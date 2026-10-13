@@ -199,9 +199,20 @@ cargo test --lib kiro::server::tests::live -- --ignored --nocapture --test-threa
 并按 `<名称>_<版本>_<平台>` 命名后随 `latest.json` 更新清单一并发布。
 
 ```bash
-node scripts/release.mjs        # 版本号 +1，提交、打 tag、推送
+node scripts/release.mjs        # 版本号 +1，提交、打附注 tag、推送
 node scripts/release.mjs 0.2.0  # 指定版本
 ```
+
+发版说明来自 **`release-notes/<版本>.md`**（例如 `release-notes/v0.2.0.md`），
+在跑脚本**之前**写好并提交即可。它会被写进附注 tag 的正文，随后同时出现在
+GitHub Release 页面和 `latest.json` 的 `notes` 里 —— 也就是用户升级时看到的那段文字。
+
+- 形状：引用块点题 + `- ` 清单，**不要写 `##` 标题**（它整段塞进 Release 的「### 更新内容」下面）。
+- 不写这个文件也能发版，但会退化成「上一个版本以来的提交标题清单」——
+  提交标题（`fix(ci): …`）直接给用户看不太合适。
+
+> 必须打**附注** tag。轻量 tag 没有正文 ⇒ `latest.json` 的 `notes` 为空 ⇒
+> 应用内「应用更新」分区整块不渲染。脚本已改成附注 tag，手动补 tag 时请注意这一点。
 
 首次使用前需在仓库的 **Settings → Secrets and variables → Actions** 配置两项：
 
