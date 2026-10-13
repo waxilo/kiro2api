@@ -16,4 +16,7 @@ src-tauri/gen/schemas/
 # 会话中间产物
 .workbuddy/
 
+# 代码评审工具的输出（一次性的，不属于源码）
+review_results.json
+
 .DS_Store
