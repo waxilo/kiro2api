@@ -1,0 +1,508 @@
+/* 组件层：按钮、卡片、徽标、键值行、表单、提示条、空态、浮层提示。
+   只放「在多个分区里重复出现」的东西；只服务某一个分区的（.proto / .meter / .dir-tile）
+   放在 views.css，免得组件层变成一个什么都往里塞的杂物间。 */
+
+/* ── 按钮 ─────────────────────────────────────────────────────────────
+   主 CTA 保持 8px 圆角（工业感来自克制的圆角），胶囊只留给徽标 / chip / 开关这类次级控件。 */
+button {
+  cursor: pointer;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-1);
+  color: var(--ink);
+  padding: 5px 12px;
+  font-size: var(--t-body);
+  transition:
+    background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    color var(--dur) var(--ease),
+    opacity var(--dur) var(--ease);
+}
+
+/* 两种「不可用」要分开表达：
+
+   * `:disabled` —— 这颗按钮自己现在没有可做的事（没地址可复制、代理没在运行）。
+     连 click 都不派发，静默即可，因为原因就写在同一个卡片里。
+   * `[aria-disabled='true']` —— 因为别处正在忙而暂时不能做。它**必须**接得住点击，
+     好让状态层回一句「正在 X，请稍候」（见 ui/shared/render.ts 的 busyAttr）。
+     观感与真禁用一致，但不给任何 hover / active 反馈，免得看着像能点。 */
+button:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-2);
+  border-color: var(--hairline-tertiary);
+}
+
+button:active:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-3);
+}
+
+button:disabled,
+button[aria-disabled='true'] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+  font-weight: 550;
+}
+button.primary:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--primary-hover);
+  border-color: var(--primary-hover);
+}
+button.primary:active:not(:disabled):not([aria-disabled='true']) {
+  background: var(--primary-active);
+  border-color: var(--primary-active);
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 38%, transparent);
+}
+button.danger:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+
+button.small {
+  padding: 3px 9px;
+  font-size: var(--t-small);
+}
+
+button.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-muted);
+}
+button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-2);
+  border-color: var(--hairline);
+}
+
+.btn-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-xs);
+}
+
+/* 同一行里的间隔符：把「间距靠 gap」这件事表达清楚，不靠给某个按钮加 margin */
+.btn-row .spacer {
+  flex: 1;
+}
+
+.btn-arrow {
+  display: inline-grid;
+  place-items: center;
+  vertical-align: -3px;
+  margin-left: 3px;
+}
+.btn-arrow .icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* ── 卡片 ─────────────────────────────────────────────────────────────
+   卡片自身是 flex 列 + 统一 gap：内部各块之间的间距只在一个地方定义，
+   免得每个视图各写一遍「这个 note 加 10px、那个加 14px」。
+   层级完全靠 surface + 发丝边框表达，不加投影。 */
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-sm);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  padding: var(--s-md);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+}
+
+.card-title {
+  font-size: var(--t-title);
+  font-weight: 620;
+  color: var(--ink);
+  letter-spacing: -0.1px;
+}
+
+.card-sub {
+  font-size: var(--t-caption);
+  color: var(--ink-subtle);
+}
+
+.card-head-spacer {
+  flex: 1;
+  min-width: var(--s-xs);
+}
+
+/* 动作行：用一条发丝线把它和上面的信息分开，形成「读 → 做」的两段 */
+.card-actions {
+  padding-top: var(--s-sm);
+  border-top: 1px solid var(--hairline);
+}
+
+.card-danger {
+  border-color: color-mix(in srgb, var(--danger) 24%, transparent);
+}
+
+/* ── 状态徽标 ─────────────────────────────────────────────────────── */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+  font-size: var(--t-caption);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.pill.ok {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: color-mix(in srgb, var(--success) 26%, transparent);
+}
+.pill.off {
+  color: var(--ink-muted);
+  background: var(--surface-2);
+  border-color: var(--hairline-strong);
+}
+.pill.warn {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: color-mix(in srgb, var(--warning) 26%, transparent);
+}
+.pill.err {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: color-mix(in srgb, var(--danger) 26%, transparent);
+}
+
+/* ── 提示条 ───────────────────────────────────────────────────────── */
+.note {
+  padding: 9px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--ink-muted);
+  font-size: var(--t-small);
+}
+
+.note.warn {
+  background: var(--warning-soft);
+  border-color: color-mix(in srgb, var(--warning) 28%, transparent);
+  color: var(--warning);
+}
+.note.err {
+  background: var(--danger-soft);
+  border-color: color-mix(in srgb, var(--danger) 28%, transparent);
+  color: var(--danger);
+}
+.note.ok {
+  background: var(--success-soft);
+  border-color: color-mix(in srgb, var(--success) 28%, transparent);
+  color: var(--success);
+}
+
+.note code {
+  font-size: var(--t-caption);
+}
+
+/* 顶部错误横幅：比 note 更醒目（它是「刚才那件事失败了」），并且可以关掉 */
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-xs);
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  font-size: var(--t-small);
+}
+
+.banner.err {
+  background: var(--danger-soft);
+  border: 1px solid color-mix(in srgb, var(--danger) 28%, transparent);
+  color: var(--danger);
+}
+
+.banner-icon {
+  display: grid;
+  place-items: center;
+  margin-top: 1px;
+}
+.banner-icon .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.banner-text {
+  flex: 1;
+  min-width: 0;
+  /* 保留后端错误里的换行（更新超时那条就是多行的） */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.banner-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0 4px;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.65;
+}
+.banner-close:hover:not(:disabled) {
+  background: transparent;
+  opacity: 1;
+}
+
+/* ── 键值信息行 ───────────────────────────────────────────────────── */
+.kv {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 6px var(--s-sm);
+  font-size: var(--t-body);
+}
+
+.kv dt {
+  color: var(--ink-subtle);
+}
+
+.kv dd {
+  margin: 0;
+  color: var(--ink);
+  min-width: 0;
+}
+
+/* 密钥 / 路径这类值可能很长，宁可断字也不要撑破卡片 */
+.kv dd code {
+  word-break: break-all;
+}
+
+/* ── 表单 ─────────────────────────────────────────────────────────── */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-xxs);
+  font-size: var(--t-caption);
+  color: var(--ink-subtle);
+}
+
+.field-inline {
+  max-width: 360px;
+}
+
+.field-row {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--s-md);
+}
+
+input[type='text'],
+input[type='number'],
+select {
+  padding: 5px 9px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-1);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+  transition:
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
+}
+
+input[type='number'] {
+  width: 96px;
+}
+
+select {
+  font-family: var(--font-ui);
+}
+
+/* focus 环用主色半透明，而不是换边框色 —— 半透明圈在浅色底上更干净，
+   也不会让控件在聚焦瞬间「跳」一下宽度。 */
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-ring);
+}
+
+.switch {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.switch input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+/* ── 模型 chip ────────────────────────────────────────────────────── */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: var(--t-caption);
+}
+
+.chip.is-current {
+  background: var(--primary-soft);
+  border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+  color: var(--primary);
+  font-weight: 600;
+}
+
+/* ── 进度条 ───────────────────────────────────────────────────────── */
+.progress {
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0;
+  background: var(--primary);
+  transition: width 0.2s var(--ease);
+}
+
+/* ── 发布说明（Markdown 轻量渲染） ────────────────────────────────── */
+.notes {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+}
+
+.notes-heading {
+  margin-top: 6px;
+  font-weight: 620;
+  color: var(--ink);
+}
+.notes-heading:first-child {
+  margin-top: 0;
+}
+
+.notes-item {
+  position: relative;
+  padding-left: 13px;
+}
+.notes-item::before {
+  content: '·';
+  position: absolute;
+  left: 5px;
+  color: var(--ink-tertiary);
+  font-weight: 700;
+}
+
+/* ── 空态 ─────────────────────────────────────────────────────────── */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: var(--s-lg) var(--s-md);
+  border-radius: var(--r-md);
+  border: 1px dashed var(--hairline-strong);
+  background: var(--surface-2);
+  text-align: center;
+}
+
+.empty-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--surface-1);
+  color: var(--ink-tertiary);
+}
+.empty-icon .icon {
+  width: 15px;
+  height: 15px;
+}
+
+.empty-title {
+  font-size: var(--t-body);
+  font-weight: 600;
+  color: var(--ink-muted);
+}
+
+.empty-hint {
+  font-size: var(--t-caption);
+  color: var(--ink-tertiary);
+  max-width: 34em;
+}
+
+/* ── 浮层提示 ─────────────────────────────────────────────────────── */
+#toast-host {
+  position: fixed;
+  left: 50%;
+  bottom: 42px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-xs);
+  align-items: center;
+  pointer-events: none;
+  z-index: 50;
+}
+
+.toast {
+  padding: 7px 15px;
+  border-radius: var(--r-pill);
+  background: var(--ink);
+  color: #fff;
+  font-size: var(--t-small);
+  box-shadow: var(--shadow-pop);
+  opacity: 0;
+  transform: translateY(6px);
+  transition:
+    opacity 0.18s var(--ease),
+    transform 0.18s var(--ease);
+}
+
+.toast.show {
+  opacity: 1;
+  transform: none;
+}
+
+.toast.err {
+  background: var(--danger);
+}

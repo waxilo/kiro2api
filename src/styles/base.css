@@ -1,0 +1,123 @@
+/* 基础层：reset、根布局、排版基线、以及少量全局工具类。
+   这一层不出现任何组件选择器（.card / .pill 之类），组件一律在 components.css。 */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--t-body);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 页面本身不滚动：所有滚动都交给 .view-body，滚动条由 .osb-* 自绘 */
+body {
+  overflow: hidden;
+}
+
+/* 外壳三段式：标题栏 / 主区 / 状态栏。主区自己再分成导航与内容。 */
+#app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+h1,
+h2,
+h3,
+p,
+dl,
+dd,
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+}
+
+ul,
+ol {
+  list-style: none;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* 等宽只用于「要逐字符辨认」的内容：密钥、路径、地址、模型名、数字。 */
+code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-muted);
+  word-break: break-word;
+}
+
+/* 所有内联图标统一尺寸；颜色一律 currentColor，跟着所在控件走。 */
+.icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: block;
+}
+
+/* 占位 / 未就绪的文字：比正文低一档，但不至于看不见 */
+.dim {
+  color: var(--ink-tertiary);
+}
+
+::selection {
+  background: var(--primary-soft);
+}
+
+/* 可访问性基线：键盘聚焦才画环（鼠标点击不画）。
+   输入框的 focus 样式在 components.css 里用 box-shadow 单独处理，特异性更高。 */
+:focus-visible {
+  outline: 2px solid var(--primary-ring);
+  outline-offset: 1px;
+}
+
+/* 兜底：万一还有没被 .osb-* 接管的可滚区域，也用自绘的细条，不落回系统样式。
+   两条都写是因为内核支持程度不同 —— 新内核认标准属性并忽略 ::-webkit-scrollbar。 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: var(--r-pill);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 尊重系统的「减少动态效果」：入场动画与过渡全部关掉，但保留状态变化本身。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

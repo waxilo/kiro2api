@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    kiro2api 图标母版（1024 空间，直接用 `npx tauri icon` 吃这个文件）。
+    设计意图：单字形「K」保持 16px 任务栏可辨；两条斜臂用不同色相，
+    对应本应用对外提供的两条协议通道（Anthropic Messages / OpenAI Chat Completions）。
+    只用渐变，不用滤镜（resvg 对 feGaussianBlur 支持不全）。
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#26364e"/>
+      <stop offset="1" stop-color="#090d15"/>
+    </linearGradient>
+    <linearGradient id="armA" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#0ea5a0"/>
+      <stop offset="1" stop-color="#4ade80"/>
+    </linearGradient>
+    <linearGradient id="armB" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#c084fc"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 底板：深色圆角方（浅色任务栏上辨识度高） -->
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="url(#tile)"/>
+  <!-- 内描边：深色任务栏上避免圆角与背景糊在一起（x+4 补偿 stroke 居中） -->
+  <rect x="40" y="40" width="944" height="944" rx="196"
+        fill="none" stroke="#a5c8ff" stroke-opacity="0.34" stroke-width="10"/>
+
+  <!-- 字形：K 的竖笔 + 两条斜臂 -->
+  <g stroke-linecap="round" fill="none" stroke-width="112">
+    <line x1="312" y1="266" x2="312" y2="758" stroke="#f1f5f9"/>
+    <line x1="372" y1="504" x2="712" y2="266" stroke="url(#armA)"/>
+    <line x1="372" y1="520" x2="712" y2="758" stroke="url(#armB)"/>
+  </g>
+</svg>

@@ -1,0 +1,260 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（例如 v0.1.0）'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PRODUCT: kiro2api
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # 平台标签（name）既是 job 间的 artifact 名，也是发布产物 <名称>_<版本>_<平台> 里的
+        # <平台> 段，所以统一成「小写 + 连字符」，并与 ci.yml 保持一致。
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            name: macos-arm64
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            name: macos-x64
+          - platform: windows-latest
+            args: ''
+            name: windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app（含更新包与签名）
+        env:
+          # 私钥与口令来自仓库 Secrets；没有它们则 createUpdaterArtifacts 无法签名
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build ${{ matrix.args }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: src-tauri/target/**/release/bundle/**
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Publish Release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          # 产物命名规范：<名称>_<版本>_<平台>，例如 kiro2api_0.1.0_windows-x64.exe。
+          # 版本取自 tag 并去掉前缀 v（v0.1.0 → 0.1.0）；平台标签与上方矩阵的 name 一致。
+          VERSION="${RELEASE_TAG#v}"
+          asset() { printf '%s_%s_%s' "$PRODUCT" "$VERSION" "$1"; }
+
+          MAC_ARM="macos-arm64"
+          MAC_X64="macos-x64"
+          WIN="windows-x64"
+
+          find_installer() {
+            find "artifacts/$1" -type f -name "$2" | head -n 1
+          }
+
+          copy_or_fail() {
+            local src="$1" dest="$2"
+            if [ -z "$src" ] || [ ! -f "$src" ]; then
+              echo "Missing release asset: $dest"
+              exit 1
+            fi
+            cp "$src" "release-assets/$dest"
+            echo "Prepared: $dest"
+          }
+
+          ARM64_DMG="$(find_installer "$MAC_ARM" '*.dmg')"
+          X64_DMG="$(find_installer "$MAC_X64" '*.dmg')"
+          WIN_MSI="$(find_installer "$WIN" '*.msi')"
+          WIN_EXE="$(find_installer "$WIN" '*.exe')"
+
+          copy_or_fail "$ARM64_DMG" "$(asset "$MAC_ARM").dmg"
+          copy_or_fail "$X64_DMG" "$(asset "$MAC_X64").dmg"
+          copy_or_fail "$WIN_MSI" "$(asset "$WIN").msi"
+          copy_or_fail "$WIN_EXE" "$(asset "$WIN").exe"
+
+          # —— 应用内自动更新产物 ——
+          # macOS：用 .app.tar.gz + .sig（dmg 不参与自动更新）
+          ARM64_TAR="$(find_installer "$MAC_ARM" '*.app.tar.gz')"
+          X64_TAR="$(find_installer "$MAC_X64" '*.app.tar.gz')"
+          copy_or_fail "$ARM64_TAR" "$(asset "$MAC_ARM").app.tar.gz"
+          copy_or_fail "${ARM64_TAR}.sig" "$(asset "$MAC_ARM").app.tar.gz.sig"
+          copy_or_fail "$X64_TAR" "$(asset "$MAC_X64").app.tar.gz"
+          copy_or_fail "${X64_TAR}.sig" "$(asset "$MAC_X64").app.tar.gz.sig"
+
+          # Windows：自动更新直接用 NSIS setup.exe + 其签名
+          WIN_SETUP_SIG="$(find_installer "$WIN" '*-setup.exe.sig')"
+          copy_or_fail "$WIN_SETUP_SIG" "$(asset "$WIN").exe.sig"
+
+          ls -la release-assets/
+
+      - name: Generate updater manifest
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # 变更说明：优先取附注 tag 正文，其次取被打 tag 提交的正文
+          git fetch --tags --force >/dev/null 2>&1 || true
+          CHANGELOG="$(git tag -l --format='%(contents:body)' "$RELEASE_TAG" 2>/dev/null || true)"
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="$(git log -1 --format=%b "$RELEASE_TAG" 2>/dev/null || true)"
+          fi
+          printf '%s' "$CHANGELOG" > .release-changelog.txt
+
+          # 用 Node 生成 latest.json，避免 bash 手工拼 JSON 的转义问题
+          node <<'NODE'
+          const fs = require('fs');
+          const tag = process.env.RELEASE_TAG;
+          const product = process.env.PRODUCT;
+          const repo = process.env.GITHUB_REPOSITORY;
+          const read = (name) => fs.readFileSync(`release-assets/${name}`, 'utf8').trim();
+          const notes = fs.readFileSync('.release-changelog.txt', 'utf8').trim();
+          const base = `https://github.com/${repo}/releases/download/${tag}`;
+          // 命名必须与上一步「Prepare release assets」完全一致：<名称>_<版本>_<平台>
+          const version = tag.replace(/^v/, '');
+          const asset = (platform, ext) => `${product}_${version}_${platform}${ext}`;
+          const manifest = {
+            version,
+            notes: notes || null,
+            pub_date: new Date().toISOString(),
+            platforms: {
+              'darwin-aarch64': {
+                signature: read(asset('macos-arm64', '.app.tar.gz.sig')),
+                url: `${base}/${asset('macos-arm64', '.app.tar.gz')}`,
+              },
+              'darwin-x86_64': {
+                signature: read(asset('macos-x64', '.app.tar.gz.sig')),
+                url: `${base}/${asset('macos-x64', '.app.tar.gz')}`,
+              },
+              'windows-x86_64': {
+                signature: read(asset('windows-x64', '.exe.sig')),
+                url: `${base}/${asset('windows-x64', '.exe')}`,
+              },
+            },
+          };
+          fs.writeFileSync('release-assets/latest.json', JSON.stringify(manifest, null, 2));
+          console.log('Generated release-assets/latest.json');
+          NODE
+
+          echo "--- latest.json ---"
+          cat release-assets/latest.json
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force >/dev/null 2>&1 || true
+          CHANGELOG="$(git tag -l --format='%(contents:body)' "$RELEASE_TAG" 2>/dev/null || true)"
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="$(git log -1 --format=%b "$RELEASE_TAG" 2>/dev/null || true)"
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
+          asset() { printf '%s_%s_%s' "$PRODUCT" "$VERSION" "$1"; }
+
+          {
+            echo "## ${PRODUCT} ${RELEASE_TAG}"
+            echo
+            echo "### 更新内容"
+            if [ -n "$CHANGELOG" ]; then echo "$CHANGELOG"; else echo "- 详见提交记录"; fi
+            echo
+            echo "产物命名：\`<名称>_<版本>_<平台>\`。"
+            echo
+            echo "### macOS"
+            echo "- Apple Silicon：\`$(asset macos-arm64).dmg\`"
+            echo "- Intel Mac：\`$(asset macos-x64).dmg\`"
+            echo
+            echo "### Windows"
+            echo "- \`$(asset windows-x64).exe\`"
+            echo "- \`$(asset windows-x64).msi\`"
+            echo
+            echo "### 自动更新"
+            echo "已安装的旧版本可直接在应用内「应用更新」分区一键下载并安装本版本。"
+            echo
+            echo "> macOS 首次打开若提示未验证开发者，请在「系统设置 → 隐私与安全性」中允许运行。"
+          } > release-notes.md
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG 已存在，覆盖上传产物..."
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "${PRODUCT} ${RELEASE_TAG}" \
+              --notes-file release-notes.md
+          fi

@@ -1,0 +1,109 @@
+/* 设计令牌 —— Linear 工业极简骨架的**浅色**版本。
+ *
+ * 骨架取自 Linear 的 design system（近黑画布 + 四级 surface 阶梯 + 1px 发丝边框 +
+ * 单一蓝紫强调 + 几乎不用阴影），把它的明度轴整体翻到浅色侧：
+ * 深色里「越亮层级越高」，浅色里对应「越白层级越高」。
+ *
+ * 三条硬规则（改样式时逐条核对，它们是工业感的来源，不是审美偏好）：
+ *   1. 层级只靠「surface 阶梯 + 发丝边框」表达，阴影只留给浮层；
+ *   2. 圆角只用下面六档，不出现 5px / 7px / 10px 这类游离值；
+ *   3. --primary 稀缺使用：只出现在主 CTA、focus ring、当前导航项、品牌标记、链接。
+ *      全局出现频率越高，工业感越弱。
+ *
+ * 只做浅色主题：`color-scheme: light` 是必须的，否则 WebView 会把原生控件
+ * （滚动条、复选框、下拉箭头）按系统深色画，和页面配色对不上。
+ */
+:root {
+  color-scheme: light;
+
+  /* ── 画布与 surface 阶梯 ─────────────────────────────────────────── */
+  --canvas: #f6f7f9; /* 内容区底面 */
+  --chrome: #ffffff; /* 标题栏 / 导航 / 状态栏 —— 包裹内容区的三块白 */
+  --surface-1: #ffffff; /* 卡片、面板 */
+  --surface-2: #f4f6f8; /* 内嵌：输入框、内层面板、条形底 */
+  --surface-3: #eceef2; /* 更深一层：轨道、代码块 */
+  --surface-hover: #f7f8fa;
+
+  /* ── 发丝边框：三级，对应「卡片 / 输入 / 嵌套」三种强度 ─────────── */
+  --hairline: #e7e9ee;
+  --hairline-strong: #d7dbe2;
+  --hairline-tertiary: #c6ccd6;
+
+  /* ── 文本 ───────────────────────────────────────────────────────── */
+  --ink: #14161b; /* 标题与正文 */
+  --ink-muted: #565d6b; /* 次级信息 */
+  --ink-subtle: #818996; /* 三级：说明、单位 */
+  --ink-tertiary: #a7adba; /* 四级：占位、禁用、装饰 */
+
+  /* ── 强调色 ─────────────────────────────────────────────────────── */
+  --primary: #5e6ad2;
+  --primary-hover: #4f5ac0;
+  --primary-active: #464fa8;
+  --primary-soft: #eef0fb; /* 选中态底色：当前导航项、当前 chip */
+  --primary-ring: rgba(94, 106, 210, 0.3); /* focus 环 */
+
+  /* ── 语义色 ─────────────────────────────────────────────────────── */
+  --success: #1f8f52;
+  --success-soft: #e9f6ef;
+  --warning: #95610b;
+  --warning-soft: #fdf4e2;
+  --danger: #bf3a30;
+  --danger-soft: #fdeeed;
+
+  /* ── 圆角阶梯 ───────────────────────────────────────────────────── */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-pill: 9999px;
+
+  /* ── 间距阶梯：4px 基数 ─────────────────────────────────────────── */
+  --s-xxs: 4px;
+  --s-xs: 8px;
+  --s-sm: 12px;
+  --s-md: 16px;
+  --s-lg: 24px;
+  --s-xl: 32px;
+  --s-xxl: 40px;
+
+  /* ── 字号阶梯 ───────────────────────────────────────────────────── */
+  --t-display: 25px; /* 视图标题 */
+  --t-headline: 18px; /* 指标数值 */
+  --t-title: 14px; /* 卡片标题 */
+  --t-body: 13px; /* 正文与按钮 */
+  --t-small: 12.5px; /* 说明 */
+  --t-caption: 11.5px; /* 脚注、徽标 */
+  --t-eyebrow: 10.5px; /* 分组标签 */
+
+  /* ── 字体 ───────────────────────────────────────────────────────────
+     不引外部字体：这是离线桌面应用，webfont 会带来首屏闪字与一条额外网络依赖，
+     而系统自带的那一档恰好是各平台上的最优解（Windows 的 Segoe UI Variable 带光学
+     尺寸轴，macOS 的 SF Pro 也正是 Linear 规范里点名的回退）。区分度靠字号 / 字重 /
+     字距的纪律来建立，不靠换一套字形。 */
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", -apple-system, "SF Pro Text",
+    "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI", -apple-system, "SF Pro Display",
+    "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* ── 阴影：只给浮层（提示条）用 ─────────────────────────────────── */
+  --shadow-pop: 0 6px 20px -6px rgba(20, 22, 27, 0.18), 0 1px 2px rgba(20, 22, 27, 0.06);
+
+  /* ── 结构尺寸 ───────────────────────────────────────────────────── */
+  --titlebar-h: 38px;
+  --rail-w: 210px;
+  --statusbar-h: 28px;
+  --content-max: 880px;
+
+  /* ── 动效：短、同一条曲线 ───────────────────────────────────────── */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur: 150ms;
+
+  /* ── 自绘窗口按钮 / 滚动条 ──────────────────────────────────────── */
+  --wc-hover: rgba(20, 22, 27, 0.06);
+  --wc-active: rgba(20, 22, 27, 0.11);
+  --wc-close-hover: #c42b1c;
+  --scroll-thumb: rgba(20, 22, 27, 0.16);
+  --scroll-thumb-hover: rgba(20, 22, 27, 0.32);
+}

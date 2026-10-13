@@ -1,0 +1,35 @@
+[package]
+name = "kiro2api"
+version = "0.1.0"
+description = "Kiro 额度转本地 API：Anthropic Messages + OpenAI Chat Completions 双协议反代"
+authors = ["waxilo"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "kiro2api_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# 下限 2.4.5：Windows 上从该版本起，第二个实例退出前会把「允许置前」权限移交给第一个实例，
+# 否则唤起窗口时 SetForegroundWindow 会被系统拒绝（只剩任务栏闪烁）。
+tauri-plugin-single-instance = "2.4.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+base64 = "0.22"
+tiny_http = "0.12"
+regex = "1"
+arboard = "3"

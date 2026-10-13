@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # 平台标签与 release.yml 保持一致（小写 + 连字符），免得同一个平台在两处叫两个名字。
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            name: macos-arm64
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            name: macos-x64
+          - platform: windows-latest
+            args: ''
+            name: windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 测试只在一个平台跑一次，避免矩阵重复；构建在全部平台执行
+      - name: Frontend type check
+        if: matrix.name == 'macos-x64'
+        run: npx tsc --noEmit
+
+      - name: Rust tests
+        if: matrix.name == 'macos-x64'
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Build Tauri app
+        # CI 无签名私钥，临时关闭 updater 产物以避免签名失败；Release 工作流才生成并签名
+        run: npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}' ${{ matrix.args }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiro2api-${{ matrix.name }}
+          # macOS 交叉编译产物落在 target/<triple>/release/bundle/
+          path: src-tauri/target/**/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14

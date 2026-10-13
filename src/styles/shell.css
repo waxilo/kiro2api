@@ -1,0 +1,540 @@
+/* 外壳层：窗口骨架三段式（标题栏 / 主区 / 状态栏），主区再分导航与内容。
+   这一层决定「屏幕上哪一块归谁」，不含任何业务视觉。
+
+   ┌──────────────────────────────────────────────────────────┐
+   │ .titlebar   白 · 品牌 / 更新入口 / 窗口按钮（可拖拽区）      │
+   ├────────────┬─────────────────────────────────────────────┤
+   │ .rail 白   │ .view-head   标题 + 说明 + 该分区的动作（固定）│
+   │ 分组导航   ├─────────────────────────────────────────────┤
+   │            │ .view-host → .view-body   内容（唯一滚动区）  │
+   ├────────────┴─────────────────────────────────────────────┤
+   │ .statusbar  白 · 常驻遥测：状态 / 地址 / 模型 / 凭据        │
+   └──────────────────────────────────────────────────────────┘ */
+
+/* ── 标题栏 ─────────────────────────────────────────────────────────── */
+/* 拖拽由 data-tauri-drag-region="deep" 接管（它会跳过按钮等可点击元素），
+   这里只负责版式与禁掉文字选中带来的拖影。 */
+.titlebar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  height: var(--titlebar-h);
+  padding-left: var(--s-sm);
+  background: var(--chrome);
+  border-bottom: 1px solid var(--hairline);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* macOS 是覆盖式标题栏：红绿灯由系统画在我们这层之上，左侧必须留出安全区；
+   右侧没有自绘窗口按钮，留一点内边距免得内容顶到窗口边缘。 */
+.platform-macos .titlebar {
+  padding-left: 78px;
+  padding-right: var(--s-sm);
+}
+
+.titlebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.titlebar-logo {
+  width: 19px;
+  height: 19px;
+  flex: none;
+  border-radius: var(--r-xs);
+}
+
+.titlebar-name {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 650;
+  /* 品牌名是拉丁文，可以用负字距收紧；中文一律不用（负字距对汉字只会显得挤） */
+  letter-spacing: -0.2px;
+  white-space: nowrap;
+}
+
+.titlebar-version {
+  font-family: var(--font-mono);
+  font-size: var(--t-caption);
+  color: var(--ink-tertiary);
+  white-space: nowrap;
+}
+
+.titlebar-spacer {
+  flex: 1;
+  min-width: var(--s-sm);
+}
+
+.titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  height: 100%;
+}
+
+/* ── 自绘窗口按钮（仅 Windows；macOS 用系统红绿灯）───────────────── */
+.window-controls {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+  margin-left: var(--s-xxs);
+}
+
+.wc-btn {
+  width: 46px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink-muted);
+}
+
+.wc-btn:hover:not(:disabled) {
+  background: var(--wc-hover);
+  border-color: transparent;
+  color: var(--ink);
+}
+.wc-btn:active:not(:disabled) {
+  background: var(--wc-active);
+  color: var(--ink);
+}
+
+/* 最大化按钮在贴靠命中区内：那块区域算非客户区，网页收不到鼠标消息，:hover 不会触发，
+   高亮由窗口过程转发过来的悬停态补上（见 src-tauri/src/window/snap.rs）。 */
+.wc-btn.is-hover:not(:disabled) {
+  background: var(--wc-hover);
+  color: var(--ink);
+}
+
+.wc-btn-close:hover:not(:disabled),
+.wc-btn-close:active:not(:disabled) {
+  background: var(--wc-close-hover);
+  color: #fff;
+}
+
+.wc-btn svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+/* 两个字形都放进 DOM，靠类名切换显隐 —— 避免同步状态时改 innerHTML 重建节点 */
+.wc-glyph-restore {
+  display: none;
+}
+.wc-btn.is-maximized .wc-glyph-max {
+  display: none;
+}
+.wc-btn.is-maximized .wc-glyph-restore {
+  display: block;
+}
+
+/* ── 主区：左导航 + 右内容 ─────────────────────────────────────────── */
+.shell-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  background: var(--canvas);
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  padding: var(--s-md) var(--s-sm) var(--s-sm);
+  background: var(--chrome);
+  border-right: 1px solid var(--hairline);
+  overflow-y: auto;
+  /* 导航本身不需要滚动条；万一内容超出（窗口极矮）也照样能用滚轮 */
+  scrollbar-width: none;
+}
+.rail::-webkit-scrollbar {
+  width: 0;
+}
+
+.rail-group + .rail-group {
+  margin-top: var(--s-md);
+}
+
+.rail-eyebrow {
+  padding: 0 10px;
+  margin-bottom: var(--s-xxs);
+  font-size: var(--t-eyebrow);
+  font-weight: 600;
+  /* 分组标签用正字距，与负字距的标题形成「这是分类、不是内容」的对照 */
+  letter-spacing: 0.6px;
+  color: var(--ink-tertiary);
+}
+
+.rail-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: var(--t-body);
+  text-align: left;
+}
+
+.rail-item:hover:not(.is-active) {
+  background: var(--surface-2);
+  border-color: transparent;
+  color: var(--ink);
+}
+
+/* 当前分区用主色底 + 主色字：这是 --primary 允许出现的少数位置之一 */
+.rail-item.is-active {
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-weight: 600;
+}
+.rail-item.is-active:hover {
+  background: var(--primary-soft);
+}
+
+.rail-icon {
+  display: grid;
+  place-items: center;
+  opacity: 0.9;
+}
+
+.rail-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 可用更新的提示点：绝对定位，这样导航收成纯图标时位置依旧正确 */
+.rail-badge {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning);
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    opacity var(--dur) var(--ease),
+    transform var(--dur) var(--ease);
+}
+.rail-badge.is-on {
+  opacity: 1;
+  transform: none;
+}
+
+/* ── 内容区 ───────────────────────────────────────────────────────── */
+.content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 分区标题固定不滚动：滚动时仍然知道自己在哪一页、这一页是干什么的 */
+.view-head {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-md);
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--s-lg) var(--s-xl) var(--s-md);
+}
+
+.view-head-text {
+  min-width: 0;
+}
+
+.view-title {
+  font-family: var(--font-display);
+  font-size: var(--t-display);
+  font-weight: 640;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.view-desc {
+  margin-top: 3px;
+  font-size: var(--t-small);
+  color: var(--ink-subtle);
+}
+
+.view-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  margin-left: auto;
+  padding-top: var(--s-xxs);
+}
+
+/* 定位基准：自绘滚动条的轨道挂在它这里，所以它必须是 position: relative，
+   且不能有内边距 —— 否则轨道会被推进内容里。 */
+.view-host {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.view-body {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  /* 原生滚动条一律不出现：主滚动区由 .osb-* 自绘 */
+  scrollbar-width: none;
+}
+.view-body::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* 内容列：宽度上限 + 居中，让行宽落在好读的区间；
+   内边距放在这里而不是 .view-host，是为了让滚动条轨道始终压在留白上。 */
+.view-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-sm);
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: 0 var(--s-xl) var(--s-xxl);
+}
+
+/* 切分区的入场：只播一次，靠 shell.ts 加/摘 is-entering 控制。
+   顶层子块依次浮入，用一点点错位把「这是一页新内容」讲清楚。 */
+.view-stack.is-entering > * {
+  animation: view-rise 260ms var(--ease) both;
+}
+.view-stack.is-entering > *:nth-child(2) {
+  animation-delay: 28ms;
+}
+.view-stack.is-entering > *:nth-child(3) {
+  animation-delay: 56ms;
+}
+.view-stack.is-entering > *:nth-child(4) {
+  animation-delay: 84ms;
+}
+.view-stack.is-entering > *:nth-child(5) {
+  animation-delay: 108ms;
+}
+
+@keyframes view-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ── 自绘滚动条 ─────────────────────────────────────────────────────
+   轨道固定在 .view-host 右侧 12px 内：.view-stack 右侧有 32px 内边距，
+   所以这条窄带永远压在空白上，不会挡住任何内容；即使不透明也能安全接收指针事件。 */
+.osb-track {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  bottom: 2px;
+  width: 12px;
+  z-index: 20;
+  opacity: 0;
+  transition: opacity 0.16s var(--ease);
+}
+
+.osb-track.is-active,
+.osb-track:hover,
+.osb-track.is-dragging {
+  opacity: 1;
+}
+
+.osb-track.is-hidden {
+  display: none;
+}
+
+.osb-thumb {
+  width: 8px;
+  height: 40px;
+  margin: 0 auto;
+  border-radius: var(--r-pill);
+  background: var(--scroll-thumb);
+  will-change: transform;
+  transition: background 0.12s var(--ease);
+}
+
+.osb-track:hover .osb-thumb,
+.osb-track.is-dragging .osb-thumb {
+  background: var(--scroll-thumb-hover);
+}
+
+/* ── 状态栏 ───────────────────────────────────────────────────────── */
+/* 常驻遥测条。它不随分区变化，「代理跑没跑」这类问题不必切回概览去确认。 */
+.statusbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+  height: var(--statusbar-h);
+  padding: 0 var(--s-md);
+  background: var(--chrome);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--t-caption);
+  color: var(--ink-subtle);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.sb-slot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sb-slot code {
+  font-size: var(--t-caption);
+  color: var(--ink-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sb-spacer {
+  flex: 1;
+}
+
+.sb-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-tertiary);
+}
+/* 运行中给色点加一圈极淡的同色晕：不用跳动的动画，也能一眼看出「活着」 */
+.sb-dot.ok {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent);
+}
+.sb-dot.warn {
+  background: var(--warning);
+}
+.sb-dot.err {
+  background: var(--danger);
+}
+
+.sb-strong {
+  font-weight: 550;
+  color: var(--ink-muted);
+}
+
+.sb-key {
+  color: var(--ink-tertiary);
+}
+
+.sb-divider {
+  flex: none;
+  width: 1px;
+  height: 12px;
+  background: var(--hairline);
+}
+
+/* 全局进行态：任何动作在跑，这里都亮起来说它在干什么。
+   默认占位为零（display:none），不占版面也不闪动。 */
+.sb-busy {
+  display: none;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+.sb-busy.is-on {
+  display: flex;
+}
+.sb-busy #sb-busy-text {
+  color: var(--primary);
+}
+
+/* 细环转圈：用 border 的一半做弧，比 SVG 省一层 DOM */
+.sb-spinner {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid color-mix(in srgb, var(--primary) 28%, transparent);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: sb-spin 0.7s linear infinite;
+}
+
+@keyframes sb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 关掉动画偏好时不转圈，改成实心点：仍然能看出「在忙」，但不晃眼 */
+@media (prefers-reduced-motion: reduce) {
+  .sb-spinner {
+    animation: none;
+    border-color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 35%, transparent);
+  }
+}
+
+.statusbar .is-dim {
+  color: var(--ink-tertiary);
+}
+.statusbar .is-warn {
+  color: var(--warning);
+}
+
+/* ── 窄窗口 ───────────────────────────────────────────────────────── */
+/* 导航收成纯图标条，卡片栅格落回单列。窗口最小宽度由 tauri.conf.json 限制，
+   所以这里只需要处理到「侧边栏该让位」这一档。 */
+@media (max-width: 860px) {
+  .shell-main {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  .rail {
+    padding-left: var(--s-xs);
+    padding-right: var(--s-xs);
+  }
+
+  .rail-eyebrow,
+  .rail-label {
+    display: none;
+  }
+
+  .rail-item {
+    justify-content: center;
+    padding: 7px 0;
+  }
+
+  .rail-group + .rail-group {
+    margin-top: var(--s-sm);
+    padding-top: var(--s-sm);
+    border-top: 1px solid var(--hairline);
+  }
+
+  .view-head,
+  .view-stack {
+    padding-left: var(--s-md);
+    padding-right: var(--s-md);
+  }
+}

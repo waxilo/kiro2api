@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "kiro2api",
+  "version": "0.1.0",
+  "identifier": "com.waxilo.kiro2api",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1430",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "kiro2api",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "visible": true,
+        "decorations": false,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://localhost:1430 ws://localhost:1430; object-src 'none'; base-uri 'none'; form-action 'none'"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERBMTYxQTJDNkMzNzRFNDYKUldSR1RqZHNMQm9XMnVDdVRkMTJKRkg5WmRuRGtCbmNwQlZWblQvVUZRYzJBc0dZNFhPNEswUEEK",
+      "dangerousInsecureTransportProtocol": true,
+      "endpoints": [
+        "http://127.0.0.1:47866/latest.json",
+        "https://ghfast.top/https://github.com/waxilo/kiro2api/releases/latest/download/latest.json",
+        "https://gh-proxy.com/https://github.com/waxilo/kiro2api/releases/latest/download/latest.json",
+        "https://github.com/waxilo/kiro2api/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
