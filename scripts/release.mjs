@@ -127,8 +127,11 @@ function computeVersionEdits(next) {
 
   if (existsSync(abs(CARGO_LOCK))) {
     const lock = read(CARGO_LOCK);
+    // 行尾必须容忍 CRLF：本机 `core.autocrlf=true` 时工作区那份是 CRLF，
+    // 而 cargo 自己重写过的那份是 LF —— 只认 `\n` 会在其中之一上匹配失败
+    // （报「未匹配到 Cargo.lock 中 kiro2api 的 version」），且只在部分机器上复现。
     const pattern = new RegExp(
-      `(\\[\\[package\\]\\]\\nname = "${CRATE_NAME}"\\nversion = ")[^"]*(")`,
+      `(\\[\\[package\\]\\]\\r?\\nname = "${CRATE_NAME}"\\r?\\nversion = ")[^"]*(")`,
     );
     const lockNext = replaceOnce(lock, pattern, `$1${next}$2`, `${CARGO_LOCK} 中 ${CRATE_NAME} 的 version`);
     if (lockNext !== lock) edits.push({ rel: CARGO_LOCK, text: lockNext });
@@ -157,8 +160,9 @@ function verifyVersion(expected) {
     found[`${PACKAGE_LOCK}(packages[""])`] = lock.packages?.['']?.version;
   }
   if (existsSync(abs(CARGO_LOCK))) {
+    // 与 computeVersionEdits 保持一致：`\r?\n` 兼容 CRLF 与 LF
     found[CARGO_LOCK] = (read(CARGO_LOCK).match(
-      new RegExp(`\\[\\[package\\]\\]\\nname = "${CRATE_NAME}"\\nversion = "([^"]*)"`),
+      new RegExp(`\\[\\[package\\]\\]\\r?\\nname = "${CRATE_NAME}"\\r?\\nversion = "([^"]*)"`),
     ) ?? [])[1];
   }
 
@@ -236,9 +240,12 @@ if (dryRun) {
   const edits = computeVersionEdits(next);
   console.log('[dry-run] 将更新以下文件的版本号：');
   for (const { rel, text } of edits) {
-    // 只报告真正变化的那一行，避免误抓到文件里其它形如 version 的依赖声明
-    const before = read(rel).split('\n');
-    const after = text.split('\n');
+    // 只报告真正变化的那一行，避免误抓到文件里其它形如 version 的依赖声明。
+    // 按 `\r?\n` 切分：`core.autocrlf=true` 时工作区是 CRLF，而这里替换后的文本
+    // 可能被 JSON.stringify 重写成 LF —— 按 `\n` 切会让行尾的 `\r` 把整份文件
+    // 都算成「第一处差异」，报告出来就是 `{` → `{` 这种没有信息量的东西。
+    const before = read(rel).split(/\r?\n/);
+    const after = text.split(/\r?\n/);
     const index = before.findIndex((line, i) => line !== after[i]);
     console.log(`  ${rel}`);
     console.log(`    旧: ${(before[index] ?? '').trim()}`);
