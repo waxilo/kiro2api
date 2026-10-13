@@ -1,8 +1,12 @@
-//! kiro2api 本地配置：端口、代理密钥、模型偏好、更新清单缓存。
+//! kiro2api 本地配置：端口、代理密钥、模型与额度缓存。
 //!
 //! 单一事实源是数据目录下的 `config.json`。所有读写都经过 [`update_config`]，
 //! 它以进程内互斥锁串行化「读 → 改 → 原子写」，避免 Tauri 命令与后台刷新线程并发时互相覆盖。
 //! 代理密钥属于敏感信息，落盘时按最小权限写入（类 Unix 下 0600）。
+//!
+//! 「模型列表」与「账户额度」都**只**是缓存：它们由上游同步得到，落盘纯粹是为了
+//! 让应用一打开就有东西可显示（启动时的后台刷新随后静默替换成最新值）。
+//! 真正的模型选择不在这里 —— 客户端在每次请求里自己指定模型。
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -11,6 +15,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::kiro::auth::KiroUsageInfo;
 use crate::paths::get_data_path;
 
 pub(crate) const DEFAULT_PORT: u16 = 5680;
@@ -27,12 +32,23 @@ pub(crate) struct AppConfig {
     pub(crate) auto_start: bool,
     /// 上次退出时代理是否处于运行态。用于「自动启动」开启时恢复上次状态。
     pub(crate) last_running: bool,
-    /// 当前默认模型（写入 `/v1/models` 之外的默认值，并作为接入配置里的建议值）。
-    pub(crate) default_model: String,
-    /// 从 Kiro 上游同步到的可用模型。
-    pub(crate) display_models: Vec<String>,
-    /// 用户手工补充的模型 ID。
-    pub(crate) custom_models: Vec<String>,
+    /// 上一次从上游同步到的可用模型。
+    ///
+    /// 落盘的意义是「打开应用就能看见有哪些模型」—— 不必先启动代理，也不必等联网。
+    /// `alias` 保留旧键名 `displayModels`，让升级前写下的缓存不白丢。
+    #[serde(alias = "displayModels")]
+    pub(crate) models: Vec<String>,
+    /// 上一次查询到的账户额度快照。
+    pub(crate) usage_cache: Option<UsageCache>,
+}
+
+/// 额度快照 + 写入时刻。重启后先拿它渲染，再等后台静默刷新替换。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct UsageCache {
+    pub(crate) info: KiroUsageInfo,
+    /// 写入时刻（Unix 毫秒）。用于诊断，以及将来判断缓存是否已过期。
+    pub(crate) updated_at_ms: i64,
 }
 
 impl Default for AppConfig {
@@ -42,9 +58,8 @@ impl Default for AppConfig {
             proxy_api_key: None,
             auto_start: false,
             last_running: false,
-            default_model: String::new(),
-            display_models: Vec::new(),
-            custom_models: Vec::new(),
+            models: Vec::new(),
+            usage_cache: None,
         }
     }
 }
@@ -116,8 +131,7 @@ pub(crate) fn ensure_api_key() -> Result<String, String> {
 }
 
 /// 脱敏展示：首尾各留 4 位，中间用圆点填充。
-pub(crate) fn mask_api_key(key: &str) -> String {
-    let trimmed = key.trim();
+pub(crate) fn mask_api_key(key: &str) -> String {    let trimmed = key.trim();
     let chars: Vec<char> = trimmed.chars().collect();
     if chars.is_empty() {
         return String::new();
@@ -129,6 +143,47 @@ pub(crate) fn mask_api_key(key: &str) -> String {
     let tail: String = chars[chars.len() - 4..].iter().collect();
     let dots = 6usize.max(12.min(chars.len() - 8));
     format!("{head}{}{tail}", "•".repeat(dots))
+}
+
+// ── 缓存读写（模型列表 / 额度快照）──────────────────────────────────────
+//
+// 统一走 `load_config` / `update_config`，与其它字段共用同一把锁 ——
+// 后台刷新线程与前端命令可能同时写，绕过锁就会互相覆盖。
+
+/// 读取缓存的模型列表（纯本地读取，不发网络请求）。
+pub(crate) fn cached_models() -> Vec<String> {
+    load_config().models
+}
+
+/// 写入模型缓存。
+pub(crate) fn store_models(models: &[String]) -> Result<(), String> {
+    update_config(|config| {
+        config.models = models.to_vec();
+        Ok(())
+    })
+}
+
+/// 读取缓存的额度快照（纯本地读取）。从未查询过时为 `None`。
+pub(crate) fn cached_usage() -> Option<KiroUsageInfo> {
+    load_config().usage_cache.map(|cache| cache.info)
+}
+
+/// 写入额度快照（连同写入时刻）。
+pub(crate) fn store_usage(info: &KiroUsageInfo) -> Result<(), String> {
+    update_config(|config| {
+        config.usage_cache = Some(UsageCache {
+            info: info.clone(),
+            updated_at_ms: now_ms(),
+        });
+        Ok(())
+    })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ── 原子写入 ────────────────────────────────────────────────────────────
@@ -212,12 +267,45 @@ mod tests {
 
     #[test]
     fn config_roundtrip_keeps_unknown_fields_out_but_known_fields_in() {
-        let json = r#"{"port":6000,"proxyApiKey":"k2a-x","defaultModel":"claude-sonnet-5"}"#;
+        let json = r#"{"port":6000,"proxyApiKey":"k2a-x","retiredField":"ignored"}"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.port, 6000);
         assert_eq!(config.proxy_api_key.as_deref(), Some("k2a-x"));
-        assert_eq!(config.default_model, "claude-sonnet-5");
         // 未提供的字段落到默认值，而不是解析失败
-        assert!(config.display_models.is_empty());
+        assert!(config.models.is_empty());
+        assert!(config.usage_cache.is_none());
+    }
+
+    /// 旧版本的键名 `displayModels` 必须继续读得进来，否则升级一次就把用户
+    /// 上次同步到的模型列表丢了（第一次启动时若恰好没网，界面会空着）。
+    #[test]
+    fn cached_models_survive_the_key_rename() {
+        let legacy = r#"{"displayModels":["claude-opus-5","claude-sonnet-5"]}"#;
+        let config: AppConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(config.models, vec!["claude-opus-5", "claude-sonnet-5"]);
+    }
+
+    #[test]
+    fn usage_cache_roundtrips_with_its_timestamp() {
+        let json = r#"{
+            "usageCache": {
+                "info": {
+                    "subscriptionTitle": "Kiro Pro",
+                    "currentUsage": 412.0,
+                    "usageLimit": 1000.0,
+                    "remaining": 588.0,
+                    "percentUsed": 41.0,
+                    "currency": "USD"
+                },
+                "updatedAtMs": 1760300000000
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        let cache = config.usage_cache.expect("缓存应被解析出来");
+        assert_eq!(cache.info.percent_used, 41.0);
+        assert_eq!(cache.info.subscription_title.as_deref(), Some("Kiro Pro"));
+        assert_eq!(cache.updated_at_ms, 1_760_300_000_000);
+        // 上游没给的可选字段落空，而不是解析失败
+        assert!(cache.info.email.is_none());
     }
 }

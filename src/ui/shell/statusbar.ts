@@ -1,8 +1,11 @@
-// 底部状态栏：常驻的遥测条 —— 服务状态、地址、默认模型、凭据有效期。
+// 底部状态栏：常驻的遥测条 —— 服务状态、地址、凭据有效期。
 //
 // 为什么值得单开一层：这些值在任何分区下都要能看见（「代理到底跑没跑」是最常被问的问题），
 // 但不能每次都塞进内容区 —— 那会让人从任意分区切回概览去确认。
 // 放在窗口底部，它就成了一条不随分区变化的基线。
+//
+// 这里刻意**不**显示「当前模型」：本应用是代理服务，同一时刻不同客户端可能各用各的模型，
+// 状态栏放一个模型名只会让人误以为那是全局设置，而这个全局设置并不存在。
 //
 // 同样地，只做定点文本更新，不参与整块重绘：状态点颜色与数字每秒都可能变，
 // 重建 DOM 会让文字选中状态和过渡动画一起丢掉。
@@ -22,11 +25,6 @@ export function renderStatusbar(): string {
       <span id="sb-busy-text"></span>
     </div>
     <div class="sb-spacer"></div>
-    <div class="sb-slot">
-      <span class="sb-key">模型</span>
-      <code id="sb-model"></code>
-    </div>
-    <div class="sb-divider"></div>
     <div class="sb-slot">
       <span class="sb-key">凭据</span>
       <span id="sb-credential"></span>
@@ -48,13 +46,6 @@ export function updateStatusbar(state: AppState): void {
     const value = serviceAddress(state);
     address.textContent = value ?? '未运行';
     address.classList.toggle('is-dim', value === null);
-  }
-
-  const model = document.getElementById('sb-model');
-  if (model) {
-    const value = state.status?.model;
-    model.textContent = value || '—';
-    model.classList.toggle('is-dim', !value);
   }
 
   const credential = document.getElementById('sb-credential');

@@ -12,7 +12,6 @@ export interface ProxyStatus {
   authSource: string;
   expiresAt: string | null;
   profileArn: string | null;
-  model: string;
   autoStart: boolean;
   configDir: string;
   debugLogPath: string;
@@ -20,14 +19,13 @@ export interface ProxyStatus {
 
 /** `k2a_models` 的返回。 */
 export interface ModelsState {
-  running: boolean;
-  /** 上游同步到的可用模型（展示用）。 */
-  displayModels: string[];
-  /** 用户手工追加的模型。 */
-  customModels: string[];
-  /** 两者合并去重后的完整列表。 */
+  /**
+   * 账户可用的模型 ID（上一次同步的结果，落盘缓存）。
+   *
+   * 这里**没有**「当前选中的模型」：本应用是代理服务，具体用哪个模型由客户端在
+   * 每次请求里决定，应用不替用户挑。
+   */
   models: string[];
-  defaultModel: string;
 }
 
 /** `k2a_access` 的返回。 */
@@ -38,7 +36,6 @@ export interface ProxyAccess {
   openaiBaseUrl: string;
   apiKeyMasked: string;
   hasApiKey: boolean;
-  model: string;
 }
 
 /** `k2a_usage` 的返回。 */
@@ -61,7 +58,6 @@ export type CopyKind =
   | 'anthropic_base_url'
   | 'openai_base_url'
   | 'api_key'
-  | 'model'
   | 'anthropic_env'
   | 'anthropic_json'
   | 'openai_env'

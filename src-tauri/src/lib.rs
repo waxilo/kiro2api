@@ -150,6 +150,9 @@ pub fn run() {
 
             let state = app.state::<KiroProxyState>().inner().clone();
             spawn_autostart(handle, state);
+            // 模型列表与额度缓存的后台刷新。与自动启动并行，互不依赖：
+            // 它是「让界面上的旧值变成新值」，不是「让代理跑起来」。
+            kiro::spawn_startup_refresh();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -159,8 +162,7 @@ pub fn run() {
             kiro::k2a_start,
             kiro::k2a_stop,
             kiro::k2a_sync_models,
-            kiro::k2a_save_models,
-            kiro::k2a_set_default_model,
+            kiro::k2a_cached_usage,
             kiro::k2a_set_auto_start,
             kiro::k2a_set_port,
             kiro::k2a_copy_access,

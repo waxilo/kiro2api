@@ -18,7 +18,6 @@ import {
   navigate,
   refresh,
   saveAutoStart,
-  saveDefaultModel,
   savePort,
   useFeedback,
 } from '../../state/actions';
@@ -204,9 +203,6 @@ function bindEvents(container: HTMLElement): void {
         return;
       case 'autostart-input':
         void saveAutoStart((target as HTMLInputElement).checked);
-        return;
-      case 'model-select':
-        void saveDefaultModel((target as HTMLSelectElement).value);
         return;
       default:
         return;

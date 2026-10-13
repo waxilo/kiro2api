@@ -1,13 +1,15 @@
-// 维护：本地目录入口 + 有破坏性的操作。
+// 维护：本地目录入口 + 退出应用。
 //
 // 分区依据是「会不会改变现有状态」：打开目录只读，放上边；
-// 重置密钥、退出应用会打断正在使用的客户端，单独放进危险区并在按钮上直接标红，
+// 退出应用会打断正在使用的客户端，单独放进危险区并在按钮上标红，
 // 而不是混在一排同款按钮里等人点错。
+//
+// 重置密钥曾经在这里，现在搬到了「双协议接入」—— 它影响的是那一页给出的地址与密钥，
+// 放在被影响的东西旁边，用户重新拿一份配置就不用跨分区跑。
 import { esc } from '../../core/format';
 import type { RevealTarget } from '../../core/types';
-import { ACTION } from '../../state/actions';
 import { ICON } from '../shared/icons';
-import { busyAttr, note } from '../shared/render';
+import { note } from '../shared/render';
 import type { ViewSpec } from './types';
 
 function dirTile(label: string, path: string, target: RevealTarget): string {
@@ -26,13 +28,12 @@ export const maintenanceView: ViewSpec = {
   id: 'maintenance',
   label: '维护',
   title: '维护',
-  desc: '打开本地目录、重置密钥、退出应用',
+  desc: '打开本地目录、退出应用',
 
   head: () => '',
 
   body: (state) => {
     const status = state.status;
-    const running = Boolean(status?.running);
 
     const directories = `
       <div class="card">
@@ -50,20 +51,12 @@ export const maintenanceView: ViewSpec = {
     const danger = `
       <div class="card card-danger">
         <div class="card-head">
-          <span class="card-title">危险操作</span>
+          <span class="card-title">退出应用</span>
         </div>
         <div class="btn-row">
-          <button class="danger" data-action="reset-key"
-                  ${running ? 'disabled' : busyAttr(state.busy)}>
-            ${state.busyLabel === ACTION.resetKey ? '重置中…' : '重置代理密钥'}
-          </button>
           <button class="danger" data-action="quit">退出应用</button>
         </div>
-        ${
-          running
-            ? note('重置密钥需要先停止代理，避免正在使用的客户端突然失配。', 'warn')
-            : note('重置后旧密钥立即失效，已配置的客户端需要重新粘贴。')
-        }
+        ${note('退出会同时停止代理，正在使用它的客户端会立即断开。关闭窗口只是隐藏到托盘，代理继续服务。')}
       </div>`;
 
     return `${directories}${danger}`;

@@ -21,6 +21,13 @@ export const backend = {
   models: () => invoke<ModelsState>('k2a_models'),
   access: () => invoke<ProxyAccess>('k2a_access'),
   usage: () => invoke<UsageInfo>('k2a_usage'),
+  /**
+   * 上次查询到的额度（纯本地读取，不发网络请求）。从未查过时为 null。
+   *
+   * 首屏用它把数值先画出来，随后后端在启动刷新里推来新值 —— 用户看到的是
+   * 数字自己更新了一下，而不是一片空白等联网。
+   */
+  cachedUsage: () => invoke<UsageInfo | null>('k2a_cached_usage'),
 
   // ── 代理生命周期 ──────────────────────────────────────────────────────
   start: (port?: number) => invoke<ProxyStatus>('k2a_start', { port: port ?? null }),
@@ -28,13 +35,8 @@ export const backend = {
   refreshToken: () => invoke<ProxyStatus>('k2a_refresh_token'),
 
   // ── 模型 ──────────────────────────────────────────────────────────────
+  // 只读的账户模型清单，同步走上游控制面，**不需要**代理在运行
   syncModels: () => invoke<ModelsState>('k2a_sync_models'),
-  saveModels: (config: {
-    displayModels: string[];
-    customModels: string[];
-    defaultModel?: string | null;
-  }) => invoke<ModelsState>('k2a_save_models', { config }),
-  setDefaultModel: (model: string) => invoke<ModelsState>('k2a_set_default_model', { model }),
 
   // ── 配置 ──────────────────────────────────────────────────────────────
   setAutoStart: (enabled: boolean) => invoke<boolean>('k2a_set_auto_start', { enabled }),

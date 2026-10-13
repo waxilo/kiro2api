@@ -361,7 +361,9 @@ select:focus {
   cursor: pointer;
 }
 
-/* ── 模型 chip ────────────────────────────────────────────────────── */
+/* ── 模型 chip ──────────────────────────────────────────────────────
+   一堆等价的候选项：没有「选中」这个状态 —— 模型由客户端在请求里指定，
+   清单只回答「有哪些」。所以这里不存在高亮样式。 */
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -376,13 +378,6 @@ select:focus {
   color: var(--ink-muted);
   font-family: var(--font-mono);
   font-size: var(--t-caption);
-}
-
-.chip.is-current {
-  background: var(--primary-soft);
-  border-color: color-mix(in srgb, var(--primary) 45%, transparent);
-  color: var(--primary);
-  font-weight: 600;
 }
 
 /* ── 进度条 ───────────────────────────────────────────────────────── */

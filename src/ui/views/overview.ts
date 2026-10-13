@@ -94,7 +94,7 @@ export const overviewView: ViewSpec = {
         ${statTile({
           label: '可用模型',
           value: String(models?.models.length ?? 0),
-          hint: models?.models.length ? '来自 Kiro 账户' : '启动后同步',
+          hint: models?.models.length ? '来自 Kiro 账户' : '尚未同步',
           goto: 'models',
         })}
         ${statTile({

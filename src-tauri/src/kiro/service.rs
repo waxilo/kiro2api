@@ -12,12 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::kiro::models::kiro_model_to_public_model_id;
 use crate::paths::kiro_sso_cache_dir;
 use crate::prefs::{
-    ensure_api_key, generate_api_key, load_config, mask_api_key, update_config, AppConfig,
+    cached_models, cached_usage, ensure_api_key, generate_api_key, load_config, mask_api_key,
+    store_models, store_usage, update_config,
 };
 
 pub(crate) const KIRO_RUNTIME_URL: &str = "https://runtime.us-east-1.kiro.dev/";
@@ -151,7 +153,6 @@ pub struct ProxyStatus {
     pub auth_source: String,
     pub expires_at: Option<String>,
     pub profile_arn: Option<String>,
-    pub model: String,
     pub auto_start: bool,
     pub config_dir: String,
     pub debug_log_path: String,
@@ -171,77 +172,21 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
         auth_source: auth.describe_auth_source(),
         expires_at: auth.get_sso_token_expiry(),
         profile_arn: auth.get_sso_profile_arn(),
-        model: effective_default_model(&config),
         auto_start: config.auto_start,
         config_dir: crate::paths::get_data_path().display().to_string(),
         debug_log_path: crate::paths::get_debug_log_path().display().to_string(),
     }
 }
 
-fn effective_default_model(config: &AppConfig) -> String {
-    let configured = config.default_model.trim();
-    if !configured.is_empty() {
-        return configured.to_string();
-    }
-    config
-        .display_models
-        .first()
-        .or_else(|| config.custom_models.first())
-        .cloned()
-        .unwrap_or_else(|| KIRO_DEFAULT_MODEL.to_string())
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// 账户可用的模型 ID 缓存。
+///
+/// 这里**没有**「当前选中的模型」——本应用是代理服务，具体用哪个模型由客户端在
+/// 每次请求里自己指定（见 `server.rs` 的 `resolve_kiro_model`）。所以这里只是一份
+/// 供人查看的清单：哪些模型这个账户能用。
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsState {
-    pub running: bool,
-    pub display_models: Vec<String>,
-    pub custom_models: Vec<String>,
-    /// 展示列表 + 自定义列表合并去重后的候选集。
     pub models: Vec<String>,
-    pub default_model: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveModelsConfig {
-    #[serde(default)]
-    pub display_models: Vec<String>,
-    #[serde(default)]
-    pub custom_models: Vec<String>,
-    #[serde(default)]
-    pub default_model: Option<String>,
-}
-
-fn build_models_state(running: bool) -> ModelsState {
-    let config = load_config();
-    let mut merged = config.display_models.clone();
-    for model in &config.custom_models {
-        if !merged.iter().any(|existing| existing == model) {
-            merged.push(model.clone());
-        }
-    }
-    let default_model = effective_default_model(&config);
-    ModelsState {
-        running,
-        display_models: config.display_models,
-        custom_models: config.custom_models,
-        models: merged,
-        default_model,
-    }
-}
-
-fn normalize_model_list(models: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut normalized = Vec::new();
-    for model in models {
-        let trimmed = model.trim();
-        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
-            continue;
-        }
-        normalized.push(trimmed.to_string());
-    }
-    normalized
 }
 
 /// 双协议接入信息。明文密钥不经过前端：这里只回传脱敏串，
@@ -257,7 +202,6 @@ pub struct ProxyAccess {
     pub openai_base_url: String,
     pub api_key_masked: String,
     pub has_api_key: bool,
-    pub model: String,
 }
 
 pub(crate) fn build_access(state: &ProxyStateRef) -> ProxyAccess {
@@ -278,7 +222,6 @@ pub(crate) fn build_access(state: &ProxyStateRef) -> ProxyAccess {
             .unwrap_or_default(),
         api_key_masked: key.as_deref().map(mask_api_key).unwrap_or_default(),
         has_api_key: key.is_some(),
-        model: effective_default_model(&load_config()),
     }
 }
 
@@ -338,16 +281,13 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
     let _ = update_config(|config| {
         config.port = actual_port;
         config.last_running = true;
-        if config.default_model.trim().is_empty() {
-            config.default_model = default_model;
-        }
         Ok(())
     });
 
-    // 启动后立即从反代 /v1/models 同步一次模型列表
-    if let Err(error) = sync_models(actual_port, &key) {
-        eprintln!("[proxy] 启动后同步模型列表失败: {error}");
-    }
+    // 启动后同步一次模型列表：账户可用的模型与套餐有关（部分套餐不含 Claude），
+    // 上游也会不定期上新。这里顺手把最新清单落盘并推给界面。
+    // 同步走的是上游控制面而不是本地反代，所以它失败不影响代理本身的可用性。
+    refresh_models_and_notify();
 
     spawn_refresh_loop(state.clone());
     Ok(build_status(state))
@@ -514,84 +454,77 @@ pub(crate) fn spawn_refresh_loop(state: ProxyStateRef) {
 
 // ── 模型列表 ────────────────────────────────────────────────────────────
 
-/// 从本地反代 `/v1/models` 拉取模型 ID 列表。
-pub(crate) fn fetch_model_ids(port: u16, api_key: &str) -> Result<Vec<String>, String> {
-    let url = format!("http://127.0.0.1:{port}/v1/models");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-
-    let mut last_error = String::from("unknown");
-    // 代理线程刚起来或上游 ListAvailableModels 较慢时短暂重试
-    for attempt in 1..=4u32 {
-        match client
-            .get(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .send()
-        {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    let body = response.text().unwrap_or_default();
-                    last_error = format!("HTTP {status}: {body}");
-                } else {
-                    let data: serde_json::Value = response
-                        .json()
-                        .map_err(|e| format!("解析模型列表失败: {e}"))?;
-                    let mut ids: Vec<String> = data
-                        .get("data")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    ids.sort();
-                    ids.dedup();
-                    if ids.is_empty() {
-                        last_error = "模型列表为空".to_string();
-                    } else {
-                        return Ok(ids);
-                    }
-                }
-            }
-            Err(error) => last_error = error.to_string(),
-        }
-        if attempt < 4 {
-            thread::sleep(Duration::from_millis(400 * u64::from(attempt)));
-        }
+/// 从上游控制面拉取账户可用模型，映射成公共 ID、落盘并返回。
+///
+/// 刻意**不**走本地反代 `/v1/models`：那条路要求代理已经在跑，于是「看看有哪些模型」
+/// 这件只读的事被绑定成「先启动代理」。改成直接问上游之后，模型分区在没有代理时也能看、
+/// 也能同步；顺带让启动时的后台刷新不依赖代理是否被自动拉起。
+///
+/// 唯一的前置条件是本机有 Kiro 凭据 —— 那是「能不能问上游」的前提，不是「代理有没有跑」。
+pub(crate) fn sync_models_from_upstream() -> Result<Vec<String>, String> {
+    let ids = new_auth().list_available_models()?;
+    let mut models: Vec<String> = ids
+        .iter()
+        .map(|id| kiro_model_to_public_model_id(id))
+        .collect();
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Err("上游没有返回任何可用模型".to_string());
     }
-    Err(format!("拉取模型列表失败: {last_error}"))
+    store_models(&models)?;
+    Ok(models)
 }
 
-/// 同步上游模型列表到本地配置，并挑选一个合理的默认模型（保留原有选择优先）。
-pub(crate) fn sync_models(port: u16, api_key: &str) -> Result<Vec<String>, String> {
-    let ids = fetch_model_ids(port, api_key)?;
-    update_config(|config| {
-        let preferred = [config.default_model.trim()]
-            .into_iter()
-            .find(|model| !model.is_empty() && ids.iter().any(|id| id == model))
-            .map(str::to_string)
-            .or_else(|| ids.first().cloned())
-            .unwrap_or_else(|| KIRO_DEFAULT_MODEL.to_string());
-        config.display_models = ids.clone();
-        config.default_model = preferred;
-        Ok(())
-    })?;
-    Ok(ids)
+/// 同步模型并通知前端；失败只记日志（供后台刷新与代理启动后调用）。
+pub(crate) fn refresh_models_and_notify() {
+    match sync_models_from_upstream() {
+        Ok(models) => {
+            eprintln!("[proxy] 模型列表已同步: {} 个", models.len());
+            notify("proxy://models-updated", ModelsState { models });
+        }
+        Err(error) => eprintln!("[proxy] 同步模型列表失败: {error}"),
+    }
+}
+
+/// 向前端广播事件。没有 AppHandle（例如单元测试里）时静默跳过。
+fn notify<S: Serialize + Clone>(event: &str, payload: S) {
+    if let Some(app) = crate::APP_HANDLE.get() {
+        let _ = app.emit(event, payload);
+    }
+}
+
+/// 应用启动时的后台静默刷新：把模型列表与账户额度更新到最新并推给界面。
+///
+/// 为什么放后台线程而不是让前端 await：两者都要打上游（几百毫秒到数秒），
+/// 让首屏等它们会显得「应用开得慢」。缓存已经落在 `config.json` 里，界面先用旧值渲染，
+/// 这里拿到新值再用事件替换 —— 用户看到的是数字自己更新了一下，而不是白屏或转圈。
+///
+/// 没有 Kiro 凭据时直接跳过：那不是错误，只是还没登录。
+pub(crate) fn spawn_startup_refresh() {
+    if !is_locally_available() {
+        eprintln!("[proxy] 跳过启动刷新：本机无 Kiro 凭据");
+        return;
+    }
+    thread::spawn(|| {
+        refresh_models_and_notify();
+        match new_auth().get_usage_limits() {
+            Ok(info) => {
+                if let Err(error) = store_usage(&info) {
+                    eprintln!("[proxy] 额度缓存写入失败: {error}");
+                }
+                notify("proxy://usage-updated", info);
+            }
+            Err(error) => eprintln!("[proxy] 启动刷新额度失败: {error}"),
+        }
+    });
 }
 
 // ── 接入配置文本 ────────────────────────────────────────────────────────
 
 /// 该复制类型是否需要读取明文密钥。
 ///
-/// 与前端「按钮是否可点」必须共用同一判据：地址 / 模型这类不依赖密钥的复制项，
+/// 与前端「按钮是否可点」必须共用同一判据：地址这类不依赖密钥的复制项，
 /// 在密钥缺失时也必须可用；否则会出现「按钮可点、点了报错」。
 fn kind_needs_key(kind: &str) -> bool {
     matches!(
@@ -601,41 +534,38 @@ fn kind_needs_key(kind: &str) -> bool {
 }
 
 /// 组装写入剪贴板的接入文本。
-/// kind: anthropic_base_url | openai_base_url | api_key | model
+/// kind: anthropic_base_url | openai_base_url | api_key
 ///     | anthropic_env | anthropic_json | openai_env | openai_json
+///
+/// 片段里**刻意不含模型名**：本应用是代理服务，具体用哪个模型由客户端在每次请求里决定。
+/// 写死一个模型会让人以为「必须用这一个」，而那只是应用在上游模型列表里顺手挑的兜底值。
 pub(crate) fn format_access_text(
     kind: &str,
     anthropic_base_url: &str,
     openai_base_url: &str,
     key: &str,
-    model: &str,
 ) -> Result<String, String> {
     Ok(match kind.trim() {
         "anthropic_base_url" => anthropic_base_url.to_string(),
         "openai_base_url" => openai_base_url.to_string(),
         "api_key" => key.to_string(),
-        "model" => model.to_string(),
         // 通用 .env / shell 变量形式
-        "anthropic_env" => format!(
-            "ANTHROPIC_BASE_URL={anthropic_base_url}\nANTHROPIC_AUTH_TOKEN={key}\nANTHROPIC_MODEL={model}"
-        ),
+        "anthropic_env" => {
+            format!("ANTHROPIC_BASE_URL={anthropic_base_url}\nANTHROPIC_AUTH_TOKEN={key}")
+        }
         // Claude Code settings.json 的 env 片段
         "anthropic_json" => serde_json::to_string_pretty(&serde_json::json!({
             "env": {
                 "ANTHROPIC_BASE_URL": anthropic_base_url,
                 "ANTHROPIC_AUTH_TOKEN": key,
-                "ANTHROPIC_MODEL": model,
             }
         }))
         .map_err(|error| format!("生成配置片段失败: {error}"))?,
         // OpenAI SDK / 兼容客户端通用变量名（openai-python、LangChain、各类 ChatBox 等）
-        "openai_env" => format!(
-            "OPENAI_BASE_URL={openai_base_url}\nOPENAI_API_KEY={key}\nOPENAI_MODEL={model}"
-        ),
+        "openai_env" => format!("OPENAI_BASE_URL={openai_base_url}\nOPENAI_API_KEY={key}"),
         "openai_json" => serde_json::to_string_pretty(&serde_json::json!({
             "base_url": openai_base_url,
             "api_key": key,
-            "model": model,
         }))
         .map_err(|error| format!("生成配置片段失败: {error}"))?,
         other => return Err(format!("不支持的复制类型: {other}")),
@@ -657,7 +587,6 @@ fn build_access_text(state: &ProxyStateRef, kind: &str) -> Result<String, String
         &access.anthropic_base_url,
         &access.openai_base_url,
         &key,
-        &access.model,
     )
 }
 
@@ -669,8 +598,10 @@ pub fn k2a_status(state: State<'_, ProxyStateRef>) -> ProxyStatus {
 }
 
 #[tauri::command]
-pub fn k2a_models(state: State<'_, ProxyStateRef>) -> ModelsState {
-    build_models_state(is_proxy_running(&state))
+pub fn k2a_models() -> ModelsState {
+    ModelsState {
+        models: cached_models(),
+    }
 }
 
 #[tauri::command]
@@ -709,77 +640,24 @@ pub async fn k2a_stop(state: State<'_, ProxyStateRef>) -> Result<ProxyStatus, St
     .map_err(|e| format!("停止任务失败: {e}"))?
 }
 
-/// 从运行中的代理重新同步模型列表。
+/// 从上游同步账户可用模型（**不需要**代理在运行）。
+///
+/// 曾经这里要求「代理已在运行」，因为实现是去打本地反代的 `/v1/models`。
+/// 但「看看有哪些模型」是只读的，把它绑在「先启动代理」上毫无必要 —— 而且代理一起
+/// 就要占端口、就要替用户向上游发请求，代价远大于收益。现在直接问上游控制面。
 #[tauri::command]
-pub async fn k2a_sync_models(state: State<'_, ProxyStateRef>) -> Result<ModelsState, String> {
-    let state = (*state).clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if !is_proxy_running(&state) {
-            return Err("请先启动代理".to_string());
-        }
-        let port = state
-            .port
-            .lock()
-            .map_err(|_| "lock failed".to_string())?
-            .ok_or_else(|| "代理端口未知".to_string())?;
-        let key = current_api_key(&state).ok_or_else(|| "代理密钥未知".to_string())?;
-        sync_models(port, &key)?;
-        Ok(build_models_state(true))
-    })
-    .await
-    .map_err(|e| format!("同步任务失败: {e}"))?
+pub async fn k2a_sync_models() -> Result<ModelsState, String> {
+    tauri::async_runtime::spawn_blocking(|| sync_models_from_upstream().map(|models| ModelsState { models }))
+        .await
+        .map_err(|e| format!("同步任务失败: {e}"))?
 }
 
-/// 保存展示 / 自定义模型列表与默认模型。
+/// 读取缓存的账户额度（纯本地读取，不发网络请求）。
+///
+/// 首屏用它把上次查询到的数值先画出来，随后 [`k2a_usage`] 的后台刷新会推来新值。
 #[tauri::command]
-pub fn k2a_save_models(config: SaveModelsConfig) -> Result<ModelsState, String> {
-    update_config(|current| {
-        current.display_models = normalize_model_list(&config.display_models);
-        current.custom_models = normalize_model_list(&config.custom_models);
-        let all: Vec<String> = current
-            .display_models
-            .iter()
-            .chain(current.custom_models.iter())
-            .cloned()
-            .collect();
-        let preferred = config
-            .default_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                let existing = current.default_model.trim();
-                all.iter().any(|id| id == existing).then(|| existing.to_string())
-            })
-            .or_else(|| all.first().cloned())
-            .unwrap_or_default();
-        current.default_model = preferred;
-        Ok(())
-    })?;
-    Ok(build_models_state(false))
-}
-
-/// 设置默认模型（会顺带把它加进自定义列表，避免选择器里看不到）。
-#[tauri::command]
-pub fn k2a_set_default_model(model: String) -> Result<ModelsState, String> {
-    let trimmed = model.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("模型名称不能为空".to_string());
-    }
-    update_config(|current| {
-        let known = current
-            .display_models
-            .iter()
-            .chain(current.custom_models.iter())
-            .any(|id| id == &trimmed);
-        if !known {
-            current.custom_models.push(trimmed.clone());
-        }
-        current.default_model = trimmed.clone();
-        Ok(())
-    })?;
-    Ok(build_models_state(false))
+pub fn k2a_cached_usage() -> Option<super::auth::KiroUsageInfo> {
+    cached_usage()
 }
 
 #[tauri::command]
@@ -831,11 +709,19 @@ pub fn k2a_reset_key(state: State<'_, ProxyStateRef>) -> Result<ProxyAccess, Str
 }
 
 /// 查询 Kiro 账户额度（阻塞 HTTP 放后台线程，不卡界面）。
+///
+/// 成功即落盘：下次启动的首屏可以直接画出上次的值，不必等联网。前端因此不需要为
+/// 「持久化」写任何特殊逻辑 —— 它只需要在事件到达时把值换掉。
 #[tauri::command]
 pub async fn k2a_usage() -> Result<super::auth::KiroUsageInfo, String> {
-    tauri::async_runtime::spawn_blocking(|| new_auth().get_usage_limits())
+    let info = tauri::async_runtime::spawn_blocking(|| new_auth().get_usage_limits())
         .await
-        .map_err(|e| format!("额度查询任务失败: {e}"))?
+        .map_err(|e| format!("额度查询任务失败: {e}"))??;
+    if let Err(error) = store_usage(&info) {
+        eprintln!("[proxy] 额度缓存写入失败: {error}");
+    }
+    notify("proxy://usage-updated", info.clone());
+    Ok(info)
 }
 
 /// 手动刷新共享 SSO 凭据。
@@ -878,22 +764,20 @@ mod tests {
     const A: &str = "http://127.0.0.1:5680";
     const O: &str = "http://127.0.0.1:5680/openai/v1";
     const K: &str = "k2a-test1234";
-    const M: &str = "claude-opus-5";
 
     #[test]
     fn single_field_kinds() {
-        assert_eq!(format_access_text("anthropic_base_url", A, O, K, M).unwrap(), A);
-        assert_eq!(format_access_text("openai_base_url", A, O, K, M).unwrap(), O);
-        assert_eq!(format_access_text("api_key", A, O, K, M).unwrap(), K);
-        assert_eq!(format_access_text("model", A, O, K, M).unwrap(), M);
+        assert_eq!(format_access_text("anthropic_base_url", A, O, K).unwrap(), A);
+        assert_eq!(format_access_text("openai_base_url", A, O, K).unwrap(), O);
+        assert_eq!(format_access_text("api_key", A, O, K).unwrap(), K);
     }
 
     /// 两套协议的入口地址必须不同：OpenAI 入口要带 `/openai/v1` 前缀。
     /// 若两者相同，OpenAI SDK 自带 `/v1` 会拼成 `/v1/chat/completions` 落到 Anthropic 路由上。
     #[test]
     fn two_protocol_urls_are_distinct() {
-        let anthropic = format_access_text("anthropic_base_url", A, O, K, M).unwrap();
-        let openai = format_access_text("openai_base_url", A, O, K, M).unwrap();
+        let anthropic = format_access_text("anthropic_base_url", A, O, K).unwrap();
+        let openai = format_access_text("openai_base_url", A, O, K).unwrap();
         assert_ne!(anthropic, openai);
         assert!(!anthropic.ends_with(KIRO_OPENAI_PATH_PREFIX));
         assert!(openai.ends_with(KIRO_OPENAI_PATH_PREFIX));
@@ -901,52 +785,69 @@ mod tests {
 
     #[test]
     fn anthropic_env_uses_anthropic_variable_names() {
-        let text = format_access_text("anthropic_env", A, O, K, M).unwrap();
+        let text = format_access_text("anthropic_env", A, O, K).unwrap();
         assert_eq!(
             text,
             "ANTHROPIC_BASE_URL=http://127.0.0.1:5680\n\
-             ANTHROPIC_AUTH_TOKEN=k2a-test1234\n\
-             ANTHROPIC_MODEL=claude-opus-5"
+             ANTHROPIC_AUTH_TOKEN=k2a-test1234"
         );
         assert!(!text.contains("OPENAI_"));
     }
 
     #[test]
     fn openai_env_uses_openai_variable_names() {
-        let text = format_access_text("openai_env", A, O, K, M).unwrap();
+        let text = format_access_text("openai_env", A, O, K).unwrap();
         assert_eq!(
             text,
             "OPENAI_BASE_URL=http://127.0.0.1:5680/openai/v1\n\
-             OPENAI_API_KEY=k2a-test1234\n\
-             OPENAI_MODEL=claude-opus-5"
+             OPENAI_API_KEY=k2a-test1234"
         );
         // 不能混入 Anthropic 变量名，否则复制到 OpenAI 客户端后不生效
         assert!(!text.contains("ANTHROPIC"));
     }
 
+    /// 复制出来的配置片段里**不能**出现模型名：本应用不决定用哪个模型，
+    /// 具体模型由客户端在每次请求里给出。写死一个名字会让人以为「必须用这一个」。
+    #[test]
+    fn access_snippets_never_pin_a_model() {
+        for kind in [
+            "anthropic_env",
+            "anthropic_json",
+            "openai_env",
+            "openai_json",
+        ] {
+            let text = format_access_text(kind, A, O, K).unwrap();
+            let lower = text.to_lowercase();
+            assert!(
+                !lower.contains("model"),
+                "{kind} 不应包含任何模型字段: {text}"
+            );
+        }
+    }
+
     #[test]
     fn json_snippets_are_valid_json() {
         let anthropic: serde_json::Value =
-            serde_json::from_str(&format_access_text("anthropic_json", A, O, K, M).unwrap()).unwrap();
+            serde_json::from_str(&format_access_text("anthropic_json", A, O, K).unwrap()).unwrap();
         assert_eq!(anthropic["env"]["ANTHROPIC_BASE_URL"], A);
-        assert_eq!(anthropic["env"]["ANTHROPIC_MODEL"], M);
+        assert_eq!(anthropic["env"]["ANTHROPIC_AUTH_TOKEN"], K);
 
         let openai: serde_json::Value =
-            serde_json::from_str(&format_access_text("openai_json", A, O, K, M).unwrap()).unwrap();
+            serde_json::from_str(&format_access_text("openai_json", A, O, K).unwrap()).unwrap();
         assert_eq!(openai["base_url"], O);
         assert_eq!(openai["api_key"], K);
     }
 
     #[test]
     fn unknown_kind_is_rejected() {
-        assert!(format_access_text("oauth", A, O, K, M).is_err());
+        assert!(format_access_text("oauth", A, O, K).is_err());
     }
 
     /// 判据必须与前端一致：只有真正依赖密钥的 kind 才需要读密钥，
-    /// 否则无密钥时「接口地址 / 模型」按钮可点却报错。
+    /// 否则无密钥时「接口地址」按钮可点却报错。
     #[test]
     fn only_key_dependent_kinds_require_the_key() {
-        for kind in ["anthropic_base_url", "openai_base_url", "model"] {
+        for kind in ["anthropic_base_url", "openai_base_url"] {
             assert!(!kind_needs_key(kind), "{kind} 不应依赖密钥");
         }
         for kind in [
@@ -961,21 +862,9 @@ mod tests {
     }
 
     #[test]
-    fn urls_and_model_copy_work_without_a_key() {
-        assert_eq!(format_access_text("anthropic_base_url", A, O, "", M).unwrap(), A);
-        assert_eq!(format_access_text("openai_base_url", A, O, "", M).unwrap(), O);
-        assert_eq!(format_access_text("model", A, O, "", M).unwrap(), M);
-    }
-
-    #[test]
-    fn model_list_normalization_dedupes_and_trims() {
-        let input = vec![
-            " a ".to_string(),
-            "a".to_string(),
-            "".to_string(),
-            "b".to_string(),
-        ];
-        assert_eq!(normalize_model_list(&input), vec!["a", "b"]);
+    fn urls_copy_works_without_a_key() {
+        assert_eq!(format_access_text("anthropic_base_url", A, O, "").unwrap(), A);
+        assert_eq!(format_access_text("openai_base_url", A, O, "").unwrap(), O);
     }
 
     #[test]

@@ -9,7 +9,7 @@ import { listen } from '@tauri-apps/api/event';
 
 import { errorText } from '../core/format';
 import { backend } from '../core/ipc';
-import type { CopyKind, RevealTarget } from '../core/types';
+import type { CopyKind, ModelsState, RevealTarget, UsageInfo } from '../core/types';
 import { updater } from '../services/updater';
 import { store, type ViewId } from './app-state';
 
@@ -37,13 +37,11 @@ export const ACTION = {
   resetKey: '重置密钥',
   savePort: '保存端口',
   saveAutoStart: '保存自动启动',
-  saveDefaultModel: '保存默认模型',
 } as const;
 
 /** 每个复制目标在提示里的说法。集中在这里，避免散落在分支里对不上。 */
 const COPY_LABELS: Record<CopyKind, string> = {
   api_key: '代理密钥',
-  model: '模型名',
   anthropic_base_url: 'Anthropic 地址',
   openai_base_url: 'OpenAI 地址',
   anthropic_env: 'Anthropic .env',
@@ -76,15 +74,31 @@ export function navigate(view: ViewId): void {
   store.set({ view });
 }
 
-/** 拉取首屏所需的三个状态。失败只记进 `error`，不清空已有数据。 */
+/**
+ * 拉取首屏所需的本地状态。失败只记进 `error`，不清空已有数据。
+ *
+ * 四个读取全是**本地**的（不发网络请求）：代理状态、接入信息、模型缓存、额度缓存。
+ * 联网的部分（上游同步模型、查额度）由后端在启动后台刷新里做，拿到结果再用事件推过来 ——
+ * 这样「打开应用」永远不会卡在网络上，界面先是缓存里的旧值，随后自己更新。
+ */
 export async function refresh(): Promise<void> {
   try {
-    const [status, access, models] = await Promise.all([
+    const [status, access, models, cachedUsage] = await Promise.all([
       backend.status(),
       backend.access(),
       backend.models(),
+      backend.cachedUsage(),
     ]);
-    store.set({ status, access, models, error: null });
+    store.set({
+      status,
+      access,
+      models,
+      // 缓存只用来**填空白**，绝不覆盖已经拿到的新值：`refresh()` 会被每个动作在收尾时
+      // 调用一次，而它读的是磁盘上那一份（可能比内存里的旧）。用 `??` 而不是直接赋值，
+      // 语义就变成「首屏没有值时才拿缓存顶上」，不会把刚查回来的额度倒回旧数。
+      usage: store.get().usage ?? cachedUsage,
+      error: null,
+    });
   } catch (error) {
     store.set({ error: errorText(error) });
   }
@@ -220,7 +234,10 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
       await run(ACTION.syncModels, async () => {
         const models = await backend.syncModels();
         store.set({ models });
-        feedback.toast(`已同步 ${models.displayModels.length} 个模型`);
+        feedback.toast(
+          models.models.length ? `已同步 ${models.models.length} 个模型` : '上游没有返回模型',
+          models.models.length ? 'info' : 'error',
+        );
       });
       return;
 
@@ -294,14 +311,6 @@ export async function saveAutoStart(enabled: boolean): Promise<void> {
   });
 }
 
-export async function saveDefaultModel(model: string): Promise<void> {
-  if (!model) return;
-  await run(ACTION.saveDefaultModel, async () => {
-    store.set({ models: await backend.setDefaultModel(model) });
-    feedback.toast(`默认模型：${model}`);
-  });
-}
-
 // ── 后端事件 ────────────────────────────────────────────────────────────
 
 /**
@@ -320,5 +329,16 @@ export async function bindBackendEvents(): Promise<void> {
   }
   await listen<string>('proxy://token-refresh-failed', (event) => {
     store.set({ error: `凭据刷新失败：${event.payload}` });
+  });
+
+  // 缓存被后台刷新替换：直接把新值写进 store，不重新拉一遍。
+  //
+  // 这是「持久化 + 静默更新」的后半截：首屏的数字来自本地缓存，这个事件把它换成最新的。
+  // 整条链路对用户是无感的 —— 没有加载态、没有闪烁，就是数字自己变了。
+  await listen<ModelsState>('proxy://models-updated', (event) => {
+    store.set({ models: event.payload });
+  });
+  await listen<UsageInfo>('proxy://usage-updated', (event) => {
+    store.set({ usage: event.payload, usageLoading: false });
   });
 }

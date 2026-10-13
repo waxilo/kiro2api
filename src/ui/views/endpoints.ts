@@ -2,11 +2,16 @@
 //
 // 两块协议面板用同一套结构渲染（只是数据不同），左右并排便于逐项比对；
 // 窄窗口下自动落回单列 —— 用 grid 而不是 flex 是为了不必手写两份媒体查询。
+//
+// 为什么「重置密钥」在这一页而不是「维护」：重置会立刻让已配置的客户端失配，
+// 而客户端配的就是这一页给出的地址与密钥。把它放在被它影响的东西旁边，
+// 用户重新拿一份配置的动作就在手边，不必在两个分区之间来回跑。
 import { esc } from '../../core/format';
 import { copyKindNeedsKey } from '../../core/ipc';
 import type { CopyKind } from '../../core/types';
+import { ACTION } from '../../state/actions';
 import type { AppState } from '../../state/app-state';
-import { kv, kvList, mono, note } from '../shared/render';
+import { busyAttr, kv, kvList, mono, note } from '../shared/render';
 import type { ViewSpec } from './types';
 
 interface ProtoSpec {
@@ -89,13 +94,14 @@ export const endpointsView: ViewSpec = {
   id: 'endpoints',
   label: '双协议接入',
   title: '双协议接入',
-  desc: '同一端口按路径分流，同一套密钥与模型对两套协议同时生效',
+  desc: '同一端口按路径分流，同一套密钥对两套协议同时生效',
 
   head: () => '',
 
   body: (state) => {
     const access = state.access;
     const hasKey = Boolean(access?.hasApiKey);
+    const running = Boolean(state.status?.running);
 
     const credentialCard = `
       <div class="card">
@@ -104,13 +110,17 @@ export const endpointsView: ViewSpec = {
           <span class="card-head-spacer"></span>
           <button class="small" data-action="copy" data-kind="api_key"
                   ${state.busy || !hasKey ? 'disabled' : ''}>复制密钥</button>
-          <button class="small" data-action="copy" data-kind="model"
-                  ${state.busy || !access?.model ? 'disabled' : ''}>复制模型名</button>
+          <button class="small danger" data-action="reset-key"
+                  ${running ? 'disabled' : busyAttr(state.busy)}>
+            ${state.busyLabel === ACTION.resetKey ? '重置中…' : '重置密钥'}
+          </button>
         </div>
-        ${kvList([
-          kv('代理密钥', mono(access?.apiKeyMasked)),
-          kv('默认模型', mono(access?.model)),
-        ])}
+        ${kvList([kv('代理密钥', mono(access?.apiKeyMasked))])}
+        ${
+          running
+            ? note('重置密钥需要先停止代理，避免正在使用的客户端突然失配。', 'warn')
+            : note('重置后旧密钥立即失效，已配置的客户端需要重新粘贴。')
+        }
       </div>`;
 
     const protoCard = `
@@ -128,8 +138,8 @@ export const endpointsView: ViewSpec = {
       ${credentialCard}
       ${protoCard}
       ${note(
-        '密钥重置需要先停止代理，避免正在使用的客户端突然失配；' +
-          '在「维护」分区可以重置密钥与打开配置目录。',
+        '模型由客户端在请求里自己指定（本应用不代选），可选项见「可用模型」分区；' +
+          '复制的配置片段里因此不含模型名。',
       )}`;
   },
 };

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const TOKEN_REFRESH_SKEW_SECS: i64 = 120;
@@ -31,8 +31,11 @@ struct AuthCache {
 }
 
 /// Kiro 账户额度快照（来自 getUsageLimits）。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// 同时用于「返回给前端」与「落盘缓存」两种用途，因此既 `Serialize` 也 `Deserialize`：
+/// 缓存要在下一次启动时被读回来，只可写不可读就白存了。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct KiroUsageInfo {
     pub subscription_title: Option<String>,
     pub subscription_type: Option<String>,

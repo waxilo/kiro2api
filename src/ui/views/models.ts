@@ -1,7 +1,13 @@
-// 模型：一个选择器 + 一份全量清单。
+// 可用模型：一份只读的清单，回答「这个账户能用哪些模型」。
+//
+// 这里刻意**没有**模型选择器。本应用是代理服务，具体用哪个模型由客户端在每次请求里决定，
+// 应用不替用户挑，也不该让人以为存在一个全局的「当前模型」。
 //
 // 清单用 chip 而不是表格：模型名长度不齐，表格会逼出一堆留白；
-// chip 自动换行、也天然承担「当前项高亮」这个状态。
+// chip 自动换行，天然适合「一堆等价的候选项」这种形状。
+//
+// 同步走上游控制面，**不需要代理在运行** —— 只是「看看有哪些模型」而已，
+// 为它先启动一个监听端口、替用户向上游发请求，代价和收益完全不成比例。
 import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
 import { busyAttr, emptyState, note } from '../shared/render';
@@ -9,72 +15,39 @@ import type { ViewSpec } from './types';
 
 export const modelsView: ViewSpec = {
   id: 'models',
-  label: '模型',
-  title: '模型',
-  desc: '默认模型在客户端未指定模型时生效；列表来自 Kiro 账户实际可用的模型',
+  label: '可用模型',
+  title: '可用模型',
+  desc: '当前 Kiro 账户可用的模型清单；具体用哪个由客户端在请求里指定，本应用不做选择',
 
   head: (state) => {
     const label = state.busyLabel === ACTION.syncModels ? '同步中…' : '从上游同步';
-    // 代理没运行时是真禁用（原因写在本页正文里）；忙碌期改用 aria-disabled，
-    // 点击照常派发，好让 run() 回一句「正在 X，请稍候」而不是无声无息。
-    const gate = state.status?.running ? busyAttr(state.busy) : ' disabled';
-    return `<button class="small" data-action="sync-models"${gate}>${label}</button>`;
+    return `<button class="small" data-action="sync-models"${busyAttr(state.busy)}>${label}</button>`;
   },
 
   body: (state) => {
-    const models = state.models;
-    const list = models?.models ?? [];
-    const current = models?.defaultModel ?? '';
-    const running = Boolean(state.status?.running);
-
-    const chooser = `
-      <div class="card">
-        <div class="card-head">
-          <span class="card-title">默认模型</span>
-          <span class="card-head-spacer"></span>
-          <span class="card-sub">${list.length ? `共 ${list.length} 个` : ''}</span>
-        </div>
-        <label class="field field-inline">
-          <span>模型</span>
-          <select id="model-select" ${state.busy || list.length === 0 ? 'disabled' : ''}>
-            ${
-              list.length === 0
-                ? '<option value="">（先启动代理并同步）</option>'
-                : list
-                    .map(
-                      (id) =>
-                        `<option value="${esc(id)}"` +
-                        `${id === current ? ' selected' : ''}>${esc(id)}</option>`,
-                    )
-                    .join('')
-            }
-          </select>
-        </label>
-        ${
-          running
-            ? ''
-            : note('代理未运行，无法从上游同步。启动代理后回到这里点「从上游同步」。', 'warn')
-        }
-      </div>`;
+    const list = state.models?.models ?? [];
 
     const inventory = `
       <div class="card">
         <div class="card-head">
           <span class="card-title">可用模型</span>
-          <span class="card-sub">高亮项为当前默认模型</span>
+          <span class="card-head-spacer"></span>
+          <span class="card-sub">${list.length ? `共 ${list.length} 个` : ''}</span>
         </div>
         ${
           list.length
             ? `<div class="chips">${list
-                .map(
-                  (id) =>
-                    `<span class="chip${id === current ? ' is-current' : ''}">${esc(id)}</span>`,
-                )
+                .map((id) => `<span class="chip">${esc(id)}</span>`)
                 .join('')}</div>`
-            : emptyState('还没有模型列表', '启动代理后点击右上角「从上游同步」')
+            : emptyState('还没有模型清单', '点击右上角「从上游同步」向 Kiro 账户读取')
         }
       </div>`;
 
-    return `${chooser}${inventory}`;
+    return `
+      ${inventory}
+      ${note(
+        '把模型名填在客户端的配置里即可（例如 Claude Code 的 <code>ANTHROPIC_MODEL</code>）；' +
+          '不填则由上游按账户情况自行选择。清单以套餐为准，套餐变化后重新同步即可。',
+      )}`;
   },
 };
