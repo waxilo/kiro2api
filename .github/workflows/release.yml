@@ -169,11 +169,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 变更说明：优先取附注 tag 正文，其次取被打 tag 提交的正文
+          # 变更说明：附注 tag 正文 → 被打 tag 提交的正文 → 上一个 tag 以来的提交标题。
+          #
+          # 第三层是必须的兜底：轻量 tag 没有正文，而被打 tag 的发版提交本身是
+          # `chore(release): …` 一句话（正文为空）⇒ 前两层都会落空，`latest.json`
+          # 的 notes 变成 null，应用内「应用更新」分区会整块不显示（前端只在 notes
+          # 非空时渲染）。宁可给一份朴素的提交清单，也不要给一片空白。
           git fetch --tags --force >/dev/null 2>&1 || true
           CHANGELOG="$(git tag -l --format='%(contents:body)' "$RELEASE_TAG" 2>/dev/null || true)"
           if [ -z "$CHANGELOG" ]; then
             CHANGELOG="$(git log -1 --format=%b "$RELEASE_TAG" 2>/dev/null || true)"
+          fi
+          if [ -z "$CHANGELOG" ]; then
+            PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || true)"
+            if [ -n "$PREVIOUS_TAG" ]; then
+              CHANGELOG="$(
+                git log "${PREVIOUS_TAG}..${RELEASE_TAG}" --no-merges --pretty='- %s' \
+                  | grep -v '^- chore(release)' || true
+              )"
+            fi
           fi
           printf '%s' "$CHANGELOG" > .release-changelog.txt
 
@@ -222,10 +236,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          git fetch --tags --force >/dev/null 2>&1 || true
-          CHANGELOG="$(git tag -l --format='%(contents:body)' "$RELEASE_TAG" 2>/dev/null || true)"
+          # 复用「Generate updater manifest」算好的变更说明，而不是把同一段逻辑再抄一遍 ——
+          # 两处各写一遍迟早会漂移（Release 页面和 latest.json 说的不是一回事）。
+          # 兜底保留：万一上一步产出的文件缺失，还能退回附注 tag 正文。
+          CHANGELOG="$(cat .release-changelog.txt 2>/dev/null || true)"
           if [ -z "$CHANGELOG" ]; then
-            CHANGELOG="$(git log -1 --format=%b "$RELEASE_TAG" 2>/dev/null || true)"
+            git fetch --tags --force >/dev/null 2>&1 || true
+            CHANGELOG="$(git tag -l --format='%(contents:body)' "$RELEASE_TAG" 2>/dev/null || true)"
           fi
 
           VERSION="${RELEASE_TAG#v}"
@@ -256,6 +273,11 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG 已存在，覆盖上传产物..."
             gh release upload "$RELEASE_TAG" release-assets/* --clobber
+            # 说明也要一并刷新：重发同一个 tag 时只换产物、不换说明，
+            # 会出现「Release 页面还是旧文案、latest.json 已是新文案」的错位。
+            gh release edit "$RELEASE_TAG" \
+              --title "${PRODUCT} ${RELEASE_TAG}" \
+              --notes-file release-notes.md
           else
             gh release create "$RELEASE_TAG" release-assets/* \
               --title "${PRODUCT} ${RELEASE_TAG}" \

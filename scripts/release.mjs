@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 一键发版：递增版本号（五处对齐）→ 提交 → 打轻量 tag → 推送触发 CI 构建。
+ * 一键发版：递增版本号（五处对齐）→ 提交 → 打附注 tag（正文为变更清单）→ 推送触发 CI 构建。
  *
  * 用法：
  *   node scripts/release.mjs            # patch +1
@@ -11,6 +11,16 @@
  *   - 版本号散落在 5 个文件、其中 package-lock.json 有 2 处，正则替换在 Node 里可控且可测；
  *   - 避免不同平台换行符（CRLF/LF）导致的匹配漂移；
  *   - 发版必须一次性改全，漏一处就会出现「应用内版本号显示错」或 `--locked` 构建失败。
+ *
+ * 为什么是**附注** tag 而不是轻量 tag：tag 正文是发布说明的唯一来源，
+ * 而发布说明既进 GitHub Release 页面，也进 `latest.json` 的 `notes`
+ * （应用内「应用更新」分区靠它渲染变更内容）。轻量 tag 没有正文，
+ * 会让升级的用户看到一片空白。
+ *
+ * tag 正文的取法：**优先用 `release-notes/<tag>.md`**（人写的、面向用户的文案，
+ * 随本次发版一起提交），没有才退化成「上一个 tag 以来的提交标题清单」。
+ * 提交标题是给开发者看的（`fix(ci): …` 这种不该出现在升级提示里），
+ * 所以人工文案优先；但宁可给一份朴素的清单，也不要给一片空白。
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -165,6 +175,54 @@ function git(...gitArgs) {
   return execFileSync('git', gitArgs, { cwd: ROOT, encoding: 'utf8' }).trim();
 }
 
+function tryGit(...gitArgs) {
+  try {
+    return git(...gitArgs);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 变更清单：上一个 tag 之后的所有提交标题。
+ *
+ * 为什么要有这个东西：`release.yml` 从**附注 tag 的正文**里取更新说明，并把它同时写进
+ * GitHub Release 页面和 `latest.json` 的 `notes`。而 `latest.json` 的 notes 是应用内
+ * 「应用更新」分区唯一的说明来源 —— 它一旦为空，前端会整块不渲染（`updates.ts` 里
+ * `update.available && update.notes` 的判断），用户升级时看不到任何更新内容。
+ *
+ * 早先打的是**轻量 tag**（没有正文），于是只有「被打 tag 的那个提交」的正文能兜底；
+ * 而发版提交本身是 `chore(release): ...` 一句话，正文为空 ⇒ notes 恒为 null。
+ * 改成附注 tag 并把清单写进正文，这条链路才有内容可给。
+ */
+function changelogSincePreviousTag() {
+  const previous = tryGit('describe', '--tags', '--abbrev=0', 'HEAD');
+  const range = previous ? `${previous}..HEAD` : 'HEAD';
+  return tryGit('log', range, '--no-merges', '--pretty=- %s')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    // 发版提交自己不该出现在清单里（它只是把版本号对齐）
+    .filter((line) => !/^- chore\(release\)/.test(line));
+}
+
+/**
+ * 人工写好的发布说明：`release-notes/<tag>.md`（例如 `release-notes/v0.2.0.md`）。
+ *
+ * 内容形状要求：**只有正文，不要写一级/二级标题** —— 它会整段塞进 Release 页面的
+ * 「### 更新内容」下面，也会原样成为 `latest.json` 的 notes。所以用
+ * 「引用块点题 + `- ` 清单」这种形状最贴，加了 `## 标题` 反而会把层级拧过来。
+ *
+ * 返回 null 表示没有人工文案，调用方退回提交标题清单。
+ */
+function curatedReleaseNotes(tag) {
+  const file = `release-notes/${tag}.md`;
+  if (!existsSync(abs(file))) return null;
+  const text = read(file).trim();
+  if (!text) return null;
+  return text.split('\n');
+}
+
 // ── 主流程 ──────────────────────────────────────────────────────────────
 
 const current = currentVersion();
@@ -220,9 +278,29 @@ verifyVersion(next);
 // 只提交明确列出的文件，绝不 `git add -A`
 git('add', ...changed);
 git('commit', '-m', `chore(release): kiro2api ${tag}`);
-git('tag', tag);
 
-console.log(`已提交并打 tag：${tag}`);
+// 打**附注** tag：正文即发布说明，供 release.yml 写进 Release 页面与 latest.json。
+// 注意消息必须「第一行一句标题 + 空行 + 正文」——`%(contents:body)` 取的是空行之后的部分，
+// 整条消息都塞在第一行的话正文照样是空的。
+const curated = curatedReleaseNotes(tag);
+const changelog = curated ?? changelogSincePreviousTag();
+const tagMessage = [`kiro2api ${tag}`, '', ...changelog].join('\n');
+git('tag', '-a', tag, '-m', tagMessage);
+
+console.log(`已提交并打附注 tag：${tag}`);
+if (curated) {
+  console.log(`发布说明来源：release-notes/${tag}.md（人工文案）`);
+} else {
+  console.warn(
+    `⚠ 未找到 release-notes/${tag}.md，退化为提交标题清单 ——\n` +
+      '  这段文字会直接显示给升级的用户，提交标题（fix(ci): …）不太适合。\n' +
+      '  建议写一份 release-notes/' +
+      tag +
+      '.md 再发版（形状：引用块点题 + 「- 」清单，不要写 ## 标题）。'
+  );
+}
+console.log('将随 Release 与 latest.json 一起发布的说明：');
+console.log(changelog.map((l) => (l ? `  ${l}` : '')).join('\n') || '  (无)');
 console.log('下一步：git push 与 git push origin ' + tag);
 
 // 顺手把 tag 推到远端；普通提交由使用者自己决定何时 push
