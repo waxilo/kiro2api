@@ -71,7 +71,10 @@ jobs:
           # 私钥与口令来自仓库 Secrets；没有它们则 createUpdaterArtifacts 无法签名
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build ${{ matrix.args }}
+        # ⚠️ `--` 不能省：npm 会把 `--target` 当成自己的配置项吃掉（只留个 warn），
+        # 实际执行的是 `tauri build aarch64-apple-darwin` —— triple 成了位置参数，
+        # 一路传给 cargo build 报 `unexpected argument`。Windows 的 args 是空串才没暴露。
+        run: npm run tauri build -- ${{ matrix.args }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
