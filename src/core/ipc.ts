@@ -44,6 +44,15 @@ export const backend = {
 
   // ── 密钥与复制 ────────────────────────────────────────────────────────
   copyAccess: (kind: CopyKind) => invoke<boolean>('k2a_copy_access', { kind }),
+  /**
+   * 复制一段任意文本（目前只有「点模型名复制」在用）。
+   *
+   * 与 `copyAccess` 分开是刻意的：那条路径按 `kind` 在后端组装接入片段、独占明文密钥的读取；
+   * 这条只把前端递过来的字符串写进剪贴板，不接受 `kind`，因此也绕不过密钥门控。
+   * 两条路都落在后端，是因为 WebView 里的 `navigator.clipboard` 在不同内核 / 权限下
+   * 可用性不一致，而后端 `arboard` 这条路已经被接入信息的复制验证过了。
+   */
+  copyText: (text: string) => invoke<boolean>('k2a_copy_text', { text }),
   resetKey: () => invoke<ProxyAccess>('k2a_reset_key'),
 
   // ── 系统 ──────────────────────────────────────────────────────────────

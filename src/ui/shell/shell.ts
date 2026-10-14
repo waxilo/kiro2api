@@ -19,6 +19,7 @@ import {
   refresh,
   saveAutoStart,
   savePort,
+  setModelFilter,
   useFeedback,
 } from '../../state/actions';
 import { store, type AppState, type ViewId } from '../../state/app-state';
@@ -158,11 +159,16 @@ interface FocusSnapshot {
 
 function captureFocus(host: HTMLElement): FocusSnapshot | null {
   const active = document.activeElement;
-  if (!(active instanceof HTMLElement) || !active.id || !host.contains(active)) return null;
+  if (!(active instanceof HTMLElement) || !host.contains(active)) return null;
+  // 焦点落在**没有 id** 的按钮上时，`data-refocus` 指名渲染后该把焦点还给谁。
+  // 「清空搜索」就是这种：点它的人下一步一定是接着改那个输入框，
+  // 不还焦点的话光标会掉到 body 上，得再点一次输入框才能继续打字。
+  const id = active.id || active.dataset.refocus || '';
+  if (!id) return null;
   const field = active as HTMLInputElement;
   const hasSelection = typeof field.selectionStart === 'number';
   return {
-    id: active.id,
+    id,
     start: hasSelection ? field.selectionStart : null,
     end: hasSelection ? field.selectionEnd : null,
   };
@@ -207,6 +213,29 @@ function bindEvents(container: HTMLElement): void {
       default:
         return;
     }
+  });
+
+  // 搜索框反过来：边打边筛，用 change 得等失焦才生效，那是筛选框最不能忍的延迟。
+  // 每敲一个字符重绘一次分区（输入框靠 id 拿回焦点与光标），代价只有几十个 chip 的字符串拼接。
+  container.addEventListener('input', (event) => {
+    const target = event.target as HTMLInputElement;
+    if (target.id !== 'model-filter') return;
+    // 输入法组字过程中不重绘：整块换 innerHTML 会打断候选词窗口，也会把组字状态弄丢。
+    // 组字结束时会再补一次 input（Chrome）；WebKit 只给 compositionend，所以下面也接一份。
+    if ((event as InputEvent).isComposing) return;
+    setModelFilter(target.value);
+  });
+
+  container.addEventListener('compositionend', (event) => {
+    const target = event.target as HTMLInputElement;
+    if (target.id === 'model-filter') setModelFilter(target.value);
+  });
+
+  // Escape 清空搜索。焦点还在输入框里，重绘后外壳的焦点快照会把光标放回原位。
+  container.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    const target = event.target as HTMLInputElement;
+    if (target.id === 'model-filter' && target.value) setModelFilter('');
   });
 
   // 窗口重新可见时补一次状态同步。

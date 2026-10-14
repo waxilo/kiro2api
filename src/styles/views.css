@@ -255,6 +255,54 @@
   color: var(--ink-tertiary);
 }
 
+/* ── 可用模型：搜索过滤 ─────────────────────────────────────────────
+   输入框的基本外观（尺寸、发丝边框、等宽字体、focus 环）直接复用 components.css 里
+   `input[type='text']` 那条通用规则，这里只补两件它不知道的事：撑满卡片宽度、
+   给右端的清空按钮留出位置。 */
+.filter-bar {
+  position: relative;
+  display: flex;
+}
+
+.filter-input {
+  width: 100%;
+  /* 清空按钮压在右端，留出它的宽度再加半个间隙 —— 模型名很长，
+     不留位置的话结尾几个字符会跑到按钮底下。 */
+  padding-right: 28px;
+}
+
+.filter-bar ::placeholder {
+  color: var(--ink-tertiary);
+}
+
+/* 位置与尺寸写在基础规则里，**不**挂在 `:not(:disabled)` 上 ——
+   禁用态该只影响观感，不该把布局一起抽掉。压过通用 `button` 规则靠类选择器就够了
+   （0,1,1 > 0,0,1），需要再高一档的只有下面的 hover。 */
+button.filter-clear {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--ink-subtle);
+  font-size: 15px;
+  line-height: 1;
+}
+
+button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--ink);
+}
+
 /* ── 维护：目录入口 ───────────────────────────────────────────────── */
 .dir-grid {
   display: grid;

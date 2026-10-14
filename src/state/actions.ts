@@ -75,6 +75,16 @@ export function navigate(view: ViewId): void {
 }
 
 /**
+ * 更新「可用模型」分区的搜索词。
+ *
+ * 不走 `run()`：它是一次纯本地的重绘触发，没有后端命令、没有耗时、也不该有 `busy` 语义 ——
+ * 被上一个动作的忙碌状态挡住、连打字都被吞掉，那才是真的糟。
+ */
+export function setModelFilter(query: string): void {
+  store.set({ modelFilter: query });
+}
+
+/**
  * 拉取首屏所需的本地状态。失败只记进 `error`，不清空已有数据。
  *
  * 四个读取全是**本地**的（不发网络请求）：代理状态、接入信息、模型缓存、额度缓存。
@@ -168,6 +178,22 @@ async function copyToClipboard(kind: CopyKind): Promise<void> {
   }
 }
 
+/**
+ * 复制模型名。
+ *
+ * 提示里带上名字本身，是因为「已复制」这句话在模型名长得很像的时候帮助有限
+ * （`claude-opus-4-6` / `claude-opus-4-7`）—— 把名字念出来，用户能一眼确认没点错。
+ */
+async function copyModel(model: string): Promise<void> {
+  if (!model) return;
+  try {
+    const copied = await backend.copyText(model);
+    feedback.toast(copied ? `已复制模型名 ${model}` : '没有可复制的内容', copied ? 'info' : 'error');
+  } catch (error) {
+    feedback.toast(errorText(error), 'error');
+  }
+}
+
 async function queryUsage(): Promise<void> {
   store.set({ usageLoading: true });
   try {
@@ -243,6 +269,14 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
 
     case 'copy':
       await copyToClipboard(dataset.kind as CopyKind);
+      return;
+
+    case 'copy-model':
+      await copyModel(dataset.model ?? '');
+      return;
+
+    case 'clear-model-filter':
+      setModelFilter('');
       return;
 
     case 'usage':

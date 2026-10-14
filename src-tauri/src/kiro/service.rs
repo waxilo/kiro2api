@@ -694,6 +694,24 @@ pub fn k2a_copy_access(state: State<'_, ProxyStateRef>, kind: String) -> Result<
     Ok(true)
 }
 
+/// 复制一段文本到系统剪贴板（当前只有「点模型名复制」在用）。
+///
+/// 与 [`k2a_copy_access`] 分开是刻意的：那条路径按 `kind` 在后端组装接入片段、
+/// 独占明文密钥的读取；这条只把前端递过来的字符串写进剪贴板，不接受 `kind`，
+/// 因此也没有办法被前端拿去绕过密钥门控。
+#[tauri::command]
+pub fn k2a_copy_text(text: String) -> Result<bool, String> {
+    if text.is_empty() {
+        return Ok(false);
+    }
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("无法访问系统剪贴板: {e}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| format!("写入剪贴板失败: {e}"))?;
+    Ok(true)
+}
+
 /// 重置代理密钥（旧密钥立即失效）。代理运行中不允许重置，避免正在用的客户端突然失配。
 #[tauri::command]
 pub fn k2a_reset_key(state: State<'_, ProxyStateRef>) -> Result<ProxyAccess, String> {

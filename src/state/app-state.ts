@@ -30,6 +30,16 @@ export interface AppState {
   status: ProxyStatus | null;
   access: ProxyAccess | null;
   models: ModelsState | null;
+  /**
+   * 「可用模型」分区的搜索词。
+   *
+   * 放在全局状态而不是视图内部，是因为视图是「状态进、HTML 出」的纯函数 —— 它没地方存东西。
+   * 写进 store 还有两个好处：后台推来新的模型清单时会连带重绘整个分区，过滤条件不会因此
+   * 被悄悄清掉；以及它天然可以被测试当作一个普通状态来断言。
+   *
+   * 只是界面状态，不落盘：重开应用应该回到「看到全部模型」。
+   */
+  modelFilter: string;
   usage: UsageInfo | null;
   /** 额度查询进行中（与全局 `busy` 分开：它只影响额度那一个视图）。 */
   usageLoading: boolean;
@@ -75,6 +85,7 @@ export const store = createStore<AppState>({
   status: null,
   access: null,
   models: null,
+  modelFilter: '',
   usage: null,
   usageLoading: false,
   busy: false,

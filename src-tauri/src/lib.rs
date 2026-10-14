@@ -166,6 +166,7 @@ pub fn run() {
             kiro::k2a_set_auto_start,
             kiro::k2a_set_port,
             kiro::k2a_copy_access,
+            kiro::k2a_copy_text,
             kiro::k2a_reset_key,
             kiro::k2a_usage,
             kiro::k2a_refresh_token,
