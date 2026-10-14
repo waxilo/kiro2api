@@ -7,6 +7,10 @@
 //! - POST /v1/messages/count_tokens → token 估算
 //! - POST /v1/messages        → 对话（SSE 流式 / 非流式）
 //!
+//! Anthropic 兼容入口（前缀 /anthropic，与 /openai 对称）：界面给出的接入地址是
+//! `{origin}/anthropic`，客户端在它后面自己拼 `/v1/messages` 等标准路径。
+//! 根路径下的同款路由**保留**：已经按旧地址（裸 origin）配置好的客户端不受升级影响。
+//!
 //! OpenAI 兼容入口（同一监听端口，按路径分流；前缀 /openai/v1）：
 //! - GET  /openai/v1/models              → 模型列表（OpenAI 形状）
 //! - POST /openai/v1/chat/completions    → 对话（OpenAI 形状，SSE 流式 / 非流式）
@@ -674,9 +678,15 @@ fn handle_request(
 
     match (method.clone(), path.as_str()) {
         (Method::Get, "/") | (Method::Get, "/health") => handle_health(request, config, auth),
-        (Method::Get, "/v1/models") => handle_models(request, config, auth),
-        (Method::Post, "/v1/messages/count_tokens") => handle_count_tokens(request, config),
-        (Method::Post, "/v1/messages") => handle_messages(
+        // Anthropic 兼容入口：/anthropic 前缀（界面给出的接入地址带这个前缀）与
+        // 根路径（旧地址，保留兼容）指向同一批 handler。
+        (Method::Get, "/v1/models") | (Method::Get, "/anthropic/v1/models") => {
+            handle_models(request, config, auth)
+        }
+        (Method::Post, "/v1/messages/count_tokens") | (Method::Post, "/anthropic/v1/messages/count_tokens") => {
+            handle_count_tokens(request, config)
+        }
+        (Method::Post, "/v1/messages") | (Method::Post, "/anthropic/v1/messages") => handle_messages(
             request,
             config,
             auth,
@@ -4701,6 +4711,52 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(resp.status(), 404);
+
+        handle.stop();
+    }
+
+    /// `/anthropic` 前缀路由与根路径旧路由必须指向同一批 handler。
+    ///
+    /// 界面给出的接入地址是 `{origin}/anthropic`，客户端在它后面拼 `/v1/messages`；
+    /// 鉴权层先于业务层，所以「无 key → 401」就足以证明路由已通（404 才是没通）。
+    /// 根路径旧路由保留兼容，也要一并验证没有被改坏。
+    #[test]
+    fn anthropic_prefix_routes_mirror_legacy_root_routes() {
+        let mut handle = start_proxy(test_config(39883)).expect("proxy starts");
+        let port = handle.port;
+        let client = reqwest::blocking::Client::new();
+        let body = json!({
+            "model": "claude-opus-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": false,
+        });
+
+        for path in ["/anthropic/v1/messages", "/v1/messages"] {
+            let resp = client
+                .post(format!("http://127.0.0.1:{port}{path}"))
+                .json(&body)
+                .send()
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} 未被路由到鉴权层");
+        }
+        for path in [
+            "/anthropic/v1/messages/count_tokens",
+            "/v1/messages/count_tokens",
+        ] {
+            let resp = client
+                .post(format!("http://127.0.0.1:{port}{path}"))
+                .json(&body)
+                .send()
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} 未被路由到鉴权层");
+        }
+        for path in ["/anthropic/v1/models", "/v1/models"] {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .send()
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} 未被路由到鉴权层");
+        }
 
         handle.stop();
     }

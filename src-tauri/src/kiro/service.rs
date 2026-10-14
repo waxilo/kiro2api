@@ -30,6 +30,9 @@ pub(crate) const KIRO_DEFAULT_MODEL: &str = "claude-opus-5";
 /// OpenAI 兼容入口的路径前缀。与 `server.rs` 的路由共用同一常量，
 /// 避免「界面显示的地址」与「服务实际监听的路径」漂移。
 pub(crate) const KIRO_OPENAI_PATH_PREFIX: &str = "/openai/v1";
+/// Anthropic 兼容入口的路径前缀，与 `/openai` 对称：客户端在接入地址后面自己拼
+/// `/v1/messages` 等标准路径。同样是地址显示与路由的共用常量；根路径旧路由仍保留。
+pub(crate) const KIRO_ANTHROPIC_PATH_PREFIX: &str = "/anthropic";
 
 /// 定时刷新间隔（access token 通常约 1 小时）。
 const REFRESH_DEFAULT_SECS: u64 = 25 * 60;
@@ -216,7 +219,10 @@ pub(crate) fn build_access(state: &ProxyStateRef) -> ProxyAccess {
     ProxyAccess {
         running,
         port,
-        anthropic_base_url: origin.clone().unwrap_or_default(),
+        anthropic_base_url: origin
+            .clone()
+            .map(|origin| format!("{origin}{KIRO_ANTHROPIC_PATH_PREFIX}"))
+            .unwrap_or_default(),
         openai_base_url: origin
             .map(|origin| format!("{origin}{KIRO_OPENAI_PATH_PREFIX}"))
             .unwrap_or_default(),
@@ -253,10 +259,19 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
         ));
     }
 
-    // 优先使用账户实际可用的模型（部分套餐不含 Claude 模型），失败时兜底内置默认
-    let default_model = auth
-        .pick_available_default_model()
-        .unwrap_or_else(|| KIRO_DEFAULT_MODEL.to_string());
+    // 优先使用持久化的模型缓存挑默认（零网络）；缓存为空（首次使用）才问一次上游。
+    // ⚠️ 不能无条件走 `pick_available_default_model`：它每次都要打上游控制面（最长 30s），
+    // 而模型列表早就随每次同步落盘了 —— 弱网下「启动代理」会在这里 + 下面的后台同步
+    // 各等一次 30s，前端 45 秒的保底闸门先触发，表现为「代理明明起来了却报启动超时」。
+    let default_model = {
+        let cached = cached_models();
+        match super::auth::pick_default_model(&cached) {
+            Some(model) => model,
+            None => auth
+                .pick_available_default_model()
+                .unwrap_or_else(|| KIRO_DEFAULT_MODEL.to_string()),
+        }
+    };
 
     let key = ensure_api_key()?;
     let configured_port = port.unwrap_or_else(|| load_config().port);
@@ -287,7 +302,11 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
     // 启动后同步一次模型列表：账户可用的模型与套餐有关（部分套餐不含 Claude），
     // 上游也会不定期上新。这里顺手把最新清单落盘并推给界面。
     // 同步走的是上游控制面而不是本地反代，所以它失败不影响代理本身的可用性。
-    refresh_models_and_notify();
+    //
+    // ⚠️ 放后台线程，不让它挡在「启动代理」的返回路径上：它内部是一次完整的上游
+    // HTTP（最长 30s），弱网下会把命令的总耗时顶过前端的 45 秒保底闸门 —— 端口
+    // 早就绑好了，用户看到的却是「启动代理超时」。它只是顺手刷新，没资格阻塞启动。
+    std::thread::spawn(refresh_models_and_notify);
 
     spawn_refresh_loop(state.clone());
     Ok(build_status(state))

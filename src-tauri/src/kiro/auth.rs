@@ -688,16 +688,7 @@ impl Auth {
     /// 否则退回第一个可用模型。失败或为空时返回 None，由调用方回退到内置默认。
     pub fn pick_available_default_model(&self) -> Option<String> {
         let models = self.list_available_models().ok()?;
-        if models.is_empty() {
-            return None;
-        }
-        let claude = models
-            .iter()
-            .find(|m| m.starts_with("claude-"))
-            .cloned()
-            .or_else(|| models.iter().find(|m| m.to_lowercase().contains("opus")).cloned())
-            .or_else(|| models.iter().find(|m| m.to_lowercase().contains("sonnet")).cloned());
-        Some(claude.unwrap_or_else(|| models[0].clone()))
+        pick_default_model(&models)
     }
 
     /// 查询当前账户 Kiro Credits 额度（不消耗额度）。
@@ -772,6 +763,24 @@ impl Auth {
 
         Ok(parse_kiro_usage_limits(&data))
     }
+}
+
+/// 从一份模型清单里挑默认模型：Claude 系 → 含 opus → 含 sonnet → 第一个。
+///
+/// 独立成自由函数，是因为挑选逻辑有两类调用方：一类手里已经有清单
+/// （持久化缓存，零网络），一类需要先问上游（[`Auth::pick_available_default_model`]）。
+/// 挑选规则只有一份，两边才不会挑出不一样的结果。
+pub fn pick_default_model(models: &[String]) -> Option<String> {
+    if models.is_empty() {
+        return None;
+    }
+    let claude = models
+        .iter()
+        .find(|m| m.starts_with("claude-"))
+        .cloned()
+        .or_else(|| models.iter().find(|m| m.to_lowercase().contains("opus")).cloned())
+        .or_else(|| models.iter().find(|m| m.to_lowercase().contains("sonnet")).cloned());
+    Some(claude.unwrap_or_else(|| models[0].clone()))
 }
 
 fn json_f64(value: &Value) -> Option<f64> {
@@ -934,6 +943,20 @@ fn parse_expiry_ms(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_model_pick_prefers_claude_and_survives_empty_list() {
+        let pick = |models: &[&str]| -> Option<String> {
+            pick_default_model(&models.iter().map(|m| m.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(pick(&["gpt-5", "claude-opus-5"]), Some("claude-opus-5".to_string()));
+        // 部分套餐不含 Claude：退而求其次按 opus / sonnet / 首个的顺序兜
+        assert_eq!(pick(&["gpt-5", "x-opus-x"]), Some("x-opus-x".to_string()));
+        assert_eq!(pick(&["gpt-5", "x-sonnet-x"]), Some("x-sonnet-x".to_string()));
+        assert_eq!(pick(&["gpt-5"]), Some("gpt-5".to_string()));
+        // 空清单必须返回 None：调用方据此回退内置默认，而不是挑出一个空串
+        assert_eq!(pick(&[]), None);
+    }
 
     #[test]
     fn usage_prefers_next_date_when_days_is_zero() {

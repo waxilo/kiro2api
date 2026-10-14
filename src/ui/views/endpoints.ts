@@ -31,7 +31,7 @@ function protoSpecs(state: AppState): ProtoSpec[] {
   return [
     {
       name: 'Anthropic Messages',
-      path: '/v1/messages',
+      path: '/anthropic/v1/messages',
       desc: 'Claude Code、Anthropic SDK、各类 Anthropic 兼容客户端',
       color: '#0f8f86',
       url: access?.anthropicBaseUrl ?? '',
