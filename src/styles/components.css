@@ -221,54 +221,6 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
   font-size: var(--t-caption);
 }
 
-/* 顶部错误横幅：比 note 更醒目（它是「刚才那件事失败了」），并且可以关掉 */
-.banner {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--s-xs);
-  padding: 10px 12px;
-  border-radius: var(--r-md);
-  font-size: var(--t-small);
-}
-
-.banner.err {
-  background: var(--danger-soft);
-  border: 1px solid color-mix(in srgb, var(--danger) 28%, transparent);
-  color: var(--danger);
-}
-
-.banner-icon {
-  display: grid;
-  place-items: center;
-  margin-top: 1px;
-}
-.banner-icon .icon {
-  width: 14px;
-  height: 14px;
-}
-
-.banner-text {
-  flex: 1;
-  min-width: 0;
-  /* 保留后端错误里的换行（更新超时那条就是多行的） */
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.banner-close {
-  border: 0;
-  background: transparent;
-  color: inherit;
-  padding: 0 4px;
-  font-size: 15px;
-  line-height: 1;
-  opacity: 0.65;
-}
-.banner-close:hover:not(:disabled) {
-  background: transparent;
-  opacity: 1;
-}
-
 /* ── 键值信息行 ───────────────────────────────────────────────────── */
 .kv {
   display: grid;

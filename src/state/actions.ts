@@ -134,7 +134,9 @@ export async function run(
   }
 
   currentLabel = label;
-  store.set({ busy: true, busyLabel: label });
+  // 顺手把上一次的错误清掉：它已经以 toast 播过了。不清的话，「同样的错误再来一次」
+  // 会因为值没变而被 store 判定为「无变化」、连通知都不发，于是提示一声不响地消失。
+  store.set({ busy: true, busyLabel: label, error: null });
 
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -144,7 +146,6 @@ export async function run(
       busyLabel: null,
       error: `${label}超时：${ACTION_TIMEOUT_MS / 1000} 秒内没有等到后端响应，已解锁界面，可以直接重试。`,
     });
-    feedback.toast(`${label}超时，已解锁界面`, 'error');
   }, ACTION_TIMEOUT_MS);
 
   try {
@@ -152,8 +153,9 @@ export async function run(
     if (!timedOut) store.set({ error: null });
   } catch (error) {
     if (!timedOut) {
-      store.set({ error: errorText(error) });
-      feedback.toast(`${label}失败`, 'error');
+      // 文案里带上动作名：「重置密钥失败：请先停止代理…」比只有后半截清楚得多 ——
+      // 失败现在只有 toast 这一个出口，信息缺一块就没别处可看了。
+      store.set({ error: `${label}失败：${errorText(error)}` });
     }
   } finally {
     clearTimeout(timer);
@@ -195,12 +197,12 @@ async function copyModel(model: string): Promise<void> {
 }
 
 async function queryUsage(): Promise<void> {
-  store.set({ usageLoading: true });
+  // 同样先清空上一次的错误：否则连着两次同样的失败，第二次会因为值没变而一声不响
+  store.set({ usageLoading: true, error: null });
   try {
     store.set({ usage: await backend.usage(), error: null });
   } catch (error) {
-    store.set({ error: errorText(error) });
-    feedback.toast('额度查询失败', 'error');
+    store.set({ error: `额度查询失败：${errorText(error)}` });
   } finally {
     store.set({ usageLoading: false });
   }
@@ -306,10 +308,6 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
 
     case 'update-install':
       await updater.install();
-      return;
-
-    case 'dismiss-error':
-      store.set({ error: null });
       return;
 
     case 'goto': {

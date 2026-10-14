@@ -52,7 +52,14 @@ export interface AppState {
    * 那个按钮自己就能写「刷新中…」，状态栏也能挂一条全局的进行态。
    */
   busyLabel: string | null;
-  /** 最近一次失败的说明。 */
+  /**
+   * 最近一次失败的说明。
+   *
+   * 界面**不**为它留位置 —— 曾经是一块顶部错误横幅，会把内容整体推下去、把按钮挪位。
+   * 现在由外壳订阅它，在它变成新值时播一条浮层提示（`ui/shell/shell.ts` 的
+   * `announceError`），仅此而已。所以这个字段的语义是「有一条新失败待播报」：
+   * 动作成功时会被清空，不会长期停在某个值上。
+   */
   error: string | null;
   update: UpdateState;
 }

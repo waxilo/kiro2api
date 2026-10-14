@@ -58,12 +58,6 @@ export const ICON = {
       'c0 .8-.6 1.4-1.4 1.4H3.8c-.8 0-1.4-.6-1.4-1.4z"/>',
   ),
 
-  /** 提示 / 异常。 */
-  alert: svg(`
-    <path d="M8 2.8 14 13H2z"/>
-    <path d="M8 6.4v3"/>
-    <circle cx="8" cy="11.2" r=".75" fill="currentColor" stroke="none"/>`),
-
   /** 中性信息（空态等的默认图标）。 */
   info: svg(`
     <circle cx="8" cy="8" r="5.8"/>

@@ -7,6 +7,16 @@ let host: HTMLElement | null = null;
 /** 同时最多保留的提示条数，超出时挤掉最早的，避免连点堆成一列。 */
 const MAX_VISIBLE = 3;
 
+/**
+ * 提示停留多久。
+ *
+ * 错误要长得多：它现在是「操作失败」的唯一出口（原先那块顶部横幅已经去掉，
+ * 横幅会把页面内容整体推下去 —— 那才是真正该避免的）。像
+ * 「刷新凭据超时：45 秒内没有等到后端响应，已解锁界面，可以直接重试。」这种，
+ * 2.2 秒连读完都来不及，等于没提示。
+ */
+const LIFE_MS = { info: 2200, error: 6000 } as const;
+
 function ensureHost(): HTMLElement {
   if (!host) {
     host = document.createElement('div');
@@ -32,5 +42,5 @@ export function toast(message: string, kind: 'info' | 'error' = 'info'): void {
   setTimeout(() => {
     node.classList.remove('show');
     setTimeout(() => node.remove(), 220);
-  }, 2200);
+  }, LIFE_MS[kind]);
 }

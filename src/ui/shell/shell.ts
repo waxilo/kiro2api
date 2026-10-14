@@ -24,7 +24,6 @@ import {
 } from '../../state/actions';
 import { store, type AppState, type ViewId } from '../../state/app-state';
 import { esc } from '../../core/format';
-import { ICON } from '../shared/icons';
 import { ScrollArea } from '../shared/scroll-area';
 import { toast } from '../shared/toast';
 import { VIEWS, type ViewSpec } from '../views';
@@ -111,6 +110,28 @@ function render(state: AppState, previous?: AppState): void {
     playEnter(bodyEl);
   }
   scrollArea?.refresh();
+
+  // 放在最后：页面已经是正确的样子了，提示只是叠上去的一层，不参与布局。
+  announceError(state, previous);
+}
+
+/**
+ * 把「新的失败」播成一条浮层提示。
+ *
+ * 失败**不往页面里插东西**：一块顶部横幅会把内容整体推下去、把按钮挪位，
+ * 而「刚才那件事失败了」并不是页面结构变了 —— 用户读到的是「页面抖了一下」。
+ *
+ * 由 store 的 `error` 字段统一驱动，而不是在每个失败点各调一次 `toast()`：
+ * 后者漏一处就是「操作失败了，界面什么都没说」。事实上 `refresh()` 的失败与后端
+ * `proxy://token-refresh-failed` 事件原本就只写 store、只靠横幅露面，
+ * 收敛到这里之后它们也自动有了提示。
+ *
+ * `store.set` 只在值真的变了才通知，所以同一个错误连续写两次只会播一条 ——
+ * 而 `run()` 在动作开始时会先把 `error` 清空，因此「重试又失败」照常提示。
+ */
+function announceError(state: AppState, previous?: AppState): void {
+  if (!state.error || state.error === previous?.error) return;
+  toast(state.error, 'error');
 }
 
 function renderHead(spec: ViewSpec, state: AppState): string {
@@ -124,16 +145,9 @@ function renderHead(spec: ViewSpec, state: AppState): string {
 }
 
 function renderBody(spec: ViewSpec, state: AppState): string {
-  const banner = state.error
-    ? `
-      <div class="banner err">
-        <span class="banner-icon">${ICON.alert}</span>
-        <span class="banner-text">${esc(state.error)}</span>
-        <button class="banner-close" data-action="dismiss-error" type="button"
-                aria-label="关闭提示">×</button>
-      </div>`
-    : '';
-  return `<div class="view-stack">${banner}${spec.body(state)}</div>`;
+  // 这里只放视图自己的内容 —— 失败提示走浮层（见 `announceError`），
+  // 页面结构不为「刚才失败了」这件事让位。
+  return `<div class="view-stack">${spec.body(state)}</div>`;
 }
 
 /**
