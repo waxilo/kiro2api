@@ -195,7 +195,10 @@ function restoreFocus(host: HTMLElement, snapshot: FocusSnapshot | null): void {
   if (!next) return;
   next.focus({ preventScroll: true });
   if (snapshot.start !== null && next instanceof HTMLInputElement) {
-    next.setSelectionRange(snapshot.start, snapshot.end ?? snapshot.start);
+    // 夹到新长度：搜索框会把非 ASCII 字符裁掉，重绘后的值可能比快照里的光标位置还短
+    const end = snapshot.end ?? snapshot.start;
+    const length = next.value.length;
+    next.setSelectionRange(Math.min(snapshot.start, length), Math.min(end, length));
   }
 }
 
@@ -240,6 +243,8 @@ function bindEvents(container: HTMLElement): void {
     setModelFilter(target.value);
   });
 
+  // 组字落地：这里拿到的是**候选词上屏之后**的值（可能是中文），
+  // `setModelFilter` 会把它裁成纯 ASCII —— 模型名全是英文，中文在这里没有意义。
   container.addEventListener('compositionend', (event) => {
     const target = event.target as HTMLInputElement;
     if (target.id === 'model-filter') setModelFilter(target.value);

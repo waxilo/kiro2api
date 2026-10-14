@@ -68,6 +68,11 @@ function countLabel(total: number, matched: number, query: string): string {
  *
  * 输入框必须带 `id`：外壳重绘时靠它把焦点与光标位置放回去（见 `ui/shell/shell.ts`），
  * 没有 id 的话边打字边筛选的体验是「每敲一个字就丢一次焦点」。
+ *
+ * `autocomplete` / `spellcheck` / `autocorrect` / `autocapitalize` 一律关掉：模型名既不该
+ * 被自动补全、也不该被改写大小写。注意这些都**管不到输入法** —— 候选词框是操作系统画的，
+ * 页面没有开关能关掉它（`ime-mode` 是废弃属性，Chrome/Edge/Safari 从未实现）。
+ * 「只收英文」这条由 `state/actions.ts` 的 `setModelFilter` 兜底。
  */
 function filterBar(query: string): string {
   const clear = query
@@ -78,6 +83,7 @@ function filterBar(query: string): string {
     <div class="filter-bar">
       <input class="filter-input" id="model-filter" type="text" value="${esc(query)}"
              placeholder="搜索模型名" autocomplete="off" spellcheck="false"
+             autocorrect="off" autocapitalize="off"
              aria-label="搜索模型名" />
       ${clear}
     </div>`;
