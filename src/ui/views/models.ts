@@ -13,8 +13,9 @@
 // 为它先启动一个监听端口、替用户向上游发请求，代价和收益完全不成比例。
 import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
+import { isPending } from '../../state/app-state';
 import { renderEnglishField } from '../shared/english-field';
-import { busyAttr, emptyState, note } from '../shared/render';
+import { actionAttrs, emptyState, note } from '../shared/render';
 import type { ViewSpec } from './types';
 
 export const modelsView: ViewSpec = {
@@ -24,8 +25,8 @@ export const modelsView: ViewSpec = {
   desc: '当前 Kiro 账户可用的模型清单；具体用哪个由客户端在请求里指定，本应用不做选择',
 
   head: (state) => {
-    const label = state.busyLabel === ACTION.syncModels ? '同步中…' : '从上游同步';
-    return `<button class="small" data-action="sync-models"${busyAttr(state.busy)}>${label}</button>`;
+    const label = isPending(state, ACTION.syncModels) ? '同步中…' : '从上游同步';
+    return `<button class="small" data-action="sync-models"${actionAttrs(state, ACTION.syncModels)}>${label}</button>`;
   },
 
   body: (state) => {

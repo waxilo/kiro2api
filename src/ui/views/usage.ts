@@ -4,7 +4,9 @@
 // 一眼就知道是不是快用完了。颜色在 75% / 90% 两档变调，对应「该留意了」与「要断了」。
 import { esc } from '../../core/format';
 import type { UsageInfo } from '../../core/types';
-import { emptyState, kv, kvList, note } from '../shared/render';
+import { ACTION } from '../../state/actions';
+import { isPending } from '../../state/app-state';
+import { actionAttrs, emptyState, kv, kvList, note } from '../shared/render';
 import type { ViewSpec } from './types';
 
 type MeterTone = 'ok' | 'warn' | 'err';
@@ -55,7 +57,7 @@ export const usageView: ViewSpec = {
 
   body: (state) => {
     const usage = state.usage;
-    const loading = state.usageLoading;
+    const loading = isPending(state, ACTION.queryUsage);
 
     const details = usage
       ? [
@@ -72,7 +74,7 @@ export const usageView: ViewSpec = {
         <div class="card-head">
           <span class="card-title">用量</span>
           <span class="card-head-spacer"></span>
-          <button class="small" data-action="usage" ${state.busy || loading ? 'disabled' : ''}>
+          <button class="small" data-action="usage"${actionAttrs(state, ACTION.queryUsage)}>
             ${loading ? '查询中…' : '查询额度'}
           </button>
         </div>

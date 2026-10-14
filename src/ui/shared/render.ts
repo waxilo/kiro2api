@@ -6,22 +6,31 @@
 // 约定：所有接收「值」的地方都接收**已经转义过或受控**的 HTML 片段 ——
 // 本模块只负责结构，不负责转义，调用方用 `core/format` 里的 `esc` / `text` 处理数据。
 import { esc } from '../../core/format';
-import type { StatusSummary, Tone, ViewId } from '../../state/app-state';
+import { actionScope } from '../../state/actions';
+import { isBlocking, isPending, type AppState, type StatusSummary, type Tone, type ViewId } from '../../state/app-state';
 import { ICON } from './icons';
 
 /**
- * 「因为别处正在忙，所以这颗按钮暂时不能做」的属性。
+ * 动作按钮的「暂时不能做」属性。
  *
- * 这里**不能**用 `disabled`：被禁用的表单控件连 click 都不会派发（更不会冒泡到外壳的
- * 事件委托），于是 `state/actions` 里那句「正在刷新凭据，请稍候」永远进不去 ——
- * 用户看到的还是一颗点了没反应的灰按钮，跟修复之前一模一样。
+ * 一律走 `aria-disabled` 而**不用** `disabled`：被禁用的表单控件连 click 都不会派发
+ * （更不会冒泡到外壳的事件委托），于是 `state/actions` 里那句「正在刷新凭据，请稍候」
+ * 永远进不去 —— 用户看到的还是一颗点了没反应的灰按钮。`aria-disabled` 在语义上同样是
+ * 「不可用」（读屏会播报），但点击照常派发，由 `run()` 统一给出解释；重复执行也由它挡住。
  *
- * `aria-disabled` 在语义上同样是「不可用」（读屏会播报），但点击照常派发，
- * 由 `run()` 统一给出解释。真正的 `disabled` 只留给「这颗按钮自己现在无事可做」
- * 的情况（没有地址可复制、代理没在运行）—— 那些原因就写在同一个卡片里，静默是对的。
+ * 什么情况算「现在不能做」，两种：
+ * * 这颗按钮自己正在跑（它自己的文案已经在写「…中」，再点一次等于重复请求）；
+ * * 别处有**会改配置**的动作在跑，而它自己也是会改配置的那一类。
+ *   范围由 `actionScope` 给出：刷新凭据、查询额度是 `scoped`，永远不会被别处的忙碌波及
+ *   —— 那正是「刷新凭据等 30 秒不该锁住整页」这条要求的落点。
+ *
+ * 真正的 `disabled` 只留给「这颗按钮自己现在无事可做」（没有地址可复制、代理没在运行）
+ * —— 那些原因就写在同一个卡片里，静默是对的。
  */
-export function busyAttr(busy: boolean): string {
-  return busy ? ' aria-disabled="true"' : '';
+export function actionAttrs(state: AppState, label: string): string {
+  if (isPending(state, label)) return ' aria-disabled="true"';
+  const blocked = actionScope(label) === 'global' && isBlocking(state);
+  return blocked ? ' aria-disabled="true"' : '';
 }
 
 /** 状态徽标：一个色点 + 短标签。 */

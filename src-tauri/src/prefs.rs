@@ -40,6 +40,12 @@ pub(crate) struct AppConfig {
     pub(crate) models: Vec<String>,
     /// 上一次查询到的账户额度快照。
     pub(crate) usage_cache: Option<UsageCache>,
+    /// 应用内更新的下载源。
+    ///
+    /// `None` 就是「自动」：每次拉清单时并行探测各镜像，挑第一个真能传数据的。
+    /// 其余取值是 `updater_accel` 里那份源清单的 id（`direct` 或某个镜像 id）——
+    /// 认不出来的值一律按自动处理，这样将来下线某个镜像时，旧配置不会让更新彻底不可用。
+    pub(crate) update_source: Option<String>,
 }
 
 /// 额度快照 + 写入时刻。重启后先拿它渲染，再等后台静默刷新替换。
@@ -60,6 +66,7 @@ impl Default for AppConfig {
             last_running: false,
             models: Vec::new(),
             usage_cache: None,
+            update_source: None,
         }
     }
 }
@@ -175,6 +182,24 @@ pub(crate) fn store_usage(info: &KiroUsageInfo) -> Result<(), String> {
             info: info.clone(),
             updated_at_ms: now_ms(),
         });
+        Ok(())
+    })
+}
+
+// ── 更新下载源 ──────────────────────────────────────────────────────────
+//
+// 取值是 `updater_accel` 那份源清单的 id。这里刻意只做存取、不做校验：
+// 「哪些 id 是有效的」属于清单代理的知识，放在同一处才不会两处漂移。
+
+/// 读取更新下载源偏好；`None` 表示「自动」。
+pub(crate) fn update_source_pref() -> Option<String> {
+    load_config().update_source
+}
+
+/// 写入更新下载源偏好。
+pub(crate) fn store_update_source(id: &str) -> Result<(), String> {
+    update_config(|config| {
+        config.update_source = Some(id.to_string());
         Ok(())
     })
 }

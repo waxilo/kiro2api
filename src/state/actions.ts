@@ -11,7 +11,13 @@ import { englishOnly, errorText } from '../core/format';
 import { backend } from '../core/ipc';
 import type { CopyKind, ModelsState, RevealTarget, UsageInfo } from '../core/types';
 import { updater } from '../services/updater';
-import { store, type ViewId } from './app-state';
+import {
+  blockingLabel,
+  isPending,
+  store,
+  type PendingAction,
+  type ViewId,
+} from './app-state';
 
 /** 表现层向状态层提供的反馈端口。 */
 export interface Feedback {
@@ -34,6 +40,7 @@ export const ACTION = {
   stopProxy: '停止代理',
   refreshToken: '刷新凭据',
   syncModels: '同步模型',
+  queryUsage: '查询额度',
   resetKey: '重置密钥',
   savePort: '保存端口',
   saveAutoStart: '保存自动启动',
@@ -51,12 +58,45 @@ const COPY_LABELS: Record<CopyKind, string> = {
 };
 
 /**
+ * 动作的占用范围。
+ *
+ * - `global`：会改配置的动作（启停代理、端口、自启动、重置密钥、同步模型）。
+ *   这类动作同时只允许跑一个 —— 两个都改配置，谁赢取决于执行顺序，不如干脆排队。
+ * - `scoped`：只影响自己那一块的动作（刷新凭据、查询额度）。它们不参与全局门控，
+ *   可以和别的动作并行；等的是网络，把整页锁住没有任何收益。
+ */
+type Scope = 'global' | 'scoped';
+
+/**
+ * 各动作的占用范围。集中在这里，是因为**视图也要用它** —— 别处有改配置的动作在跑时，
+ * 只有同样会改配置的按钮才该被标成「暂时不能做」；只读的那两个照常可用。
+ * 让视图各自去记「我这个动作是什么范围」，改一处就会漂一半。
+ *
+ * 没登记的动作按 `global` 处理：宁可多挡一下，也不要让两个改配置的动作并排跑。
+ */
+const ACTION_SCOPE: Record<string, Scope> = {
+  [ACTION.startProxy]: 'global',
+  [ACTION.stopProxy]: 'global',
+  [ACTION.syncModels]: 'global',
+  [ACTION.resetKey]: 'global',
+  [ACTION.savePort]: 'global',
+  [ACTION.saveAutoStart]: 'global',
+  [ACTION.refreshToken]: 'scoped',
+  [ACTION.queryUsage]: 'scoped',
+};
+
+/** 这个动作的占用范围。 */
+export function actionScope(label: string): Scope {
+  return ACTION_SCOPE[label] ?? 'global';
+}
+
+/**
  * 单个动作最多占用界面多久。超过就解锁并报错，而不是一直灰着。
  *
  * 后端命令各自都有超时（最长的凭据刷新是 30 秒的 HTTP），所以 45 秒只会在**响应回不来**
  * 时才触发 —— 实测出现过这种情况：后端早就把新凭据写好并 emit 了事件，页面上的 promise
  * 却迟迟不落地（窗口被最小化/遮挡时 Chromium 会节流任务投递）。没有这道闸，一次没落地的
- * invoke 会把 `busy` 永久钉住：所有 busy 门控的按钮一起变灰、再点也被静默吞掉，
+ * invoke 会把 `pending` 永久钉住：所有门控的按钮一起变灰、再点也被静默吞掉，
  * 只能重启应用。
  *
  * 局限也说清楚：页面处于后台时 `setTimeout` 本身也会被节流，所以「45 秒」在窗口最小化
@@ -64,9 +104,6 @@ const COPY_LABELS: Record<CopyKind, string> = {
  * （见 `ui/shell/shell.ts` 的 visibilitychange）。
  */
 const ACTION_TIMEOUT_MS = 45_000;
-
-/** 正在执行的动作名，用于「忙碌时又点了一次」的提示文案。 */
-let currentLabel: string | null = null;
 
 // ── 基础 ────────────────────────────────────────────────────────────────
 
@@ -125,10 +162,13 @@ export async function refresh(): Promise<void> {
 }
 
 /**
- * 执行一个会改配置的动作。
+ * 执行一个动作：登记「它在跑」→ 调后端 → 收尾。
  *
- * `busy` 期间不再静默返回 —— 那样用户会以为「点了没反应」，而真相是上一个动作还没结束。
- * 现在会明确提示在忙什么。
+ * 占用范围由**动作名**查表得出（见上面的 `ACTION_SCOPE`），而不是由调用方传进来 ——
+ * 视图那边判断「这颗按钮该不该标灰」用的也是同一张表，一处定义两处同源。
+ *
+ * 同名的动作不会重叠执行 ——「又点了一次」会被明确提示，而不是静默返回：用户以为「点了
+ * 没反应」，真相是上一个还在跑。
  *
  * 无论成功失败都在最后刷新一次：凭据刷新、模型同步、代理启停都会连带改变多项状态。
  * 唯一例外是调用方已经拿到了完整的权威状态（见 `resync: false`）。
@@ -138,23 +178,41 @@ export async function run(
   action: () => Promise<void>,
   options: { resync?: boolean } = {},
 ): Promise<void> {
-  if (store.get().busy) {
-    feedback.toast(`正在${currentLabel ?? '处理上一个操作'}，请稍候`, 'info');
+  const { resync = true } = options;
+  const blocking = actionScope(label) === 'global';
+
+  const before = store.get();
+  // 挡下这一次的两种理由：它自己已经在跑；或者它是改配置的动作、而另一个改配置的动作
+  // 正在跑。提示里要说清楚是谁在跑，否则用户只知道「点了没反应」。
+  const running = isPending(before, label)
+    ? label
+    : blocking
+      ? blockingLabel(before)
+      : null;
+  if (running) {
+    feedback.toast(`正在${running}，请稍候`, 'info');
     return;
   }
 
-  currentLabel = label;
+  const task: PendingAction = { label, blocking };
   // 顺手把上一次的错误清掉：它已经以 toast 播过了。不清的话，「同样的错误再来一次」
   // 会因为值没变而被 store 判定为「无变化」、连通知都不发，于是提示一声不响地消失。
-  store.set({ busy: true, busyLabel: label, error: null });
+  store.set({ pending: [...store.get().pending, task], error: null });
 
+  let settled = false;
   let timedOut = false;
+  // 出列只做一次：超时与正常结束都会走到这里。
+  const depart = (): void => {
+    if (settled) return;
+    settled = true;
+    store.set({ pending: store.get().pending.filter((item) => item !== task) });
+  };
+
   const timer = setTimeout(() => {
     timedOut = true;
+    depart();
     store.set({
-      busy: false,
-      busyLabel: null,
-      error: `${label}超时：${ACTION_TIMEOUT_MS / 1000} 秒内没有等到后端响应，已解锁界面，可以直接重试。`,
+      error: `${label}超时：${ACTION_TIMEOUT_MS / 1000} 秒内没有等到后端响应。命令可能仍在后台执行，可以直接重试。`,
     });
   }, ACTION_TIMEOUT_MS);
 
@@ -169,10 +227,9 @@ export async function run(
     }
   } finally {
     clearTimeout(timer);
-    currentLabel = null;
-    if (!timedOut) store.set({ busy: false, busyLabel: null });
+    depart();
     // 超时后也要同步一次：命令可能其实已经落地，只是「回话」没回来
-    if (options.resync !== false) await refresh();
+    if (resync) await refresh();
   }
 }
 
@@ -206,16 +263,22 @@ async function copyModel(model: string): Promise<void> {
   }
 }
 
+/**
+ * 查询账户额度。
+ *
+ * 走 `run()`，但它在 `ACTION_SCOPE` 里登记为 `scoped`：只影响额度那一块
+ * （自己的按钮写「查询中…」），不会把别处的按钮一起灰掉，也不会被别处的忙碌挡住。
+ *
+ * `resync: false` —— 结果本身就是权威状态，不需要再整体拉一遍本地状态。
+ */
 async function queryUsage(): Promise<void> {
-  // 同样先清空上一次的错误：否则连着两次同样的失败，第二次会因为值没变而一声不响
-  store.set({ usageLoading: true, error: null });
-  try {
-    store.set({ usage: await backend.usage(), error: null });
-  } catch (error) {
-    store.set({ error: `额度查询失败：${errorText(error)}` });
-  } finally {
-    store.set({ usageLoading: false });
-  }
+  await run(
+    ACTION.queryUsage,
+    async () => {
+      store.set({ usage: await backend.usage() });
+    },
+    { resync: false },
+  );
 }
 
 async function reveal(path: RevealTarget): Promise<void> {
@@ -258,6 +321,9 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
       // 后端已经把刷新后的 `ProxyStatus` 作为返回值送回来了，直接写进 store：
       // invoke 一落地，界面上的到期时间就是新的，不用再打一轮 IPC 去重新读。
       // 凭据刷新不会改动 access / models，所以这一次跳过最终的整体同步。
+      //
+      // `scoped`（见 ACTION_SCOPE）：它等的是最长 30 秒的上游 HTTP，只碰凭据文件、
+      // 不改配置，因此不占用全局门控 —— 这 30 秒里用户想启动代理、复制地址、查额度都照常。
       await run(
         ACTION.refreshToken,
         async () => {
@@ -381,6 +447,9 @@ export async function bindBackendEvents(): Promise<void> {
     store.set({ models: event.payload });
   });
   await listen<UsageInfo>('proxy://usage-updated', (event) => {
-    store.set({ usage: event.payload, usageLoading: false });
+    // 只换数值。后台刷新与「用户手动查一次」是两件事：手动那次有自己的 pending 记录，
+    // 由它自己在收尾时出列 —— 这里顺手清掉别人的进行态，会让那颗按钮在查询还没回来时
+    // 就先变回可点。
+    store.set({ usage: event.payload });
   });
 }

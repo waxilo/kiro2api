@@ -10,8 +10,8 @@ import { esc } from '../../core/format';
 import { copyKindNeedsKey } from '../../core/ipc';
 import type { CopyKind } from '../../core/types';
 import { ACTION } from '../../state/actions';
-import type { AppState } from '../../state/app-state';
-import { busyAttr, kv, kvList, mono, note } from '../shared/render';
+import { isBlocking, isPending, type AppState } from '../../state/app-state';
+import { actionAttrs, kv, kvList, mono, note } from '../shared/render';
 import type { ViewSpec } from './types';
 
 interface ProtoSpec {
@@ -68,7 +68,9 @@ function copyButton(kind: CopyKind, label: string, enabled = true): string {
 function renderProto(proto: ProtoSpec, state: AppState): string {
   const hasKey = Boolean(state.access?.hasApiKey);
   const urlMissing = !proto.url;
-  const baseDisabled = state.busy || urlMissing;
+  // 复制本身很快，但它读的是同一份配置 —— 有动作在改配置时先别读，
+  // 否则可能复制到「改到一半」的地址，用户拿到的配置和界面上显示的对不上。
+  const baseDisabled = isBlocking(state) || urlMissing;
   // 需要密钥的种类在无密钥时禁用：与后端 `kind_needs_key` 共用同一判据
   const canCopy = (kind: CopyKind): boolean => !baseDisabled && (!copyKindNeedsKey(kind) || hasKey);
 
@@ -109,10 +111,10 @@ export const endpointsView: ViewSpec = {
           <span class="card-title">代理凭据</span>
           <span class="card-head-spacer"></span>
           <button class="small" data-action="copy" data-kind="api_key"
-                  ${state.busy || !hasKey ? 'disabled' : ''}>复制密钥</button>
+                  ${isBlocking(state) || !hasKey ? 'disabled' : ''}>复制密钥</button>
           <button class="small danger" data-action="reset-key"
-                  ${running ? 'disabled' : busyAttr(state.busy)}>
-            ${state.busyLabel === ACTION.resetKey ? '重置中…' : '重置密钥'}
+                  ${running ? 'disabled' : actionAttrs(state, ACTION.resetKey)}>
+            ${isPending(state, ACTION.resetKey) ? '重置中…' : '重置密钥'}
           </button>
         </div>
         ${kvList([kv('代理密钥', mono(access?.apiKeyMasked))])}

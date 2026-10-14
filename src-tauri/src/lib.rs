@@ -171,6 +171,8 @@ pub fn run() {
             kiro::k2a_usage,
             kiro::k2a_refresh_token,
             kiro::k2a_reveal,
+            updater_accel::k2a_update_source_get,
+            updater_accel::k2a_update_source_set,
             window::k2a_snap_rect,
             window::k2a_diag,
             window::k2a_quit_app,

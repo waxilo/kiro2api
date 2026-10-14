@@ -5,8 +5,8 @@
 // 并用可点击的指标块把跳转做出来，避免这一页长成第二个「什么都有一点」的长列表。
 import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
-import { serviceAddress, summarizeStatus } from '../../state/app-state';
-import { busyAttr, note, statTile, statusPill, kvList, kv } from '../shared/render';
+import { isPending, serviceAddress, summarizeStatus } from '../../state/app-state';
+import { actionAttrs, note, statTile, statusPill, kvList, kv } from '../shared/render';
 import { ICON } from '../shared/icons';
 import type { ViewSpec } from './types';
 
@@ -31,9 +31,16 @@ export const overviewView: ViewSpec = {
   title: '概览',
   desc: '本地服务、凭据与接入地址的当前快照',
 
-  // 「刷新」是只读的补一次同步，不参与 busy 门控：别处卡住时它就是用户手边的一根救命绳
-  // （真正的兜底是 run() 的超时，这里只是让用户不必干等）。
-  head: () => `<button class="small" data-action="refresh">刷新</button>`,
+  // 这一页不再有标题右侧的「刷新」。
+  //
+  // 它做的只是「从本地后端重读一遍状态」（四个不发网络的 IPC），而这件事四条路径都在自动做：
+  // 首屏、每个动作收尾、后端推送事件、窗口重新可见 / 重新获得焦点。留一颗按钮在那里，
+  // 用户只会得到一个问题 ——「它到底刷新了什么」，答不上来就说明它不该在。
+  //
+  // 唯一没被自动覆盖的场景（应用一直开着、用户在窗口外面登录了 Kiro）现在由
+  // 「Kiro 凭据」卡片里的「重新检测」接手：它出现在凭据不可用的那一刻，
+  // 正好在「请先登录 Kiro IDE / 执行 kiro-cli login」那句提示旁边。
+  head: () => '',
 
   body: (state) => {
     const status = state.status;
@@ -44,11 +51,12 @@ export const overviewView: ViewSpec = {
     const hasKey = Boolean(access?.hasApiKey);
     const models = state.models;
     const usage = state.usage;
-    // 进行态文案：`busy` 只负责把按钮标成不可用，`busyLabel` 才说明「是谁在跑」。
+    const available = Boolean(status?.available);
+    // 进行态文案：`pending` 里那条记录只负责把按钮标成不可用，名字才说明「是谁在跑」。
     // 只有正在跑的那一个按钮改文案，其余按钮保持原名（只是灰着），避免张冠李戴。
-    const startText = state.busyLabel === ACTION.startProxy ? '启动中…' : '启动代理';
-    const stopText = state.busyLabel === ACTION.stopProxy ? '停止中…' : '停止代理';
-    const refreshText = state.busyLabel === ACTION.refreshToken ? '刷新中…' : '刷新凭据';
+    const startText = isPending(state, ACTION.startProxy) ? '启动中…' : '启动代理';
+    const stopText = isPending(state, ACTION.stopProxy) ? '停止中…' : '停止代理';
+    const refreshText = isPending(state, ACTION.refreshToken) ? '刷新中…' : '刷新凭据';
 
     const serviceCard = `
       <div class="card">
@@ -59,9 +67,9 @@ export const overviewView: ViewSpec = {
           ${
             running
               ? `<button class="danger" data-action="proxy-stop"
-                         ${busyAttr(state.busy)}>${stopText}</button>`
+                         ${actionAttrs(state, ACTION.stopProxy)}>${stopText}</button>`
               : `<button class="primary" data-action="proxy-start"
-                         ${status?.available ? busyAttr(state.busy) : ' disabled'}>${startText}</button>`
+                         ${available ? actionAttrs(state, ACTION.startProxy) : ' disabled'}>${startText}</button>`
           }
         </div>
 
@@ -105,26 +113,41 @@ export const overviewView: ViewSpec = {
         })}
       </div>`;
 
+    // 凭据这一格有两种完全不同的处境，动作也不同 —— 所以按钮跟着处境走：
+    //
+    // * 凭据可用 → 「刷新凭据」，真去上游 OIDC 换一次 token（它等网络，但不锁页面）。
+    // * 凭据不可用 → 「重新检测」，只重读本地。此时「刷新凭据」必然失败（没有 refreshToken
+    //   可刷），摆在那里只会把人引到一条死路上；而人真正会做的事是去窗口外面登录一次，
+    //   再回来问「好了没」—— 这正是「重新检测」回答的问题。
+    const credentialAction = !status
+      ? ''
+      : available
+        ? `<button class="small" data-action="refresh-token"
+                   ${actionAttrs(state, ACTION.refreshToken)}>${refreshText}</button>`
+        : `<button class="small" data-action="refresh">重新检测</button>`;
+
+    const credentialBody = !status
+      ? note('正在读取凭据状态…')
+      : available
+        ? kvList([
+            kv('来源', esc(status.authSource)),
+            kv('到期', status.expiresAt ? `<code>${esc(status.expiresAt)}</code>` : '—'),
+          ])
+        : note(
+            '未找到凭据。请先登录 Kiro IDE，或执行 <code>kiro-cli login</code>，' +
+              '确认 <code>~/.aws/sso/cache/kiro-auth-token.json</code> 存在；' +
+              '登录完成后点右上角「重新检测」。',
+            'warn',
+          );
+
     const credentialCard = `
       <div class="card">
         <div class="card-head">
           <span class="card-title">Kiro 凭据</span>
           <span class="card-head-spacer"></span>
-          <button class="small" data-action="refresh-token"
-                  ${busyAttr(state.busy)}>${refreshText}</button>
+          ${credentialAction}
         </div>
-        ${
-          status?.available
-            ? kvList([
-                kv('来源', esc(status.authSource)),
-                kv('到期', status.expiresAt ? `<code>${esc(status.expiresAt)}</code>` : '—'),
-              ])
-            : note(
-                '未找到凭据。请先登录 Kiro IDE，或执行 <code>kiro-cli login</code>，' +
-                  '确认 <code>~/.aws/sso/cache/kiro-auth-token.json</code> 存在。',
-                'warn',
-              )
-        }
+        ${credentialBody}
       </div>`;
 
     const accessCard = `

@@ -69,6 +69,36 @@ export type RevealTarget = 'config' | 'log' | 'sso';
 /** 应用内更新的阶段。 */
 export type UpdatePhase = 'idle' | 'checking' | 'downloading' | 'error';
 
+/** 「应用更新」分区里的一个下载源选项（对应 Rust 侧那份源清单）。 */
+export interface UpdateSourceOption {
+  id: string;
+  label: string;
+  /** 下拉框下面那句补充说明。 */
+  hint: string;
+}
+
+/**
+ * 最近一次检查更新实际走的下载源。
+ *
+ * 存在的理由只有一个：用户固定了某个镜像、它却不可用时要**如实说出来**，
+ * 而不是让他以为自己在用首选源。
+ */
+export interface UpdateSourcePick {
+  sourceId: string;
+  label: string;
+  /** 首选源没能用上（选了固定镜像却回退了）。 */
+  fallback: boolean;
+}
+
+/** `k2a_update_source_get` 的返回。 */
+export interface UpdateSourceState {
+  /** 当前选择（`auto` / `direct` / 某个镜像 id）。 */
+  current: string;
+  options: UpdateSourceOption[];
+  /** 还没检查过时为 null。 */
+  last: UpdateSourcePick | null;
+}
+
 /** 应用内更新的完整状态（由 `services/updater` 写入 store）。 */
 export interface UpdateState {
   currentVersion: string;
@@ -80,4 +110,6 @@ export interface UpdateState {
   notes: string | null;
   downloaded: number;
   total: number;
+  /** 下载源：当前选择、可选项、本次实际走的源。读取失败时为 null。 */
+  source: UpdateSourceState | null;
 }

@@ -41,17 +41,18 @@ export interface AppState {
    */
   modelFilter: string;
   usage: UsageInfo | null;
-  /** 额度查询进行中（与全局 `busy` 分开：它只影响额度那一个视图）。 */
-  usageLoading: boolean;
-  /** 有动作在执行：期间禁用会改配置的控件。 */
-  busy: boolean;
   /**
-   * 正在执行的动作名（如「刷新凭据」），`busy` 为假时是 null。
+   * 正在执行的动作（同名动作同时至多一个）。
    *
-   * 光有一个布尔量只能让按钮变灰 —— 用户看到的是「点了没反应」。带上名字之后，
-   * 那个按钮自己就能写「刷新中…」，状态栏也能挂一条全局的进行态。
+   * 这里从前是 `busy: boolean` + `busyLabel: string | null` 两个字段。拆成列表是为了区分
+   * **占用范围**：光有一个布尔量，任何动作一开跑就把整页会改配置的按钮一起灰掉，
+   * 而「刷新凭据」等的是最长 30 秒的上游 HTTP —— 用户在这 30 秒里想启动代理、复制地址、
+   * 查额度，全都被静默吞掉，看起来就是「页面锁住了」。
+   *
+   * 现在每个动作自己声明它占多大地方：会改配置的（启停代理、端口、自启动、重置密钥、
+   * 同步模型）互相阻塞；只碰自己那一块的（刷新凭据、查询额度）不参与全局门控。
    */
-  busyLabel: string | null;
+  pending: PendingAction[];
   /**
    * 最近一次失败的说明。
    *
@@ -62,6 +63,14 @@ export interface AppState {
    */
   error: string | null;
   update: UpdateState;
+}
+
+/** 一个正在执行的动作。 */
+export interface PendingAction {
+  /** 动作名（取自 `state/actions` 的 `ACTION`）。 */
+  label: string;
+  /** 是否占用全局门控：会改配置的动作占用，只读 / 局部刷新的不占用。 */
+  blocking: boolean;
 }
 
 /** 语义色档位。渲染层据此选 class，状态层只负责判断档位。 */
@@ -85,6 +94,7 @@ const INITIAL_UPDATE: UpdateState = {
   notes: null,
   downloaded: 0,
   total: 0,
+  source: null,
 };
 
 export const store = createStore<AppState>({
@@ -94,12 +104,30 @@ export const store = createStore<AppState>({
   models: null,
   modelFilter: '',
   usage: null,
-  usageLoading: false,
-  busy: false,
-  busyLabel: null,
+  pending: [],
   error: null,
   update: { ...INITIAL_UPDATE },
 });
+
+/**
+ * 有「会改配置」的动作在跑吗 —— 期间其它同为改配置的控件不可用。
+ *
+ * 判断依据是「动作会不会改配置」，不是「有没有东西在跑」：刷新凭据也在跑，但它只碰
+ * 凭据文件，没有理由让别人等着。
+ */
+export function isBlocking(state: AppState): boolean {
+  return state.pending.some((task) => task.blocking);
+}
+
+/** 会改配置、正在跑的那一个动作名（用于解释「为什么这颗按钮现在不能点」）。 */
+export function blockingLabel(state: AppState): string | null {
+  return state.pending.find((task) => task.blocking)?.label ?? null;
+}
+
+/** 这个动作正在跑吗 —— 它自己那颗按钮据此写「…中」并禁用，避免点两次。 */
+export function isPending(state: AppState, label: string): boolean {
+  return state.pending.some((task) => task.label === label);
+}
 
 /**
  * 把「服务状态」压成一个语义结论。

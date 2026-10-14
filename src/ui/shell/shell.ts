@@ -228,6 +228,9 @@ function bindEvents(container: HTMLElement): void {
       case 'autostart-input':
         void saveAutoStart((target as HTMLInputElement).checked);
         return;
+      case 'update-source-input':
+        void updater.setSource((target as HTMLSelectElement).value);
+        return;
       default:
         return;
     }
@@ -247,13 +250,42 @@ function bindEvents(container: HTMLElement): void {
     if (target.id === 'model-filter' && store.get().modelFilter) setModelFilter('');
   });
 
-  // 窗口重新可见时补一次状态同步。
+  // 窗口重新可见 / 重新获得焦点时补一次状态同步。
   //
   // WebView2 在窗口最小化 / 被遮挡时会被 Chromium 节流，任务投递（后端命令的响应、
   // 后端推来的事件）都会延后。实测出现过「后端早就把新凭据写好并 emit 了事件，
-  // 界面还停在旧的到期时间」，而 `busy` 也就一直不解除。回到可见状态时补一次即可，
-  // 代价是三个本地 IPC（不发网络请求）。
+  // 界面还停在旧的到期时间」，而动作的进行态也就一直不解除。回到可见状态时补一次即可，
+  // 代价是四个本地 IPC（不发网络请求）。
+  //
+  // `focus` 那一条另有一个场景：应用窗口一直开着，用户去窗口外面执行了 `kiro-cli login`，
+  // 回到窗口就该看见凭据已经就绪。这原本是概览页那颗「刷新」按钮唯一独占的事 ——
+  // 现在由它自己完成，那颗按钮就不再需要了。
+  //
+  // 唯一例外：光标正停在某个输入控件里时不重画（见 `isEditing`）。
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') void refresh();
+    if (document.visibilityState === 'visible') void syncOnRegain();
   });
+  window.addEventListener('focus', () => void syncOnRegain());
+}
+
+/**
+ * 焦点回到本窗口时的那次同步。
+ *
+ * 用户正把光标放在某个输入控件里（端口、自启动开关、模型搜索框、下载源下拉框）时跳过：
+ * 重绘是整块换 innerHTML，没提交的输入会回到上一次的状态 —— 而「读一遍本地状态」这件事
+ * 晚一秒没有任何代价，用户正在敲的字却会白敲。
+ */
+function syncOnRegain(): Promise<void> {
+  return isEditing() ? Promise.resolve() : refresh();
+}
+
+/** 焦点是不是落在某个输入控件里（原生输入框 / 下拉框 / 自绘搜索框）。 */
+function isEditing(): boolean {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) return false;
+  return (
+    active instanceof HTMLInputElement ||
+    active instanceof HTMLSelectElement ||
+    active.matches('[role="textbox"]')
+  );
 }

@@ -12,6 +12,7 @@ import type {
   ProxyAccess,
   ProxyStatus,
   RevealTarget,
+  UpdateSourceState,
   UsageInfo,
 } from './types';
 
@@ -54,6 +55,17 @@ export const backend = {
    */
   copyText: (text: string) => invoke<boolean>('k2a_copy_text', { text }),
   resetKey: () => invoke<ProxyAccess>('k2a_reset_key'),
+
+  // ── 更新下载源 ────────────────────────────────────────────────────────
+  /**
+   * 读当前的下载源设置（纯本地，读配置 + 内存里那条「本次实际使用」记录）。
+   */
+  updateSource: () => invoke<UpdateSourceState>('k2a_update_source_get'),
+  /**
+   * 切换更新下载源。后端会校验 id、落盘，并丢掉清单缓存 ——
+   * 所以调用方拿到返回值之后应当立刻重新检查一次更新，那时走的才是新线路。
+   */
+  setUpdateSource: (id: string) => invoke<UpdateSourceState>('k2a_update_source_set', { id }),
 
   // ── 系统 ──────────────────────────────────────────────────────────────
   reveal: (path: RevealTarget) => invoke<void>('k2a_reveal', { path }),

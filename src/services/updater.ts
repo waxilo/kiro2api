@@ -1,7 +1,7 @@
 // 应用内更新：检查 → 下载（带进度与停滞检测）→ 安装 → 重启。
 //
 // 后端已把 `plugins.updater.endpoints` 的第一个地址指向本机清单代理（127.0.0.1:47866），
-// 该代理会把清单里的下载地址改写为最快的 GitHub 镜像，因此这里的逻辑只管
+// 该代理会按用户选定的**下载源**把清单里的下载地址改写成镜像 URL，因此这里的逻辑只管
 // 「重试 / 停滞中断 / 安装后重启」三件事，不需要感知镜像细节。
 //
 // 与旧实现的差别：不再持有 `onChange` 回调、也不再自己拼 HTML，只把 UpdateState 写进 store。
@@ -15,6 +15,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 
 import { errorText } from '../core/format';
+import { backend } from '../core/ipc';
 import type { UpdateState } from '../core/types';
 import { store } from '../state/app-state';
 
@@ -136,18 +137,48 @@ async function installAndRelaunch(): Promise<void> {
 }
 
 export const updater = {
-  /** 首屏调用：取当前版本并静默检查一次。 */
+  /** 首屏调用：取当前版本、读下载源，然后静默检查一次。 */
   async init(): Promise<void> {
     try {
       patch({ currentVersion: await getVersion() });
     } catch {
       /* 取版本失败不阻塞更新检查 */
     }
+    // 先出「下载源」那一栏再检查：否则用户会先看到检查结果、后看到下拉框，闪一下。
+    await this.loadSource();
     void this.check(false);
   },
 
   get busy(): boolean {
     return current().phase === 'checking' || current().phase === 'downloading';
+  },
+
+  /** 读取下载源设置（纯本地读取）。失败只记 console：它不影响检查更新本身。 */
+  async loadSource(): Promise<void> {
+    try {
+      patch({ source: await backend.updateSource() });
+    } catch (error) {
+      console.warn('[updater] 读取下载源失败:', error);
+    }
+  },
+
+  /**
+   * 切换下载源。
+   *
+   * 后端在落盘的同时会丢掉清单缓存，所以这里紧接着重新检查一次 —— 用户切完立刻能看到
+   * 「本次使用」变成他选的那条路，而不是等下一个缓存周期。
+   */
+  async setSource(id: string): Promise<void> {
+    const previous = current();
+    if (id === previous.source?.current) return;
+    try {
+      patch({ source: await backend.setUpdateSource(id) });
+      await this.check(true);
+    } catch (error) {
+      // 失败就把选择退回上一个：下拉框是按 store 渲染的，不回退的话它会停在一个
+      // 实际没生效的值上 —— 界面在说谎。
+      patch({ source: previous.source, error: `切换下载源失败：${errorText(error)}` });
+    }
   },
 
   async check(force = false): Promise<void> {
@@ -172,6 +203,9 @@ export const updater = {
           phase: 'idle',
           statusText: null,
         });
+        // 「本次使用」是清单代理刚刚决定的（可能回退了），顺手取一次 —— 它就是给
+        // 「我选的源到底生效没有」这个问题用的，晚一拍等于没答。
+        void this.loadSource();
       } catch (error) {
         const raw = errorText(error);
         patch({

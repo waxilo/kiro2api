@@ -67,9 +67,12 @@ export function updateStatusbar(state: AppState): void {
 
   // 全局进行态：任何动作在跑，这里都显示它在干什么。
   // 只让按钮变灰的话，用户看到的是「点了没反应」——这一条把「它在忙」摆到明面上。
+  //
+  // 同时可能有好几个动作在跑（刷新凭据 + 查询额度：它们不互相阻塞），
+  // 显示最先开始的那一个 —— 那通常也是用户正在等的那一个。
   const busy = document.getElementById('sb-busy');
   if (busy) {
-    const label = state.busyLabel;
+    const label = state.pending[0]?.label ?? null;
     busy.classList.toggle('is-on', Boolean(label));
     const text = document.getElementById('sb-busy-text');
     if (text) text.textContent = label ? `${label}…` : '';

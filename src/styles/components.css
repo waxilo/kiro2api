@@ -21,10 +21,11 @@ button {
 
 /* 两种「不可用」要分开表达：
 
-   * `:disabled` —— 这颗按钮自己现在没有可做的事（没地址可复制、代理没在运行）。
-     连 click 都不派发，静默即可，因为原因就写在同一个卡片里。
+   * `:disabled` —— 这颗按钮自己现在没有可做的事（没地址可复制、代理没在运行），
+     或者它自己正在跑。
+     连 click 都不派发，静默即可，因为原因就写在同一个卡片里 / 它自己的文案上。
    * `[aria-disabled='true']` —— 因为别处正在忙而暂时不能做。它**必须**接得住点击，
-     好让状态层回一句「正在 X，请稍候」（见 ui/shared/render.ts 的 busyAttr）。
+     好让状态层回一句「正在 X，请稍候」（见 ui/shared/render.ts 的 actionAttrs）。
      观感与真禁用一致，但不给任何 hover / active 反馈，免得看着像能点。 */
 button:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--surface-2);
