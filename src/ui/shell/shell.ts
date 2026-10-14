@@ -1,7 +1,7 @@
 // 外壳组装与唯一的渲染循环。
 //
 // 这里是整个界面的「接线盒」，只做四件事：
-//   1. 建一次静态外壳（标题栏 / 导航 / 内容区 / 状态栏）—— 窗口按钮与滚动容器的事件绑定
+//   1. 建一次静态外壳（标题栏 / 导航 / 内容区）—— 窗口按钮与滚动容器的事件绑定
 //      不随内容重绘重建；
 //   2. 订阅 store，任何状态变化都从这里出发重画；
 //   3. 把点击 / 变更事件按委托分发给 `state/actions`；
@@ -17,7 +17,6 @@ import {
   dispatch,
   navigate,
   refresh,
-  saveAutoStart,
   savePort,
   setModelFilter,
   useFeedback,
@@ -29,7 +28,6 @@ import { ScrollArea } from '../shared/scroll-area';
 import { toast } from '../shared/toast';
 import { VIEWS, type ViewSpec } from '../views';
 import { renderRail, updateRail } from './rail';
-import { renderStatusbar, updateStatusbar } from './statusbar';
 import { bindTitlebar, renderTitlebar, reportShellReady, updateTitlebar } from './titlebar';
 
 let headEl: HTMLElement;
@@ -54,7 +52,6 @@ export function mountApp(container: HTMLElement): void {
         </div>
       </main>
     </div>
-    <div class="statusbar">${renderStatusbar()}</div>
   `;
 
   const head = document.getElementById('view-head');
@@ -94,7 +91,6 @@ function render(state: AppState, previous?: AppState): void {
   // 但它们所在的 DOM 结构不该被重建（会打断过渡动画、丢失文字选中）。
   updateTitlebar(state);
   updateRail(state);
-  updateStatusbar(state);
 
   const spec = VIEWS[state.view];
   headEl.innerHTML = renderHead(spec, state);
@@ -224,9 +220,6 @@ function bindEvents(container: HTMLElement): void {
     switch (target.id) {
       case 'port-input':
         void savePort((target as HTMLInputElement).value);
-        return;
-      case 'autostart-input':
-        void saveAutoStart((target as HTMLInputElement).checked);
         return;
       case 'update-source-input':
         void updater.setSource((target as HTMLSelectElement).value);

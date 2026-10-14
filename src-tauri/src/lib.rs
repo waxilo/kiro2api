@@ -1,8 +1,7 @@
-//! kiro2api 应用装配：插件、状态、命令注册、托盘常驻、自动启动。
+//! kiro2api 应用装配：插件、状态、命令注册、托盘常驻。
 
 use std::path::Path;
 use std::sync::OnceLock;
-use std::thread;
 
 use tauri::{AppHandle, Manager};
 
@@ -71,54 +70,6 @@ pub(crate) fn reveal_in_file_manager(target: &Path) -> Result<(), String> {
     Err("当前平台不支持打开文件管理器".to_string())
 }
 
-/// 应用启动时按用户偏好自动拉起代理（不阻塞窗口显示）。
-fn spawn_autostart(app: AppHandle, state: KiroProxyState) {
-    thread::spawn(move || {
-        let config = prefs::load_config();
-        if !config.auto_start {
-            eprintln!("[proxy] 跳过自动启动：未开启自动启动");
-            return;
-        }
-        if !kiro::is_locally_available() {
-            eprintln!("[proxy] 跳过自动启动：本机无 Kiro 凭据");
-            return;
-        }
-        let _guard = match state.op_lock.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                eprintln!("[proxy] 跳过自动启动：操作锁已损坏");
-                return;
-            }
-        };
-        match kiro::start_proxy(&state, None) {
-            Ok(status) => {
-                eprintln!(
-                    "[proxy] 自动启动成功: running={} port={:?}",
-                    status.running, status.port
-                );
-                let _ = app.emit_to_all("proxy://ready", &status);
-            }
-            Err(error) => eprintln!("[proxy] 自动启动失败: {error}"),
-        }
-    });
-}
-
-/// 向前端统一广播事件的小工具（避免每处都写 `use tauri::Emitter`）。
-trait EmitToAll {
-    fn emit_to_all<S: serde::Serialize + Clone>(&self, event: &str, payload: S) -> tauri::Result<()>;
-}
-
-impl EmitToAll for AppHandle {
-    fn emit_to_all<S: serde::Serialize + Clone>(
-        &self,
-        event: &str,
-        payload: S,
-    ) -> tauri::Result<()> {
-        use tauri::Emitter;
-        self.emit(event, payload)
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -148,10 +99,7 @@ pub fn run() {
                 eprintln!("[tray] 托盘初始化失败: {error}");
             }
 
-            let state = app.state::<KiroProxyState>().inner().clone();
-            spawn_autostart(handle, state);
-            // 模型列表与额度缓存的后台刷新。与自动启动并行，互不依赖：
-            // 它是「让界面上的旧值变成新值」，不是「让代理跑起来」。
+            // 模型列表与额度缓存的后台刷新：它是「让界面上的旧值变成新值」，不是「让代理跑起来」。
             kiro::spawn_startup_refresh();
             Ok(())
         })
@@ -163,7 +111,6 @@ pub fn run() {
             kiro::k2a_stop,
             kiro::k2a_sync_models,
             kiro::k2a_cached_usage,
-            kiro::k2a_set_auto_start,
             kiro::k2a_set_port,
             kiro::k2a_copy_access,
             kiro::k2a_copy_text,

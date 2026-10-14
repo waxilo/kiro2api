@@ -12,7 +12,6 @@ export interface ProxyStatus {
   authSource: string;
   expiresAt: string | null;
   profileArn: string | null;
-  autoStart: boolean;
   configDir: string;
   debugLogPath: string;
 }

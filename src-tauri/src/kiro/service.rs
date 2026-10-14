@@ -156,7 +156,6 @@ pub struct ProxyStatus {
     pub auth_source: String,
     pub expires_at: Option<String>,
     pub profile_arn: Option<String>,
-    pub auto_start: bool,
     pub config_dir: String,
     pub debug_log_path: String,
 }
@@ -166,7 +165,6 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
     let port = state.port.lock().ok().and_then(|p| *p);
     let key = current_api_key(state);
     let auth = new_auth();
-    let config = load_config();
     ProxyStatus {
         running,
         available: is_locally_available() || running,
@@ -175,7 +173,6 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
         auth_source: auth.describe_auth_source(),
         expires_at: auth.get_sso_token_expiry(),
         profile_arn: auth.get_sso_profile_arn(),
-        auto_start: config.auto_start,
         config_dir: crate::paths::get_data_path().display().to_string(),
         debug_log_path: crate::paths::get_debug_log_path().display().to_string(),
     }
@@ -292,10 +289,9 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
     *state.port.lock().map_err(|_| "lock failed".to_string())? = Some(actual_port);
     *state.inner.lock().map_err(|_| "lock failed".to_string())? = Some(handle);
 
-    // 记下端口与运行态，供下次启动恢复
+    // 记下端口，供下次启动恢复
     let _ = update_config(|config| {
         config.port = actual_port;
-        config.last_running = true;
         Ok(())
     });
 
@@ -325,10 +321,6 @@ pub(crate) fn stop_proxy(state: &ProxyStateRef) -> Result<ProxyStatus, String> {
     }
     *state.port.lock().map_err(|_| "lock failed".to_string())? = None;
     *state.key.lock().map_err(|_| "lock failed".to_string())? = None;
-    let _ = update_config(|config| {
-        config.last_running = false;
-        Ok(())
-    });
     Ok(build_status(state))
 }
 
@@ -680,17 +672,14 @@ pub fn k2a_cached_usage() -> Option<super::auth::KiroUsageInfo> {
 }
 
 #[tauri::command]
-pub fn k2a_set_auto_start(enabled: bool) -> Result<bool, String> {
-    update_config(|config| {
-        config.auto_start = enabled;
-        Ok(enabled)
-    })
-}
-
-#[tauri::command]
-pub fn k2a_set_port(port: u16) -> Result<u16, String> {
+pub fn k2a_set_port(state: State<'_, ProxyStateRef>, port: u16) -> Result<u16, String> {
     if port < 1024 {
         return Err("端口需大于 1023，避免占用系统保留端口".to_string());
+    }
+    // 前端在运行中已禁用输入框，这里是 IPC 层的同一守卫：
+    // 运行中改端口只会造成「界面显示的地址」与「服务实际监听的端口」分家。
+    if is_proxy_running(&state) {
+        return Err("代理运行中，端口修改需先停止代理".to_string());
     }
     update_config(|config| {
         config.port = port;

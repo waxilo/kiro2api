@@ -1,4 +1,4 @@
-/* 外壳层：窗口骨架三段式（标题栏 / 主区 / 状态栏），主区再分导航与内容。
+/* 外壳层：窗口骨架两段式（标题栏 / 主区），主区再分导航与内容。
    这一层决定「屏幕上哪一块归谁」，不含任何业务视觉。
 
    ┌──────────────────────────────────────────────────────────┐
@@ -7,9 +7,7 @@
    │ .rail 白   │ .view-head   标题 + 说明 + 该分区的动作（固定）│
    │ 分组导航   ├─────────────────────────────────────────────┤
    │            │ .view-host → .view-body   内容（唯一滚动区）  │
-   ├────────────┴─────────────────────────────────────────────┤
-   │ .statusbar  白 · 常驻遥测：状态 / 地址 / 凭据              │
-   └──────────────────────────────────────────────────────────┘ */
+   └────────────┴─────────────────────────────────────────────┘ */
 
 /* ── 标题栏 ─────────────────────────────────────────────────────────── */
 /* 拖拽由 data-tauri-drag-region="deep" 接管（它会跳过按钮等可点击元素），
@@ -382,118 +380,6 @@
 .osb-track:hover .osb-thumb,
 .osb-track.is-dragging .osb-thumb {
   background: var(--scroll-thumb-hover);
-}
-
-/* ── 状态栏 ───────────────────────────────────────────────────────── */
-/* 常驻遥测条。它不随分区变化，「代理跑没跑」这类问题不必切回概览去确认。 */
-.statusbar {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--s-sm);
-  height: var(--statusbar-h);
-  padding: 0 var(--s-md);
-  background: var(--chrome);
-  border-top: 1px solid var(--hairline);
-  font-size: var(--t-caption);
-  color: var(--ink-subtle);
-  user-select: none;
-  -webkit-user-select: none;
-}
-
-.sb-slot {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.sb-slot code {
-  font-size: var(--t-caption);
-  color: var(--ink-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.sb-spacer {
-  flex: 1;
-}
-
-.sb-dot {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ink-tertiary);
-}
-/* 运行中给色点加一圈极淡的同色晕：不用跳动的动画，也能一眼看出「活着」 */
-.sb-dot.ok {
-  background: var(--success);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent);
-}
-.sb-dot.warn {
-  background: var(--warning);
-}
-.sb-dot.err {
-  background: var(--danger);
-}
-
-.sb-strong {
-  font-weight: 550;
-  color: var(--ink-muted);
-}
-
-.sb-key {
-  color: var(--ink-tertiary);
-}
-
-/* 全局进行态：任何动作在跑，这里都亮起来说它在干什么。
-   默认占位为零（display:none），不占版面也不闪动。 */
-.sb-busy {
-  display: none;
-  flex: none;
-  align-items: center;
-  gap: 6px;
-}
-.sb-busy.is-on {
-  display: flex;
-}
-.sb-busy #sb-busy-text {
-  color: var(--primary);
-}
-
-/* 细环转圈：用 border 的一半做弧，比 SVG 省一层 DOM */
-.sb-spinner {
-  flex: none;
-  width: 10px;
-  height: 10px;
-  border: 1.5px solid color-mix(in srgb, var(--primary) 28%, transparent);
-  border-top-color: var(--primary);
-  border-radius: 50%;
-  animation: sb-spin 0.7s linear infinite;
-}
-
-@keyframes sb-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* 关掉动画偏好时不转圈，改成实心点：仍然能看出「在忙」，但不晃眼 */
-@media (prefers-reduced-motion: reduce) {
-  .sb-spinner {
-    animation: none;
-    border-color: var(--primary);
-    background: color-mix(in srgb, var(--primary) 35%, transparent);
-  }
-}
-
-.statusbar .is-dim {
-  color: var(--ink-tertiary);
-}
-.statusbar .is-warn {
-  color: var(--warning);
 }
 
 /* ── 窄窗口 ───────────────────────────────────────────────────────── */

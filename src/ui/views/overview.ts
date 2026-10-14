@@ -5,7 +5,7 @@
 // 并用可点击的指标块把跳转做出来，避免这一页长成第二个「什么都有一点」的长列表。
 import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
-import { isPending, serviceAddress, summarizeStatus } from '../../state/app-state';
+import { isPending, summarizeStatus } from '../../state/app-state';
 import { actionAttrs, note, statTile, statusPill, kvList, kv } from '../shared/render';
 import { ICON } from '../shared/icons';
 import type { ViewSpec } from './types';
@@ -45,7 +45,6 @@ export const overviewView: ViewSpec = {
   body: (state) => {
     const status = state.status;
     const summary = summarizeStatus(state);
-    const address = serviceAddress(state);
     const running = Boolean(status?.running);
     const access = state.access;
     const hasKey = Boolean(access?.hasApiKey);
@@ -73,28 +72,11 @@ export const overviewView: ViewSpec = {
           }
         </div>
 
-        ${kvList([
-          kv(
-            '服务地址',
-            address ? `<code>${esc(address)}</code>` : '<span class="dim">未启动</span>',
-          ),
-          kv('监听端口', portValue(status?.port)),
-          kv('随应用启动', status?.autoStart ? '已开启' : '已关闭'),
-        ])}
-
-        <div class="field-row">
-          <label class="field">
-            <span>端口</span>
-            <input id="port-input" type="number" min="1024" max="65535"
-                   value="${status?.port ?? 5680}" ${running ? 'disabled' : ''} />
-          </label>
-          <label class="switch">
-            <input id="autostart-input" type="checkbox" ${status?.autoStart ? 'checked' : ''} />
-            <span>随应用自动启动</span>
-          </label>
-        </div>
-
-        ${running ? '' : note('代理未运行时，双协议接口均不可用。启动后地址会自动填入下方。')}
+        <label class="field is-row">
+          <span>端口</span>
+          <input id="port-input" type="number" min="1024" max="65535"
+                 value="${status?.port ?? 5680}" ${running ? 'disabled' : ''} />
+        </label>
       </div>`;
 
     const tiles = `
@@ -174,7 +156,3 @@ export const overviewView: ViewSpec = {
       </div>`;
   },
 };
-
-function portValue(port: number | null | undefined): string {
-  return port ? `<code>${port}</code>` : '<span class="dim">未启动</span>';
-}

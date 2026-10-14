@@ -43,7 +43,6 @@ export const ACTION = {
   queryUsage: '查询额度',
   resetKey: '重置密钥',
   savePort: '保存端口',
-  saveAutoStart: '保存自动启动',
 } as const;
 
 /** 每个复制目标在提示里的说法。集中在这里，避免散落在分支里对不上。 */
@@ -60,7 +59,7 @@ const COPY_LABELS: Record<CopyKind, string> = {
 /**
  * 动作的占用范围。
  *
- * - `global`：会改配置的动作（启停代理、端口、自启动、重置密钥、同步模型）。
+ * - `global`：会改配置的动作（启停代理、端口、重置密钥、同步模型）。
  *   这类动作同时只允许跑一个 —— 两个都改配置，谁赢取决于执行顺序，不如干脆排队。
  * - `scoped`：只影响自己那一块的动作（刷新凭据、查询额度）。它们不参与全局门控，
  *   可以和别的动作并行；等的是网络，把整页锁住没有任何收益。
@@ -80,7 +79,6 @@ const ACTION_SCOPE: Record<string, Scope> = {
   [ACTION.syncModels]: 'global',
   [ACTION.resetKey]: 'global',
   [ACTION.savePort]: 'global',
-  [ACTION.saveAutoStart]: 'global',
   [ACTION.refreshToken]: 'scoped',
   [ACTION.queryUsage]: 'scoped',
 };
@@ -409,13 +407,6 @@ export async function savePort(raw: string): Promise<void> {
   await run(ACTION.savePort, async () => {
     await backend.setPort(port);
     feedback.toast(`端口已设置为 ${port}（下次启动生效）`);
-  });
-}
-
-export async function saveAutoStart(enabled: boolean): Promise<void> {
-  await run(ACTION.saveAutoStart, async () => {
-    await backend.setAutoStart(enabled);
-    feedback.toast(enabled ? '已开启随应用自动启动' : '已关闭自动启动');
   });
 }
 

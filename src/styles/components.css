@@ -254,6 +254,13 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
   color: var(--ink-subtle);
 }
 
+/* 标签与输入框并排一行：只有一个短字段时，上下摞白占一行高度 */
+.field.is-row {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--s-sm);
+}
+
 .field-inline {
   max-width: 360px;
 }

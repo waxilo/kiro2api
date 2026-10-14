@@ -152,9 +152,3 @@ export function summarizeStatus(state: AppState): StatusSummary {
   }
   return { tone: 'off', label: '已停止', detail: '代理未运行，双协议接口不可用' };
 }
-
-/** 服务地址，未运行时为 null。 */
-export function serviceAddress(state: AppState): string | null {
-  const port = state.status?.port;
-  return state.status?.running && port ? `http://127.0.0.1:${port}` : null;
-}

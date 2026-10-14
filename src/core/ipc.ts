@@ -40,7 +40,6 @@ export const backend = {
   syncModels: () => invoke<ModelsState>('k2a_sync_models'),
 
   // ── 配置 ──────────────────────────────────────────────────────────────
-  setAutoStart: (enabled: boolean) => invoke<boolean>('k2a_set_auto_start', { enabled }),
   setPort: (port: number) => invoke<number>('k2a_set_port', { port }),
 
   // ── 密钥与复制 ────────────────────────────────────────────────────────

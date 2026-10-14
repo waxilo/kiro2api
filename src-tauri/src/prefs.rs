@@ -28,10 +28,6 @@ pub(crate) struct AppConfig {
     pub(crate) port: u16,
     /// 代理密钥。持久化后，复制到其它客户端（Claude Code / OpenAI SDK）的配置在重启后仍然可用。
     pub(crate) proxy_api_key: Option<String>,
-    /// 应用启动时是否自动拉起代理。
-    pub(crate) auto_start: bool,
-    /// 上次退出时代理是否处于运行态。用于「自动启动」开启时恢复上次状态。
-    pub(crate) last_running: bool,
     /// 上一次从上游同步到的可用模型。
     ///
     /// 落盘的意义是「打开应用就能看见有哪些模型」—— 不必先启动代理，也不必等联网。
@@ -62,8 +58,6 @@ impl Default for AppConfig {
         Self {
             port: DEFAULT_PORT,
             proxy_api_key: None,
-            auto_start: false,
-            last_running: false,
             models: Vec::new(),
             usage_cache: None,
             update_source: None,
@@ -286,7 +280,6 @@ mod tests {
     fn default_config_is_usable() {
         let config = AppConfig::default();
         assert_eq!(config.port, DEFAULT_PORT);
-        assert!(!config.auto_start);
         assert!(config.proxy_api_key.is_none());
     }
 
