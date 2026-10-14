@@ -264,15 +264,15 @@
   display: flex;
 }
 
-.filter-input {
-  width: 100%;
-  /* 清空按钮压在右端，留出它的宽度再加半个间隙 —— 模型名很长，
-     不留位置的话结尾几个字符会跑到按钮底下。 */
+/* 选择器带上 `.ef-box`：皮肤那半边在 components.css 里（同特异性、先加载），
+   靠加载顺序压过去太脆，写实一点。 */
+.ef-box.filter-input {
+  /* 搜索框本体是自绘的 `.ef-box`（皮肤在 components.css，与同字号的 input 共用一套），
+     这里只补它在这块布局里该有的宽度。清空按钮压在右端，所以要留出它的宽度再加半个间隙 ——
+     模型名很长，不留位置的话结尾几个字符会跑到按钮底下。 */
+  flex: 1;
+  min-width: 0;
   padding-right: 28px;
-}
-
-.filter-bar ::placeholder {
-  color: var(--ink-tertiary);
 }
 
 /* 位置与尺寸写在基础规则里，**不**挂在 `:not(:disabled)` 上 ——

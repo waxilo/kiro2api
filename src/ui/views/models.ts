@@ -13,6 +13,7 @@
 // 为它先启动一个监听端口、替用户向上游发请求，代价和收益完全不成比例。
 import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
+import { renderEnglishField } from '../shared/english-field';
 import { busyAttr, emptyState, note } from '../shared/render';
 import type { ViewSpec } from './types';
 
@@ -29,7 +30,8 @@ export const modelsView: ViewSpec = {
 
   body: (state) => {
     const all = state.models?.models ?? [];
-    const query = state.modelFilter.trim();
+    const raw = state.modelFilter;
+    const query = raw.trim();
     const needle = query.toLowerCase();
     const shown = needle ? all.filter((id) => id.toLowerCase().includes(needle)) : all;
 
@@ -40,7 +42,7 @@ export const modelsView: ViewSpec = {
           <span class="card-head-spacer"></span>
           <span class="card-sub">${countLabel(all.length, shown.length, query)}</span>
         </div>
-        ${all.length ? filterBar(query) : ''}
+        ${all.length ? filterBar(raw) : ''}
         ${inventoryBody(shown, all.length, query)}
       </div>`;
 
@@ -66,25 +68,29 @@ function countLabel(total: number, matched: number, query: string): string {
  * 只在「真有清单」时才渲染 —— 空清单下面没有东西可筛，摆一个搜了也没用的输入框
  * 只会让人怀疑是不是自己搜错了。
  *
- * 输入框必须带 `id`：外壳重绘时靠它把焦点与光标位置放回去（见 `ui/shell/shell.ts`），
- * 没有 id 的话边打字边筛选的体验是「每敲一个字就丢一次焦点」。
+ * 框体是**自绘**的（`ui/shared/english-field.ts`）：不是 `<input>`，而是不可编辑的
+ * `div[role="textbox"]`。为什么要这样折腾 —— 候选词框是操作系统输入法画的，只要焦点落在
+ * 可编辑元素上，web 层就没有开关能关掉它（`ime-mode` 是废弃属性，Chrome/Edge/Safari 从未
+ * 实现；`inputmode` 只管触屏的虚拟键盘）。换成不可编辑元素之后，Chromium / WebKit 不给它建
+ * 输入法上下文，选着中文输入法敲字母也是**不出候选、直接进框**。
+ * 做法参考 market-monitor 桌面端的 `components/EnglishField.tsx`。
  *
- * `autocomplete` / `spellcheck` / `autocorrect` / `autocapitalize` 一律关掉：模型名既不该
- * 被自动补全、也不该被改写大小写。注意这些都**管不到输入法** —— 候选词框是操作系统画的，
- * 页面没有开关能关掉它（`ime-mode` 是废弃属性，Chrome/Edge/Safari 从未实现）。
- * 「只收英文」这条由 `state/actions.ts` 的 `setModelFilter` 兜底。
+ * 框必须带 `id`：外壳重绘时靠它把焦点与光标位置放回去（见 `ui/shell/shell.ts` 的焦点快照），
+ * 没有 id 的话边打字边筛选的体验是「每敲一个字就丢一次焦点」。
  */
-function filterBar(query: string): string {
-  const clear = query
+function filterBar(value: string): string {
+  const clear = value
     ? '<button class="filter-clear" type="button" data-action="clear-model-filter"' +
       ' data-refocus="model-filter" aria-label="清空搜索" title="清空搜索">×</button>'
     : '';
   return `
     <div class="filter-bar">
-      <input class="filter-input" id="model-filter" type="text" value="${esc(query)}"
-             placeholder="搜索模型名" autocomplete="off" spellcheck="false"
-             autocorrect="off" autocapitalize="off"
-             aria-label="搜索模型名" />
+      ${renderEnglishField({
+        id: 'model-filter',
+        value,
+        placeholder: '搜索模型名',
+        className: 'filter-input',
+      })}
       ${clear}
     </div>`;
 }

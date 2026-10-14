@@ -296,6 +296,96 @@ select:focus {
   box-shadow: 0 0 0 3px var(--primary-ring);
 }
 
+/* ── 自绘输入框 `.ef-box` ──────────────────────────────────────────────
+   不是 `<input>`，而是不可编辑的 `div[role="textbox"]`：**焦点落在非编辑元素上，
+   输入法不会启动** —— 选着中文输入法敲字母也不出候选词、直接进框（Chromium / WebKit
+   只给可编辑元素建输入法上下文，Windows 与 macOS 同一套机制）。候选词框由操作系统画在
+   系统层，只要焦点在可编辑元素上，web 层就没有开关能关掉它。行为见
+   `ui/shared/english-field.ts`，做法参考 market-monitor 桌面端的 EnglishField。
+
+   皮肤刻意与 `input[type='text']` 逐项对齐（内边距、圆角、描边、底色、等宽字体、
+   字号、过渡、focus 环）：自绘的是行为，不该顺带换一副长相。行高与最小高度必须钉死 ——
+   空框里一个字都没有，不钉的话它会缩成两条内边距那么高。 */
+.ef-box {
+  display: block;
+  position: relative;
+  padding: 5px 9px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-1);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+  line-height: 15px;
+  min-height: 27px; /* 15 + 5×2 + 1×2：与同字号的 input 同高 */
+  white-space: pre;
+  overflow: hidden;
+  cursor: text;
+  user-select: none;
+  -webkit-user-select: none;
+  transition:
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
+}
+
+.ef-box:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-ring);
+}
+
+/* 选区就是给中间那段换个底色 —— 中性灰，与 focus 环的主色分开 */
+.ef-sel {
+  background: var(--surface-3);
+  border-radius: 2px;
+}
+
+/* 光标：夹在文字流里的内联块，跟着排自动落位（不用量坐标）；只在框有焦点时露面 */
+.ef-caret {
+  display: none;
+  width: 1px;
+  height: 14px;
+  vertical-align: text-bottom;
+  background: currentColor; /* 跟随场景文字色 */
+  pointer-events: none;
+}
+
+.ef-box[data-focus='1'] .ef-caret {
+  display: inline-block;
+  /* 光标一动就重播动画（字段模块用「先 none 后空」重启）：刚移完先亮着，跟手，
+     与原生 input 一个脾气 */
+  animation: ef-blink 1.1s steps(1) infinite;
+}
+
+@keyframes ef-blink {
+  0%,
+  55% {
+    opacity: 1;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* 占位：与外面对 `::placeholder` 的处理同一个色（那个选择器管不到自绘框） */
+.ef-ph {
+  color: var(--ink-tertiary);
+}
+
+/* 粘贴走位用的 sink：接一次原生粘贴就退场，不露面、不进 Tab 序 */
+.ef-sink {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .switch {
   display: flex;
   align-items: center;

@@ -24,6 +24,7 @@ import {
 } from '../../state/actions';
 import { store, type AppState, type ViewId } from '../../state/app-state';
 import { esc } from '../../core/format';
+import { bindEnglishFields } from '../shared/english-field';
 import { ScrollArea } from '../shared/scroll-area';
 import { toast } from '../shared/toast';
 import { VIEWS, type ViewSpec } from '../views';
@@ -233,28 +234,17 @@ function bindEvents(container: HTMLElement): void {
   });
 
   // 搜索框反过来：边打边筛，用 change 得等失焦才生效，那是筛选框最不能忍的延迟。
-  // 每敲一个字符重绘一次分区（输入框靠 id 拿回焦点与光标），代价只有几十个 chip 的字符串拼接。
-  container.addEventListener('input', (event) => {
-    const target = event.target as HTMLInputElement;
-    if (target.id !== 'model-filter') return;
-    // 输入法组字过程中不重绘：整块换 innerHTML 会打断候选词窗口，也会把组字状态弄丢。
-    // 组字结束时会再补一次 input（Chrome）；WebKit 只给 compositionend，所以下面也接一份。
-    if ((event as InputEvent).isComposing) return;
-    setModelFilter(target.value);
-  });
+  //
+  // 它是**自绘**的（不是 `<input>`，见 `ui/shared/english-field.ts`）：输入、光标、选区、
+  // Ctrl+A/C/X/V、粘贴全归字段模块自己管 —— 外壳只负责把「用户改成了什么值」转给状态层。
+  // 顺带也就没有组字态这回事了：不可编辑元素拿不到输入法上下文，压根不会产生候选词。
+  bindEnglishFields(container, (_id, next) => setModelFilter(next));
 
-  // 组字落地：这里拿到的是**候选词上屏之后**的值（可能是中文），
-  // `setModelFilter` 会把它裁成纯 ASCII —— 模型名全是英文，中文在这里没有意义。
-  container.addEventListener('compositionend', (event) => {
-    const target = event.target as HTMLInputElement;
-    if (target.id === 'model-filter') setModelFilter(target.value);
-  });
-
-  // Escape 清空搜索。焦点还在输入框里，重绘后外壳的焦点快照会把光标放回原位。
+  // Escape 清空搜索。焦点还在框里，重绘后外壳的焦点快照会把光标放回原位。
   container.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
-    const target = event.target as HTMLInputElement;
-    if (target.id === 'model-filter' && target.value) setModelFilter('');
+    const target = event.target as HTMLElement;
+    if (target.id === 'model-filter' && store.get().modelFilter) setModelFilter('');
   });
 
   // 窗口重新可见时补一次状态同步。

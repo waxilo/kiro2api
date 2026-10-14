@@ -7,7 +7,7 @@
 //   * 渲染完全不在这里发生：写入 store 后由外壳单点订阅触发重画。
 import { listen } from '@tauri-apps/api/event';
 
-import { errorText } from '../core/format';
+import { englishOnly, errorText } from '../core/format';
 import { backend } from '../core/ipc';
 import type { CopyKind, ModelsState, RevealTarget, UsageInfo } from '../core/types';
 import { updater } from '../services/updater';
@@ -75,30 +75,19 @@ export function navigate(view: ViewId): void {
 }
 
 /**
- * 搜索词只保留可打印 ASCII。
- *
- * 为什么必须在这里兜底，而不是想办法「关掉输入法」：**web 层没有这个开关**。
- * `ime-mode` 是早已废弃的 CSS 属性，Chrome / Edge / Safari 从未实现过；
- * `inputmode` 只影响触屏上的虚拟键盘；Chromium 也没有提供任何 API 让某个输入框
- * 不接输入法。候选词框是操作系统输入法画的，页面完全碰不到它。
- *
- * 所以能保证的只有「落进搜索框的东西一定是英文」：模型名全是 ASCII，中文候选词
- * 在这里没有任何意义。这一步同时挡住输入法上屏和从别处粘贴两件事。
- */
-function asciiOnly(text: string): string {
-  // 非可打印 ASCII 一律丢掉：中文、全角标点、emoji、制表符、换行都在此列
-  return text.replace(/[^\x20-\x7e]/g, '');
-}
-
-/**
  * 更新「可用模型」分区的搜索词。
  *
  * 不走 `run()`：它是一次纯本地的重绘触发，没有后端命令、没有耗时、也不该有 `busy` 语义 ——
  * 被上一个动作的忙碌状态挡住、连打字都被吞掉，那才是真的糟。
+ *
+ * 「只收英文」这条现在**有两道**：搜索框本身是自绘的、不是可编辑元素，输入法压根不会启动
+ * （中文候选词无从产生，单个按键在字段模块里就被 `englishOnly` 拒了，见
+ * `ui/shared/english-field.ts`）；这里这道兜的是**粘贴**——整段文本是原样交上来的，
+ * 由这里一把尺子量完，也由这里负责告诉用户裁掉了什么。
  */
 export function setModelFilter(query: string): void {
-  const ascii = asciiOnly(query);
-  // 裁掉过东西就说一句：否则用户看到自己刚打进去的字凭空消失，只会以为是坏了
+  const ascii = englishOnly(query);
+  // 裁掉过东西就说一句：否则用户看到自己刚贴进去的字凭空消失，只会以为是坏了
   if (ascii !== query) {
     feedback.toast('模型名是英文，搜索框只接受 ASCII 字符');
   }

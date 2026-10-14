@@ -33,6 +33,21 @@ export function errorText(error: unknown): string {
   return String(error);
 }
 
+/**
+ * 只留英文：模型名 / 交易对名这类标识符允许的字符集 —— **可打印 ASCII 去掉空格**。
+ *
+ * 取 `[^\x21-\x7e]` 而不是 market-monitor 的 `[^A-Za-z0-9_]`：那边的字母表是交易对名
+ * （`BTC_USDT`），这边的模型名长 `claude-opus-4.6` 这样，**点和连字符必须留着**，
+ * 照抄会把搜 `4.6` 变成搜 `46`。空格也要去掉 —— 模型名里没有空格，放进来只会让
+ * 一次误按空格把后续输入全变成「搜不到」。
+ *
+ * 用在两处：① 自绘输入框的按键闸门（`ui/shared/english-field.ts`，中文、全角、标点
+ * 根本进不了框）；② 搜索词落库前的兜底（`state/actions.ts`，挡住粘贴整段文本那条路）。
+ */
+export function englishOnly(raw: string): string {
+  return raw.replace(/[^\x21-\x7e]/g, '');
+}
+
 /** 字节 → MB 字符串，用于更新包体积。 */
 export function megabytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0.0';
