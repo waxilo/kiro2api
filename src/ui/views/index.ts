@@ -9,6 +9,7 @@ import { endpointsView } from './endpoints';
 import { maintenanceView } from './maintenance';
 import { modelsView } from './models';
 import { overviewView } from './overview';
+import { thirdpartyView } from './thirdparty';
 import { updatesView } from './updates';
 import { usageView } from './usage';
 import type { ViewSpec } from './types';
@@ -16,6 +17,7 @@ import type { ViewSpec } from './types';
 export const VIEWS: Record<ViewId, ViewSpec> = {
   overview: overviewView,
   endpoints: endpointsView,
+  thirdparty: thirdpartyView,
   models: modelsView,
   usage: usageView,
   updates: updatesView,

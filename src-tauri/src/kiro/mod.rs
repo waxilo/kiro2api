@@ -5,7 +5,8 @@
 //! - `models`：模型名映射 / effort 归一化 / token 估算 / 模型能力 schema
 //! - `transform`：Anthropic ↔ Kiro 请求响应转换
 //! - `openai`：OpenAI Chat Completions 兼容层（入参归一化 + 出参翻译）
-//! - `server`：本地 HTTP 代理，同一端口按路径分流两套协议
+//! - `responses`：OpenAI Responses API 兼容层（Codex CLI 专用入口，复用 openai 的归一化链）
+//! - `server`：本地 HTTP 代理，同一端口按路径分流各套协议
 //! - `service`：应用层集成（Tauri 命令、配置持久化、凭据定时刷新）
 //!
 //! 协议内核移植自 https://github.com/aristra/kiro2cli（MIT License），
@@ -15,6 +16,7 @@ pub mod auth;
 pub mod eventstream;
 pub mod models;
 pub mod openai;
+pub mod responses;
 pub mod server;
 pub mod service;
 pub mod transform;

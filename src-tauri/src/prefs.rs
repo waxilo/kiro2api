@@ -165,19 +165,34 @@ pub(crate) fn store_models(models: &[String]) -> Result<(), String> {
 }
 
 /// 读取缓存的额度快照（纯本地读取）。从未查询过时为 `None`。
+///
+/// `fetchedAt` 在这里用**缓存写入时刻**补上：它描述的是「这份数据有多老」，
+/// 读盘时填才能让上次启动前写下的快照也带得上年龄。
 pub(crate) fn cached_usage() -> Option<KiroUsageInfo> {
-    load_config().usage_cache.map(|cache| cache.info)
+    load_config().usage_cache.map(|cache| KiroUsageInfo {
+        fetched_at: ms_to_iso(cache.updated_at_ms),
+        ..cache.info
+    })
 }
 
-/// 写入额度快照（连同写入时刻）。
-pub(crate) fn store_usage(info: &KiroUsageInfo) -> Result<(), String> {
+/// 写入额度快照（连同写入时刻），返回该时刻的 Unix 毫秒 —— 调用方把它填进
+/// `fetchedAt`，让返回给前端的值与落盘的缓存出自同一时间源，不会各说各话。
+pub(crate) fn store_usage(info: &KiroUsageInfo) -> Result<i64, String> {
+    let stamped = now_ms();
     update_config(|config| {
         config.usage_cache = Some(UsageCache {
             info: info.clone(),
-            updated_at_ms: now_ms(),
+            updated_at_ms: stamped,
         });
         Ok(())
-    })
+    })?;
+    Ok(stamped)
+}
+
+/// Unix 毫秒 → UTC 的 RFC3339（秒级，`Z` 结尾）。前端会转成本地时区再展示。
+pub(crate) fn ms_to_iso(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 // ── 更新下载源 ──────────────────────────────────────────────────────────
@@ -325,5 +340,19 @@ mod tests {
         assert_eq!(cache.updated_at_ms, 1_760_300_000_000);
         // 上游没给的可选字段落空，而不是解析失败
         assert!(cache.info.email.is_none());
+    }
+
+    #[test]
+    fn ms_to_iso_renders_utc_seconds() {
+        assert_eq!(ms_to_iso(0).as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(
+            ms_to_iso(1_767_225_600_000).as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        // 纪元之前也是合法时刻，正常成环而不是落 None
+        assert_eq!(
+            ms_to_iso(-1).as_deref(),
+            Some("1969-12-31T23:59:59Z")
+        );
     }
 }

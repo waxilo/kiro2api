@@ -6,11 +6,13 @@
 //!
 //! kiro2api 刻意**不**改写任何外部客户端的配置文件（不碰 `~/.claude/settings.json` 之类）：
 //! 接入方式一律通过「一键复制配置片段」交给用户自行粘贴，避免应用私自改动用户环境。
+//! 唯一例外是 WorkBuddy 快捷导入（`crate::workbuddy`）：用户显式发起、只写它自己的
+//! 模型清单且从不删除条目，该原则对其余客户端仍然成立。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -19,7 +21,7 @@ use crate::kiro::models::kiro_model_to_public_model_id;
 use crate::paths::kiro_sso_cache_dir;
 use crate::prefs::{
     cached_models, cached_usage, ensure_api_key, generate_api_key, load_config, mask_api_key,
-    store_models, store_usage, update_config,
+    ms_to_iso, store_models, store_usage, update_config,
 };
 
 pub(crate) const KIRO_RUNTIME_URL: &str = "https://runtime.us-east-1.kiro.dev/";
@@ -126,7 +128,7 @@ pub(crate) fn is_locally_available() -> bool {
 /// 不能以 `is_proxy_running` 作为分支条件 —— 线程一旦 spawn，`is_proxy_running` 立即为 true，
 /// 而内存 key 是稍后几行才写入的。若在这段窗口内只看内存副本，就会读到空密钥，
 /// 前端把复制按钮置灰，用户看到的现象是「刚打开就要重开一次才能复制」。
-fn current_api_key(state: &ProxyStateRef) -> Option<String> {
+pub(crate) fn current_api_key(state: &ProxyStateRef) -> Option<String> {
     let in_memory = state
         .key
         .lock()
@@ -206,10 +208,14 @@ pub struct ProxyAccess {
 
 pub(crate) fn build_access(state: &ProxyStateRef) -> ProxyAccess {
     let running = is_proxy_running(state);
+    // 接入地址是**配置**的函数，不是「进程活着」的函数：跑着用实际端口（被占时
+    // bind_server 会向后找，可能与配置不同），停着用配置端口 —— 那是上次运行
+    // 保存下来、下次启动优先尝试的值。地址照常给出，客户端可以先配好地址与密钥，
+    // 等代理一启动就能通；逼用户「先跑一次再回来复制」没有收益。
     let port = if running {
         state.port.lock().ok().and_then(|p| *p)
     } else {
-        None
+        Some(load_config().port)
     };
     let key = current_api_key(state);
     let origin = port.map(|port| format!("http://127.0.0.1:{port}"));
@@ -328,9 +334,32 @@ pub(crate) fn stop_proxy(state: &ProxyStateRef) -> Result<ProxyStatus, String> {
 
 /// 强制刷新共享 SSO 凭据（IDE / CLI 同一文件），写回 `~/.aws/sso/cache`。
 /// 返回 `(是否执行了刷新, 最新 expiresAt)`。
-pub(crate) fn refresh_credentials() -> Result<(bool, Option<String>), String> {
-    touch_kiro_cli();
-    new_auth().force_refresh()
+///
+/// `source` 标明这次刷新是谁发起的（手动 / 后台循环 / 预检恢复 / 请求重试）：
+/// 刷新全程的分阶段耗时都会追加进 kiro-debug.log，并发刷新时靠它才分得清哪行是哪次。
+/// 打包版没有控制台，`eprintln!` 的输出谁也看不见 —— 没有这份时间线，
+/// 「刷新凭据超时」就只能靠猜。日志只记耗时、端点与到期时间，不记任何令牌内容。
+pub(crate) fn refresh_credentials(source: &'static str) -> Result<(bool, Option<String>), String> {
+    let started = Instant::now();
+    let touch = touch_kiro_cli(source);
+    let result = new_auth().force_refresh(source);
+    let rest = started.elapsed().saturating_sub(touch);
+    let total = crate::diag::secs(started.elapsed());
+    let touch_secs = crate::diag::secs(touch);
+    let rest_secs = crate::diag::secs(rest);
+    match &result {
+        Ok((true, expires_at)) => crate::diag::log(&format!(
+            "[refresh:{source}] 刷新完成：{total}（轻触 {touch_secs} + 刷新 {rest_secs}），新到期 {}",
+            expires_at.as_deref().unwrap_or("—"),
+        )),
+        Ok((false, _)) => crate::diag::log(&format!(
+            "[refresh:{source}] 无可刷新的凭据：{total}（轻触 {touch_secs} + 刷新 {rest_secs}）",
+        )),
+        Err(error) => crate::diag::log(&format!(
+            "[refresh:{source}] 刷新失败：{total}（轻触 {touch_secs} + 刷新 {rest_secs}）：{error}",
+        )),
+    }
+    result
 }
 
 /// 每次「轻触」最多等多久。到点就终止子进程，绝不无限期等。
@@ -347,7 +376,9 @@ const KIRO_TOUCH_TIMEOUT: Duration = Duration::from_secs(8);
 ///   匹配不到 `kiro.cmd`，会直接返回 NotFound（`kiro-cli` 同理）。也就是说在只有
 ///   `.cmd` 启动器的机器上，这个函数是空操作 —— 这是有意留着的：装上真正的
 ///   `kiro-cli.exe` 后它会自动生效，而空操作不会带来任何副作用。
-fn touch_kiro_cli() {
+/// 返回这段「轻触」花了多久（两个二进制都不可用时 ≈ 0，总账里看得见）。
+fn touch_kiro_cli(source: &'static str) -> Duration {
+    let started = Instant::now();
     for bin in ["kiro-cli", "kiro"] {
         let mut cmd = std::process::Command::new(bin);
         crate::proc_guard::suppress_console_window(&mut cmd);
@@ -361,15 +392,20 @@ fn touch_kiro_cli() {
         };
         match crate::proc_guard::wait_with_timeout(&mut child, KIRO_TOUCH_TIMEOUT) {
             Some(status) if status.success() => {
-                eprintln!("[proxy] 已在刷新前轻触 `{bin} whoami`");
-                return;
+                crate::diag::log(&format!(
+                    "[refresh:{source}] 轻触 `{bin} whoami`：{}，成功",
+                    crate::diag::secs(started.elapsed())
+                ));
+                return started.elapsed();
             }
             Some(_) => {}
-            None => eprintln!(
-                "[proxy] 轻触 `{bin} whoami` 超过 {KIRO_TOUCH_TIMEOUT:?} 未退出，已终止（不影响本次刷新）"
-            ),
+            None => crate::diag::log(&format!(
+                "[refresh:{source}] 轻触 `{bin} whoami`：{} 未退出，已终止（不影响本次刷新）",
+                crate::diag::secs(KIRO_TOUCH_TIMEOUT)
+            )),
         }
     }
+    started.elapsed()
 }
 
 fn next_refresh_delay(expires_at: Option<&str>) -> Duration {
@@ -436,7 +472,7 @@ pub(crate) fn spawn_refresh_loop(state: ProxyStateRef) {
                 break;
             }
 
-            match refresh_credentials() {
+            match refresh_credentials("后台循环") {
                 Ok((true, expires_at)) => {
                     eprintln!("[proxy] 共享 SSO 凭据已刷新");
                     let mut status = build_status(&state);
@@ -505,6 +541,20 @@ fn notify<S: Serialize + Clone>(event: &str, payload: S) {
     }
 }
 
+/// 额度落盘 + 推事件 + 回填 `fetchedAt`，命令与启动刷新共用这同一段。
+///
+/// 时间戳取落盘的那一刻（`store_usage` 的返回值）而不是「查询返回的此刻」：
+/// 界面上「上次刷新」与缓存年龄说的是同一件事，两个时间源迟早会漂。
+/// 写入失败时不填 `fetchedAt`，界面就不显示这一项，数字本身照常推。
+fn stamp_usage_and_notify(mut info: super::auth::KiroUsageInfo) -> super::auth::KiroUsageInfo {
+    match store_usage(&info) {
+        Ok(stamp) => info.fetched_at = ms_to_iso(stamp),
+        Err(error) => eprintln!("[proxy] 额度缓存写入失败: {error}"),
+    }
+    notify("proxy://usage-updated", info.clone());
+    info
+}
+
 /// 应用启动时的后台静默刷新：把模型列表与账户额度更新到最新并推给界面。
 ///
 /// 为什么放后台线程而不是让前端 await：两者都要打上游（几百毫秒到数秒），
@@ -520,12 +570,8 @@ pub(crate) fn spawn_startup_refresh() {
     thread::spawn(|| {
         refresh_models_and_notify();
         match new_auth().get_usage_limits() {
-            Ok(info) => {
-                if let Err(error) = store_usage(&info) {
-                    eprintln!("[proxy] 额度缓存写入失败: {error}");
-                }
-                notify("proxy://usage-updated", info);
-            }
+            // 返回值只为 `?` 的存在；事件已经推过了
+            Ok(info) => drop(stamp_usage_and_notify(info)),
             Err(error) => eprintln!("[proxy] 启动刷新额度失败: {error}"),
         }
     });
@@ -584,12 +630,11 @@ pub(crate) fn format_access_text(
 }
 
 fn build_access_text(state: &ProxyStateRef, kind: &str) -> Result<String, String> {
+    // 停止状态也照常复制：地址由配置端口决定（见 `build_access`），密钥持久化在
+    // 配置里，两样都不依赖进程活着 —— 这道命令读的是同一份配置，不碰运行中的服务。
     let access = build_access(state);
-    if !access.running {
-        return Err("请先启动代理，再复制接入信息".to_string());
-    }
     let key = if kind_needs_key(kind) {
-        current_api_key(state).ok_or_else(|| "代理密钥不可用，请重新启动代理".to_string())?
+        current_api_key(state).ok_or_else(|| "还没有代理密钥，请先启动一次代理生成密钥".to_string())?
     } else {
         String::new()
     };
@@ -743,17 +788,13 @@ pub async fn k2a_usage() -> Result<super::auth::KiroUsageInfo, String> {
     let info = tauri::async_runtime::spawn_blocking(|| new_auth().get_usage_limits())
         .await
         .map_err(|e| format!("额度查询任务失败: {e}"))??;
-    if let Err(error) = store_usage(&info) {
-        eprintln!("[proxy] 额度缓存写入失败: {error}");
-    }
-    notify("proxy://usage-updated", info.clone());
-    Ok(info)
+    Ok(stamp_usage_and_notify(info))
 }
 
 /// 手动刷新共享 SSO 凭据。
 #[tauri::command]
 pub async fn k2a_refresh_token(app: AppHandle) -> Result<ProxyStatus, String> {
-    let (refreshed, expires_at) = tauri::async_runtime::spawn_blocking(refresh_credentials)
+    let (refreshed, expires_at) = tauri::async_runtime::spawn_blocking(|| refresh_credentials("手动"))
         .await
         .map_err(|e| format!("凭据刷新任务失败: {e}"))??;
     if !refreshed {

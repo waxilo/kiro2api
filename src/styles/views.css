@@ -1,5 +1,5 @@
 /* 分区视图专属样式：只服务某一个分区的结构放在这里（指标块 / 协议面板 / 用量条 / 目录块）。
-   判断标准：只在「概览」「双协议接入」「账户额度」「维护」其中一处出现的，就归这里；
+   判断标准：只在「概览」「协议接入」「三方接入」「账户额度」「维护」其中一处出现的，就归这里；
    在两处以上出现的（卡片、按钮、徽标、键值行）统一在 components.css。 */
 
 /* ── 通用：两列栅格（概览用） ─────────────────────────────────────── */
@@ -7,7 +7,6 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--s-sm);
-  align-items: start;
 }
 
 /* ── 概览：指标块 ─────────────────────────────────────────────────── */
@@ -121,68 +120,160 @@
   color: var(--ink-tertiary);
 }
 
-/* ── 双协议接入：协议面板 ─────────────────────────────────────────── */
-.proto-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--s-sm);
-}
-
-/* 左侧 3px 竖条是这两块面板唯一的彩色元素：并排时靠它最快分辨是哪一套协议，
-   其余部分一律走中性色，避免整页出现第二个大面积色块。 */
-.proto {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-xs);
-  padding: var(--s-sm);
-  border: 1px solid var(--hairline);
-  border-left: 3px solid var(--proto-color, var(--primary));
-  border-radius: var(--r-md);
+/* ── 协议接入：协议模块 ─────────────────────────────────────────────
+   标题 + 低饱和度计数标签 + 一句说明，下面是两张独立的白色协议卡片。
+   卡内五段（标题行 / 地址 / 客户端标签 / 操作行）间距统一走 4px 栅格，
+   两张卡靠 grid-auto-rows: 1fr 强制同高，各段严格对齐。 */
+.proto-count {
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
   background: var(--surface-2);
-}
-
-.proto-head {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: var(--s-xs);
-}
-
-.proto-name {
-  font-size: var(--t-title);
-  font-weight: 620;
-  color: var(--ink);
-}
-
-.proto-path {
-  font-family: var(--font-mono);
-  font-size: var(--t-caption);
-  font-weight: 600;
-  color: var(--proto-color, var(--primary));
-}
-
-.proto-desc {
   font-size: var(--t-caption);
   color: var(--ink-subtle);
 }
 
+.proto-intro {
+  margin-top: -6px;
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+}
+
+.proto-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-rows: 1fr;
+  gap: var(--s-sm);
+}
+
+/* 协议卡片：白底 + 发丝边框（层级靠 surface + 边框表达，不加投影）。
+   主题色只落在 36px 图标底和「运行中」徽标上，卡片本体保持中性。 */
+.proto {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-sm);
+  padding: var(--s-md);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+  transition: border-color var(--dur) var(--ease);
+}
+
+.proto:hover {
+  border-color: var(--hairline-strong);
+}
+
+.proto-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+}
+
+/* 36px 圆角方形图标底：两张卡片最快的视觉锚点 */
+.proto-badge {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--proto-color) 10%, transparent);
+  color: var(--proto-color);
+}
+
+.proto-badge .icon {
+  width: 19px;
+  height: 19px;
+}
+
+.proto-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: -0.1px;
+}
+
+.proto-type {
+  font-family: var(--font-mono);
+  font-size: var(--t-caption);
+  color: var(--ink-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 状态标签推到行尾；只在代理真的在跑时才渲染，绝不伪造在线状态 */
+.proto-head .pill {
+  margin-left: auto;
+}
+
+/* 地址展示区：不是输入框 —— 只读、浅灰底、等宽字体，长地址就地换行 */
 .proto-url {
   display: flex;
   align-items: center;
-  min-height: 30px;
-  padding: 6px 9px;
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-sm);
-  background: var(--surface-1);
+  gap: var(--s-xs);
+  min-height: 36px;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.proto-url-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--ink-tertiary);
+}
+
+.proto-url-icon .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.proto-url-text {
+  min-width: 0;
   font-family: var(--font-mono);
   font-size: var(--t-small);
   color: var(--ink-muted);
   word-break: break-all;
 }
 
-.proto-url.is-empty {
+.proto-url.is-empty .proto-url-text {
   font-family: var(--font-ui);
   color: var(--ink-tertiary);
+}
+
+/* 适用客户端：浅灰小胶囊，允许换行 */
+.proto-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-xxs);
+}
+
+.proto-tag {
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  font-size: var(--t-caption);
+  color: var(--ink-subtle);
+}
+
+/* 操作行：32px 控件高度、8px 间距，窄窗口自然换行 */
+.proto-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-xs);
+}
+
+.proto-actions button {
+  height: 32px;
+  padding: 0 12px;
+}
+
+/* 「已复制」短暂替换文案：绿色描边告诉用户这次点成了，1.6s 后由状态层清掉 */
+.proto-actions button.is-copied {
+  border-color: color-mix(in srgb, var(--success) 38%, transparent);
+  background: var(--success-soft);
+  color: var(--success);
 }
 
 /* ── 账户额度：用量条 ─────────────────────────────────────────────── */
@@ -377,11 +468,157 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
   opacity: 1;
 }
 
+/* ── 三方接入：页签 ─────────────────────────────────────────────────
+   浏览器页签的读法：横条 + 底边线，激活项有侧壁、底边开口与下方内容相连。
+   现在只有一个 WorkBuddy 页签，形制先立好，加客户端时不动布局。 */
+.tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s-xxs);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.tab {
+  position: relative;
+  padding: 7px 14px 8px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: var(--t-small);
+  font-weight: 500;
+}
+
+.tab:hover:not(.is-active):not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.tab.is-active {
+  border-color: var(--hairline);
+  background: var(--surface-1);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* 激活页签盖住横条的底边线：页签与内容「连着」靠这 1px 的开口 */
+.tab.is-active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--surface-1);
+}
+
+/* ── 三方接入：模型卡片网格（勾选 = 写入，取消勾选 = 移除） ────────── */
+
+/* 网格容器同时是滚动区：模型多时在格子里滚，整页不动（见下方 :has 布局链） */
+.model-card-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 6px;
+  /* 行数不足时贴顶排布：容器被布局链拉高后，卡片不该跟着摊开 */
+  align-content: start;
+  min-height: 0;
+  /* 空间充裕时也别高过这个：大窗口里这一页不该被卡片撑满一整屏 */
+  max-height: 360px;
+  overflow-y: auto;
+  /* 滚到头不再把滚动链传给整页 —— 格子里继续滚轮，页面不该跟着动 */
+  overscroll-behavior: contain;
+}
+
+/* 一张模型卡就是一颗按钮：整卡可点，选中就是整卡的主色描边 + 底色。 */
+.model-card {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+}
+
+.model-card:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-hover);
+  border-color: var(--hairline-strong);
+}
+
+.model-card.is-checked {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.model-card-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-card .pill {
+  flex: none;
+}
+
+/* 空态横跨整行，不然会被塞进一个格子里挤成一竖条 */
+.model-card-empty {
+  grid-column: 1 / -1;
+  padding: var(--s-sm) 8px;
+  color: var(--ink-tertiary);
+  font-size: var(--t-small);
+}
+
+/* 卡片底部的一行说明：与弹窗时代的 modal-hint 同一句职责，只是改住卡片里 */
+.wb-hint {
+  padding-top: var(--s-sm);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--t-caption);
+  color: var(--ink-tertiary);
+}
+
+/* 页面级布局：三方接入页整页不滚动，模型多时只在卡片网格里滚。
+   .view-body 平时是普通滚动容器（见 shell.css）；这里只对含卡片网格的页面
+   改成 flex 列，让「模型卡片 → 网格」在空间紧张时收缩出内滚 ——
+   高度跟着窗口走，写死一个 max-height 永远差一截。:has 圈定，其它分区不受影响。 */
+.view-body:has(.model-card-list) {
+  display: flex;
+  flex-direction: column;
+}
+
+.view-body:has(.model-card-list) .view-stack {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* 页签与卡头保持自然高度，收缩的责任全在卡片网格 */
+.view-body:has(.model-card-list) .view-stack > * {
+  flex: none;
+}
+
+.view-body:has(.model-card-list) .view-stack > .card:has(.model-card-list) {
+  flex: 0 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.view-body:has(.model-card-list) .card:has(.model-card-list) .model-card-list {
+  flex: 1 1 auto;
+}
+
 /* ── 窄窗口：所有栅格落回单列 ─────────────────────────────────────── */
 @media (max-width: 860px) {
   .grid-2,
   .stat-grid,
-  .proto-grid,
   .dir-grid {
     grid-template-columns: minmax(0, 1fr);
   }

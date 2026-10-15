@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use tauri::{AppHandle, Manager};
 
+mod diag;
 mod paths;
 mod prefs;
 mod proc_guard;
@@ -12,6 +13,8 @@ mod protocol_guard;
 mod tray;
 mod updater_accel;
 mod window;
+mod workbuddy;
+mod codex;
 
 mod kiro;
 
@@ -118,6 +121,12 @@ pub fn run() {
             kiro::k2a_usage,
             kiro::k2a_refresh_token,
             kiro::k2a_reveal,
+            workbuddy::k2a_workbuddy_import,
+            workbuddy::k2a_workbuddy_list,
+            workbuddy::k2a_workbuddy_remove,
+            codex::k2a_codex_import,
+            codex::k2a_codex_list,
+            codex::k2a_codex_remove,
             updater_accel::k2a_update_source_get,
             updater_accel::k2a_update_source_set,
             window::k2a_snap_rect,

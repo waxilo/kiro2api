@@ -1,8 +1,8 @@
 // 外壳组装与唯一的渲染循环。
 //
 // 这里是整个界面的「接线盒」，只做四件事：
-//   1. 建一次静态外壳（标题栏 / 导航 / 内容区）—— 窗口按钮与滚动容器的事件绑定
-//      不随内容重绘重建；
+//   1. 建一次静态外壳（标题栏 / 导航 / 内容区 / 弹窗宿主）—— 窗口按钮与滚动容器
+//      的事件绑定不随内容重绘重建；
 //   2. 订阅 store，任何状态变化都从这里出发重画；
 //   3. 把点击 / 变更事件按委托分发给 `state/actions`；
 //   4. 启动时按「先本地后联网」的顺序取数据。
@@ -11,6 +11,7 @@
 // 旧实现里每个动作都自己调一次 `render()`，改动一处忘一处就会出现「数据变了界面没动」；
 // 现在只要 `store.set` 了，界面必然会跟上。
 import { applyPlatformClass } from '../../core/platform';
+import { scheduler } from '../../services/scheduler';
 import { updater } from '../../services/updater';
 import {
   bindBackendEvents,
@@ -19,11 +20,13 @@ import {
   refresh,
   savePort,
   setModelFilter,
+  setWorkbuddyFilter,
   useFeedback,
 } from '../../state/actions';
 import { store, type AppState, type ViewId } from '../../state/app-state';
 import { esc } from '../../core/format';
 import { bindEnglishFields } from '../shared/english-field';
+import { captureFocus, restoreFocus } from '../shared/focus';
 import { ScrollArea } from '../shared/scroll-area';
 import { toast } from '../shared/toast';
 import { VIEWS, type ViewSpec } from '../views';
@@ -80,6 +83,9 @@ async function boot(): Promise<void> {
   await refresh();
   await bindBackendEvents();
   await updater.init();
+  // 全局后台 job：额度、凭据、更新在应用长期开着时的定期维护。
+  // 放在启动刷新与 updater.init() 之后，三个计时器才与「刚推过的那一轮」对齐。
+  scheduler.start();
   // 首屏若已有溢出内容，让滚动条自己亮一次，免得用户不知道下面还有东西
   scrollArea?.revealHint();
 }
@@ -162,43 +168,6 @@ function playEnter(host: HTMLElement): void {
   window.setTimeout(() => host.classList.remove('is-entering'), 420);
 }
 
-interface FocusSnapshot {
-  id: string;
-  start: number | null;
-  end: number | null;
-}
-
-function captureFocus(host: HTMLElement): FocusSnapshot | null {
-  const active = document.activeElement;
-  if (!(active instanceof HTMLElement) || !host.contains(active)) return null;
-  // 焦点落在**没有 id** 的按钮上时，`data-refocus` 指名渲染后该把焦点还给谁。
-  // 「清空搜索」就是这种：点它的人下一步一定是接着改那个输入框，
-  // 不还焦点的话光标会掉到 body 上，得再点一次输入框才能继续打字。
-  const id = active.id || active.dataset.refocus || '';
-  if (!id) return null;
-  const field = active as HTMLInputElement;
-  const hasSelection = typeof field.selectionStart === 'number';
-  return {
-    id,
-    start: hasSelection ? field.selectionStart : null,
-    end: hasSelection ? field.selectionEnd : null,
-  };
-}
-
-function restoreFocus(host: HTMLElement, snapshot: FocusSnapshot | null): void {
-  if (!snapshot) return;
-  // `CSS.escape` 是因为 id 里可能有 `:` 这类需要转义的字符（本项目里没有，但别赌）
-  const next = host.querySelector<HTMLElement>(`#${CSS.escape(snapshot.id)}`);
-  if (!next) return;
-  next.focus({ preventScroll: true });
-  if (snapshot.start !== null && next instanceof HTMLInputElement) {
-    // 夹到新长度：搜索框会把非 ASCII 字符裁掉，重绘后的值可能比快照里的光标位置还短
-    const end = snapshot.end ?? snapshot.start;
-    const length = next.value.length;
-    next.setSelectionRange(Math.min(snapshot.start, length), Math.min(end, length));
-  }
-}
-
 // ── 事件 ────────────────────────────────────────────────────────────────
 
 function bindEvents(container: HTMLElement): void {
@@ -229,18 +198,20 @@ function bindEvents(container: HTMLElement): void {
     }
   });
 
-  // 搜索框反过来：边打边筛，用 change 得等失焦才生效，那是筛选框最不能忍的延迟。
-  //
-  // 它是**自绘**的（不是 `<input>`，见 `ui/shared/english-field.ts`）：输入、光标、选区、
-  // Ctrl+A/C/X/V、粘贴全归字段模块自己管 —— 外壳只负责把「用户改成了什么值」转给状态层。
-  // 顺带也就没有组字态这回事了：不可编辑元素拿不到输入法上下文，压根不会产生候选词。
-  bindEnglishFields(container, (_id, next) => setModelFilter(next));
+  // 两个搜索框（可用模型分区、三方接入分区）按 id 分流，各自的值归各自的动作。
+  bindEnglishFields(container, (id, next) => {
+    if (id === 'workbuddy-filter') setWorkbuddyFilter(next);
+    else setModelFilter(next);
+  });
 
   // Escape 清空搜索。焦点还在框里，重绘后外壳的焦点快照会把光标放回原位。
   container.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     const target = event.target as HTMLElement;
     if (target.id === 'model-filter' && store.get().modelFilter) setModelFilter('');
+    if (target.id === 'workbuddy-filter' && store.get().workbuddyFilter) {
+      setWorkbuddyFilter('');
+    }
   });
 
   // 窗口重新可见 / 重新获得焦点时补一次状态同步。

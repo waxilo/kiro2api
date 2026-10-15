@@ -16,10 +16,17 @@ export const ICON = {
     <rect x="2.4" y="9" width="4.6" height="4.6" rx="1.3"/>
     <rect x="9" y="9" width="4.6" height="4.6" rx="1.3"/>`),
 
-  /** 双协议接入：双向箭头，一眼看出「两套协议并存」。 */
+  /** 协议接入：双向箭头，一眼看出「两套协议并存」。 */
   endpoints: svg(`
     <path d="M3 5.5h9"/><path d="m9.8 3.2 2.3 2.3-2.3 2.3"/>
     <path d="M13 10.5H4"/><path d="m6.2 8.2-2.3 2.3 2.3 2.3"/>`),
+
+  /** 三方接入：中心节点连出两方，即「第三方客户端接入本应用」。 */
+  thirdparty: svg(`
+    <circle cx="8" cy="3.6" r="1.8"/>
+    <circle cx="3.6" cy="12.2" r="1.8"/>
+    <circle cx="12.4" cy="12.2" r="1.8"/>
+    <path d="M6.9 5.1 4.5 10.6"/><path d="m9.1 5.1 2.4 5.5"/>`),
 
   /** 模型：分层堆叠。 */
   models: svg(`
@@ -63,4 +70,22 @@ export const ICON = {
     <circle cx="8" cy="8" r="5.8"/>
     <path d="M8 7.4v3.4"/>
     <circle cx="8" cy="5.2" r=".75" fill="currentColor" stroke="none"/>`),
+
+  /** 勾选（多选弹窗的选中标记）。 */
+  check: svg('<path d="m3.6 8.6 2.9 2.9 5.9-6"/>'),
+
+  /** Anthropic 协议：字母 A 的几何形。 */
+  anthropic: svg('<path d="M8 2.8 13.2 13.2H2.8z"/><path d="M5.2 9.6h5.6"/>'),
+
+  /** OpenAI 协议：六边形节点。 */
+  openai: svg(
+    '<path d="M8 1.9l5.3 3v6.2l-5.3 3-5.3-3V4.9z"/>' +
+      '<circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none"/>',
+  ),
+
+  /** 终端 / 接入端点（地址展示行的左侧图标）。 */
+  terminal: svg(
+    '<rect x="2.4" y="3.2" width="11.2" height="9.6" rx="1.4"/>' +
+      '<path d="m4.8 6.4 2 1.8-2 1.8"/><path d="M8.4 10.4h3"/>',
+  ),
 };

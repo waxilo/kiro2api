@@ -14,6 +14,8 @@
 //! OpenAI 兼容入口（同一监听端口，按路径分流；前缀 /openai/v1）：
 //! - GET  /openai/v1/models              → 模型列表（OpenAI 形状）
 //! - POST /openai/v1/chat/completions    → 对话（OpenAI 形状，SSE 流式 / 非流式）
+//! - POST /openai/v1/responses           → 对话（Responses API 形状，Codex CLI 用；
+//!                                          见 `crate::kiro::responses`）
 //!
 //! 两套入口共用同一中间层（Host/Origin 校验、密钥鉴权、并发许可、同请求去重、
 //! 健康自愈）与同一上游转换，差异只体现在入参归一化与出参构造（见 `crate::kiro::openai`）。
@@ -51,30 +53,20 @@ use crate::kiro::openai::{
     openai_models_list, openai_request_to_anthropic, openai_role_chunk, openai_sse_data,
     openai_usage_chunk, OPENAI_SSE_DONE,
 };
+use crate::kiro::responses::{
+    build_responses_output, finish_responses_after_error, responses_completed_response,
+    responses_request_to_anthropic, responses_usage, ResponsesEmitter,
+};
 use crate::kiro::transform::{
     anthropic_message_response_with_tools, build_kiro_request, build_kiro_request_with_schema,
     ensure_tool_id_unique, recover_tool_calls_from_text, RecoveredContent, TextToolRecoveryGuard,
     ToolRecoverySpec,
 };
 use crate::protocol_guard::{normalize_stop_reason, sanitize_protocol_text, ProtocolTextGuard};
+use crate::diag::log as diag_log;
 
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 16;
-
-/// 诊断日志：追加到 App 数据目录下的 kiro-debug.log，便于定位 502 /
-/// 「property 'X' is not defined in the schema」类问题（记录发给 Kiro 的请求体 + 上游原始报错）。
-/// 写失败不影响代理；排查完可删除该文件。
-fn diag_log(line: &str) {
-    use std::io::Write;
-    let path = crate::paths::get_debug_log_path();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(
-            f,
-            "{} {line}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
-    }
-}
 
 /// 诊断日志里截断超长串（主要是请求体），避免 kiro-debug.log 被 1MB+ 的 body 撑爆。
 /// 保留开头，便于定位是哪个字段/哪条消息过大。
@@ -179,7 +171,7 @@ impl ProxyHealth {
             *guard = Some(now);
         }
 
-        match auth.force_refresh() {
+        match auth.force_refresh("预检恢复") {
             Ok((true, _)) => eprintln!("[kiro] preflight recovery: credentials refreshed"),
             Ok((false, _)) => eprintln!("[kiro] preflight recovery: no refreshToken (env auth?)"),
             Err(e) => eprintln!("[kiro] preflight recovery: credential refresh failed: {e}"),
@@ -697,6 +689,14 @@ fn handle_request(
         // OpenAI 兼容入口：与 Anthropic 路径共用中间层，仅入参/出参形状不同
         (Method::Get, "/openai/v1/models") => handle_openai_models(request, config, auth),
         (Method::Post, "/openai/v1/chat/completions") => handle_openai_chat_completions(
+            request,
+            config,
+            auth,
+            health,
+            dedup,
+            active_requests,
+        ),
+        (Method::Post, "/openai/v1/responses") => handle_openai_responses(
             request,
             config,
             auth,
@@ -2131,6 +2131,251 @@ impl OpenAiToolBlock {
     }
 }
 
+/// 把 Kiro 事件流翻译成 Responses SSE（`SseFlavor::Responses` 的出参管道）。
+///
+/// 与 `pipe_kiro_body_to_openai_sse` 同构：同一套协议守护、文本工具恢复与工具
+/// schema 校验，只是出参形状换成 Responses 事件（见 `kiro::responses`）。两处刻意
+/// 的差异：思维链增量不进 Responses 流（需要 reasoning item 信封，本期不做）；
+/// 读流失败发 `response.failed` 而不是伪造正文 —— Codex 对失败事件有专门处理，
+/// 比假装成功更诚实。
+fn pipe_kiro_body_to_responses_sse(
+    response: ReqwestResponse,
+    recovery_spec: ToolRecoverySpec,
+    response_id: &str,
+    response_model: &str,
+    mut send: impl FnMut(String),
+) -> bool {
+    let mut emitter = ResponsesEmitter::new(response_id, response_model);
+    send(emitter.event_created());
+    send(emitter.event_in_progress());
+
+    let mut parser = IncrementalEventStream::new();
+    let mut reader = response;
+    let mut read_buf = [0u8; 8192];
+    let mut full_text = String::new();
+    let mut stop_reason = "end_turn".to_string();
+    let mut protocol_guard = ProtocolTextGuard::default();
+    let mut text_tool_guard = TextToolRecoveryGuard::new(recovery_spec.clone());
+
+    let mut tool_blocks: HashMap<String, OpenAiToolBlock> = HashMap::new();
+    let mut tool_order: Vec<String> = Vec::new();
+    let mut emitted_any_tool_call = false;
+
+    loop {
+        let n = match reader.read(&mut read_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let msg = format!("读取 Kiro 流失败: {e}");
+                emitter.close_message(&mut send);
+                emitter.close_function_call(&mut send);
+                send(emitter.event_failed("upstream_error", &msg));
+                return false;
+            }
+        };
+
+        for event in parser.push(&read_buf[..n]) {
+            match event.event_type.as_str() {
+                // 思维链本期不产出：Responses 侧需要 reasoning item / summary 事件信封
+                "reasoningContentEvent" => {}
+                "assistantResponseEvent" => {
+                    let Some(raw_chunk) = event.payload.get("content").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if raw_chunk.is_empty() {
+                        continue;
+                    }
+                    let chunk = protocol_guard.push(raw_chunk);
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    full_text.push_str(&chunk);
+                    let visible = text_tool_guard.push(&chunk);
+                    if visible.is_empty() {
+                        continue;
+                    }
+                    emitter.open_message(&mut send);
+                    emitter.push_text(&mut send, &visible);
+                }
+                "toolUseEvent" => {
+                    let tool_id = event
+                        .payload
+                        .get("toolUseId")
+                        .or_else(|| event.payload.get("tool_use_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if tool_id.is_empty() {
+                        continue;
+                    }
+                    let name = event
+                        .payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if !tool_blocks.contains_key(&tool_id) {
+                        if !recovery_spec.declares(&name) {
+                            continue;
+                        }
+                        tool_order.push(tool_id.clone());
+                        tool_blocks.insert(tool_id.clone(), OpenAiToolBlock::new(&name));
+                        emitter.open_function_call(&mut send, &tool_id, &name);
+                        emitted_any_tool_call = true;
+                    }
+
+                    let Some(block) = tool_blocks.get_mut(&tool_id) else {
+                        continue;
+                    };
+                    // 名字中途变化视为上游不稳定：只标记，不中断已发出的增量
+                    if !name.is_empty() && block.name != name {
+                        block.invalid = true;
+                        continue;
+                    }
+                    match event.payload.get("input") {
+                        Some(Value::String(fragment)) if !fragment.is_empty() => {
+                            block.arguments.push_str(fragment);
+                            emitter.push_function_arguments(&mut send, fragment);
+                        }
+                        Some(value) if value.is_object() => {
+                            // 上游偶发直接给完整对象：转成 JSON 文本一次性发出
+                            let text =
+                                serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+                            if block.arguments.is_empty() {
+                                block.arguments.push_str(&text);
+                                emitter.push_function_arguments(&mut send, &text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "metadataEvent" => {
+                    if let Some(reason) = event.payload.get("stopReason").and_then(|v| v.as_str()) {
+                        stop_reason = map_kiro_stop_reason(reason);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let event_stream_clean = parser.finish();
+    if !event_stream_clean {
+        stop_reason = "max_tokens".to_string();
+    }
+
+    // 尾包正文：先放行协议守护的滞留内容，再结算文本工具恢复
+    let trailing_text = protocol_guard.finish();
+    if !trailing_text.is_empty() {
+        full_text.push_str(&trailing_text);
+        let visible = text_tool_guard.push(&trailing_text);
+        if !visible.is_empty() {
+            emitter.open_message(&mut send);
+            emitter.push_text(&mut send, &visible);
+        }
+    }
+
+    let recovered_finish = text_tool_guard.finish();
+    if recovered_finish.incomplete_tool {
+        stop_reason = "max_tokens".to_string();
+    }
+
+    // 整轮结束后才能判定原生工具是否合法（与 chat 管道同一套规则：空入参视为 {}）
+    let mut invalid_native_tool = false;
+    for tool_id in &tool_order {
+        let Some(block) = tool_blocks.get(tool_id) else {
+            invalid_native_tool = true;
+            continue;
+        };
+        if block.invalid {
+            invalid_native_tool = true;
+            continue;
+        }
+        let trimmed = block.arguments.trim();
+        let parsed = if trimmed.is_empty() {
+            Some(json!({}))
+        } else {
+            serde_json::from_str::<Value>(trimmed).ok()
+        };
+        let valid = parsed
+            .as_ref()
+            .is_some_and(|input| recovery_spec.validates_input(&block.name, input));
+        if !valid {
+            invalid_native_tool = true;
+        }
+    }
+
+    // 文本恢复出的工具调用：只在整轮没有原生工具时补发（同 chat 的 is_native_mirror 判定）
+    if !invalid_native_tool {
+        for part in recovered_finish.parts {
+            let RecoveredContent::Tool(tool) = part else {
+                continue;
+            };
+            if tool_blocks.values().any(|native| {
+                native.name == tool.get("name").and_then(Value::as_str).unwrap_or("")
+                    && serde_json::from_str::<Value>(native.arguments.trim())
+                        .ok()
+                        .is_some_and(|input| recovery_spec.is_native_mirror(&tool, &json!({ "input": input })))
+            }) {
+                continue;
+            }
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let call_id = tool.get("id").and_then(Value::as_str).unwrap_or("");
+            let input = tool.get("input").cloned().unwrap_or_else(|| json!({}));
+            let arguments =
+                serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+            emitter.open_function_call(&mut send, call_id, name);
+            emitter.push_function_arguments(&mut send, &arguments);
+            emitter.close_function_call(&mut send);
+            emitted_any_tool_call = true;
+        }
+    }
+
+    // 非法工具：补一条错误正文。与 chat 相同的取舍 —— 增量已外发时保留已发出的
+    // items（撤不回），由客户端拿 schema 自行校验。
+    if invalid_native_tool {
+        emitter.open_message(&mut send);
+        emitter.push_text(&mut send, "API Error: model returned an incomplete tool call");
+    }
+
+    let final_stop = if invalid_native_tool && !emitted_any_tool_call {
+        "end_turn"
+    } else if invalid_native_tool {
+        stop_reason = "tool_use".to_string();
+        &stop_reason
+    } else if emitted_any_tool_call {
+        stop_reason = "tool_use".to_string();
+        &stop_reason
+    } else if full_text.is_empty() {
+        let fallback = if stop_reason == "tool_use" {
+            "API Error: upstream claimed tool_use but returned no tool call"
+        } else if protocol_guard.detected() {
+            "API Error: response interrupted by protocol leak"
+        } else {
+            "API Error: empty assistant response"
+        };
+        emitter.open_message(&mut send);
+        emitter.push_text(&mut send, fallback);
+        &stop_reason
+    } else {
+        &stop_reason
+    };
+
+    let normalized =
+        normalize_stop_reason(final_stop, emitted_any_tool_call, protocol_guard.detected());
+    emitter.close_function_call(&mut send);
+    emitter.close_message(&mut send);
+    let incomplete = (normalized == "max_tokens").then_some("max_tokens");
+    send(emitter.event_completed(
+        responses_usage(estimate_tokens(&full_text)),
+        incomplete,
+    ));
+    event_stream_clean
+}
+
 /// 先立刻打开 SSE，再请求 Kiro；避免等上游整包结束后才开始响应。
 fn respond_sse_stream_fetch(
     request: Request,
@@ -2319,10 +2564,21 @@ fn respond_sse_stream_fetch(
 /// follower 会拿到形状不匹配的缓冲。为此 `DedupStore::fingerprint` 的输入已包含协议标识
 /// （见该函数实现），保证两套协议互不串流。
 #[allow(clippy::too_many_arguments)]
+/// 流式管道的协议口味。两条路径共用心跳、并发许可、去重与通道Reader等全部
+/// 流式基础设施，差异只有三处：首帧、出参管道、失败收尾。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SseFlavor {
+    /// OpenAI Chat Completions（`chat.completion.chunk` + `data: [DONE]`）。
+    Chat,
+    /// OpenAI Responses API（带 type 的事件对象，无 `[DONE]`，见 `kiro::responses`）。
+    Responses,
+}
+
 fn respond_openai_sse_stream_fetch(
     request: Request,
     chat_id: String,
     response_model: String,
+    flavor: SseFlavor,
     auth: Arc<Auth>,
     runtime_url: String,
     built: Value,
@@ -2372,7 +2628,11 @@ fn respond_openai_sse_stream_fetch(
             }
         };
 
-        send(openai_sse_data(&openai_role_chunk(&chat_id, &response_model)));
+        // Responses 的首帧（response.created / in_progress）由出参管道自己发；
+        // chat 的首帧是 role 声明 chunk。
+        if flavor == SseFlavor::Chat {
+            send(openai_sse_data(&openai_role_chunk(&chat_id, &response_model)));
+        }
         send(": keepalive\n\n".to_string());
 
         let upstream = match kiro_post(
@@ -2389,7 +2649,14 @@ fn respond_openai_sse_stream_fetch(
                     "[openai-stream] network_error={e} body={}",
                     truncate_for_log(&serde_json::to_string(&built).unwrap_or_default(), 2048)
                 ));
-                finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &e);
+                match flavor {
+                    SseFlavor::Chat => {
+                        finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &e)
+                    }
+                    SseFlavor::Responses => {
+                        finish_responses_after_error(&mut send, &chat_id, &response_model, &e)
+                    }
+                }
                 if let Some(entry) = &entry {
                     dedup.mark_failed(entry);
                 }
@@ -2416,7 +2683,14 @@ fn respond_openai_sse_stream_fetch(
                         .map(|s| s.to_string())
                 })
                 .unwrap_or(text);
-            finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &message);
+            match flavor {
+                SseFlavor::Chat => {
+                    finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &message)
+                }
+                SseFlavor::Responses => {
+                    finish_responses_after_error(&mut send, &chat_id, &response_model, &message)
+                }
+            }
             if let Some(entry) = &entry {
                 dedup.mark_failed(entry);
             }
@@ -2424,13 +2698,22 @@ fn respond_openai_sse_stream_fetch(
             return;
         }
 
-        let clean = pipe_kiro_body_to_openai_sse(
-            upstream,
-            recovery_spec,
-            &chat_id,
-            &response_model,
-            send,
-        );
+        let clean = match flavor {
+            SseFlavor::Chat => pipe_kiro_body_to_openai_sse(
+                upstream,
+                recovery_spec,
+                &chat_id,
+                &response_model,
+                send,
+            ),
+            SseFlavor::Responses => pipe_kiro_body_to_responses_sse(
+                upstream,
+                recovery_spec,
+                &chat_id,
+                &response_model,
+                send,
+            ),
+        };
         if clean {
             health.record_success();
             if let Some(e) = &entry {
@@ -3077,6 +3360,7 @@ fn handle_openai_chat_completions(
             request,
             id,
             response_model,
+            SseFlavor::Chat,
             Arc::clone(auth),
             config.runtime_url.clone(),
             built,
@@ -3165,6 +3449,212 @@ fn handle_openai_chat_completions(
         &content,
         &collected.thinking,
         stop_reason,
+        estimate_tokens(&collected.text),
+    );
+    health.record_success();
+    json_response(request, 200, &response);
+}
+
+/// `POST /openai/v1/responses` —— Responses API 兼容对话（Codex CLI 的入口）。
+///
+/// 流程与 `handle_openai_chat_completions` 完全对齐，差异只有两端：
+/// - 入参先用 `responses_request_to_anthropic` 归一化（内部经过一层 Chat 折算）；
+/// - 出参按 Responses 形状构造（流式是带 type 的事件序列，非流式是完整 response 对象）。
+///
+/// 去重指纹的协议标签用 `responses` 而不是 `openai`：两条入口的 SSE 字节不同，
+/// 不能让 Responses 请求重放到一次 chat/completions 的缓存流上。
+fn handle_openai_responses(
+    mut request: Request,
+    config: &ProxyConfig,
+    auth: &Arc<Auth>,
+    health: Arc<ProxyHealth>,
+    dedup: Arc<DedupStore>,
+    active_requests: Arc<AtomicUsize>,
+) {
+    if !check_proxy_auth(&request, config) {
+        return openai_error_response(request, 401, "Invalid proxy API key.", "authentication_error");
+    }
+
+    let raw_body = match read_json_body(&mut request) {
+        Ok(body) => body,
+        Err(error) => return respond_openai_body_error(request, error),
+    };
+
+    let body = match responses_request_to_anthropic(&raw_body) {
+        Ok(body) => body,
+        Err(e) => return openai_error_response(request, 400, &e, "invalid_request_error"),
+    };
+
+    // 官方 stream 默认 false；Codex 恒显式带 stream=true。
+    let is_stream = raw_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let dedup_entry = if is_stream {
+        let key = DedupStore::fingerprint(&body, "responses");
+        match dedup.acquire(key) {
+            DedupAcquire::Leader(entry) => Some(entry),
+            DedupAcquire::Replay(bytes) => return respond_replayed_sse(request, bytes),
+            DedupAcquire::Failed => {
+                return openai_error_response(
+                    request,
+                    502,
+                    "The in-progress request with the same body failed.",
+                    "api_error",
+                );
+            }
+            DedupAcquire::TimedOut => {
+                return openai_error_response(
+                    request,
+                    504,
+                    "Timed out waiting for the in-progress request with the same body.",
+                    "api_error",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    if health.needs_preflight() {
+        health.run_preflight_recovery(auth);
+    }
+
+    let requested_model = raw_body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let kiro_model = resolve_kiro_model(auth, requested_model, &config.default_model);
+    let profile_arn = match resolve_profile_arn(auth) {
+        Ok(arn) => arn,
+        Err(e) => {
+            health.record_failure();
+            if let Some(entry) = &dedup_entry {
+                dedup.mark_failed(entry);
+            }
+            return openai_error_response(request, 502, &e, "api_error");
+        }
+    };
+
+    let model_schema = auth.model_schema(&kiro_model);
+    let build_result = match &model_schema {
+        Some(schema) => {
+            build_kiro_request_with_schema(&body, &kiro_model, profile_arn.as_deref(), schema)
+        }
+        None => build_kiro_request(&body, &kiro_model, profile_arn.as_deref()),
+    };
+    let built = match build_result {
+        Ok(built) => built,
+        Err(e) => {
+            if let Some(entry) = &dedup_entry {
+                dedup.mark_failed(entry);
+            }
+            return openai_error_response(request, 400, &e, "invalid_request_error");
+        }
+    };
+
+    // Responses 的 id 惯例是 `resp-…`
+    let id = format!("resp_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let response_model = if requested_model.is_empty() {
+        kiro_model.clone()
+    } else {
+        requested_model.to_string()
+    };
+
+    let recovery_spec = ToolRecoverySpec::from_body(&body);
+
+    if is_stream {
+        return respond_openai_sse_stream_fetch(
+            request,
+            id,
+            response_model,
+            SseFlavor::Responses,
+            Arc::clone(auth),
+            config.runtime_url.clone(),
+            built,
+            recovery_spec,
+            health,
+            dedup_entry,
+            dedup,
+            active_requests,
+        );
+    }
+
+    let Some(_permit) = try_acquire_request(&active_requests, MAX_CONCURRENT_REQUESTS) else {
+        return openai_error_response(
+            request,
+            429,
+            "Too many concurrent requests.",
+            "rate_limit_error",
+        );
+    };
+
+    let events = match call_kiro_generate(&auth.runtime, auth, config, &built) {
+        Ok(events) => events,
+        Err(e) => {
+            health.record_failure();
+            diag_log(&format!(
+                "[responses] generate_error={e} status=502 body={}",
+                truncate_for_log(&serde_json::to_string(&built).unwrap_or_default(), 2048)
+            ));
+            if let Some(entry) = &dedup_entry {
+                dedup.mark_failed(entry);
+            }
+            return openai_error_response(request, 502, &e, "api_error");
+        }
+    };
+
+    let mut collected = collect_kiro_text(&events);
+    collected.tool_uses.retain(|tool| {
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+        let input = tool.get("input").unwrap_or(&Value::Null);
+        recovery_spec.validates_input(name, input)
+    });
+    let (visible_text, mut protocol_leak_detected) = sanitize_protocol_text(&collected.text);
+    collected.text = visible_text;
+    for part in &mut collected.ordered_content {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let raw = part.get("text").and_then(Value::as_str).unwrap_or("");
+        let (visible, detected) = sanitize_protocol_text(raw);
+        protocol_leak_detected |= detected;
+        if let Some(text) = part.get_mut("text") {
+            *text = Value::String(visible);
+        }
+    }
+    collected.stop_reason = normalize_stop_reason(
+        &collected.stop_reason,
+        !collected.tool_uses.is_empty(),
+        protocol_leak_detected,
+    )
+    .to_string();
+
+    // 与 chat 非流式同一策略：先装配规范 content[]（工具恢复、thinking 终裁在Anthropic
+    // 形状上完成），再整体翻译成 Responses 的 output items。
+    let anthropic_response = anthropic_message_response_with_tools(
+        &id,
+        &response_model,
+        &collected.text,
+        &collected.thinking,
+        collected.thinking_signature.as_deref(),
+        &collected.ordered_content,
+        &collected.tool_uses,
+        &collected.stop_reason,
+        &recovery_spec,
+    );
+    let content = anthropic_response
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let output = build_responses_output(&content);
+    let response = responses_completed_response(
+        &id,
+        &response_model,
+        output,
         estimate_tokens(&collected.text),
     );
     health.record_success();
@@ -4649,6 +5139,236 @@ mod tests {
         println!("[live] OPENAI DONE");
     }
 
+    /// 临时手工验证（非 CI）：Responses 入口走真实 Kiro 凭据的完整链路（Codex 的实际报文形状）。
+    ///
+    /// 覆盖四件事：
+    /// - 非流式 `response`（`status: "completed"`、`output[]` 的 message item、usage）
+    /// - 工具调用返回 `function_call` item（`arguments` 是 JSON **字符串**）
+    /// - `function_call_output` 回传第二轮，能正常续写
+    /// - 流式事件序列：`response.created` → 文本 delta → `response.completed`（带 usage），
+    ///   全程带 `event:` 行与 `sequence_number`，没有 `[DONE]`
+    ///
+    /// 运行：cargo test -p kiro2api --lib kiro::server::tests::live_responses_proxy_roundtrip -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires real Kiro SSO credentials"]
+    fn live_responses_proxy_roundtrip() {
+        let sso_dir = crate::paths::kiro_sso_cache_dir();
+        let config = ProxyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 5053,
+            proxy_api_key: Some("live-test-key".to_string()),
+            default_model: "claude-opus-5".to_string(),
+            runtime_url: "https://runtime.us-east-1.kiro.dev/".to_string(),
+            management_url: "https://management.us-east-1.kiro.dev/".to_string(),
+            sso_cache_dir: sso_dir.clone(),
+            profile_arn_override: None,
+        };
+        let mut handle = start_proxy(config).expect("proxy starts");
+        let port = handle.port;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+
+        // 1. 非流式 response： Responses 形状而非 chat.completion
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+            .header("authorization", "Bearer live-test-key")
+            .json(&json!({
+                "model": "gpt-5.2-codex",
+                "instructions": "回答保持极短。",
+                "input": "只回复两个字：你好",
+                "stream": false,
+            }))
+            .send()
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().unwrap();
+        println!("[live] /openai/v1/responses status={status}");
+        println!(
+            "[live] body (truncated): {}",
+            text.chars().take(800).collect::<String>()
+        );
+        assert!(status.is_success(), "non-stream response failed: {text}");
+        let completion: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(completion["object"], "response", "{completion}");
+        assert!(
+            completion["id"].as_str().unwrap_or("").starts_with("resp_"),
+            "id should carry resp_ prefix: {completion}"
+        );
+        assert_eq!(completion["status"], "completed", "{completion}");
+        let output = completion["output"].as_array().expect("output array");
+        let message = output
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("message item in output");
+        assert_eq!(message["role"], "assistant");
+        let out_text = message["content"]
+            .as_array()
+            .and_then(|parts| {
+                parts
+                    .iter()
+                    .find(|p| p["type"] == "output_text")
+                    .and_then(|p| p["text"].as_str())
+            })
+            .unwrap_or("");
+        assert!(!out_text.trim().is_empty(), "output_text must be present: {completion}");
+        assert!(completion["usage"]["output_tokens"].is_u64(), "{completion}");
+
+        // 2. 非流式工具调用：function_call item，arguments 是 JSON 字符串
+        let tools = json!([{
+            "type": "function",
+            "name": "get_current_time",
+            "description": "Get the current local time",
+            "parameters": { "type": "object", "properties": {} }
+        }]);
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+            .header("authorization", "Bearer live-test-key")
+            .json(&json!({
+                "model": "gpt-5.2-codex",
+                "input": "必须调用 get_current_time 工具，不要直接回答。",
+                "tools": tools,
+                "stream": false,
+            }))
+            .send()
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().unwrap();
+        println!("[live] /openai/v1/responses(tool) status={status}");
+        println!(
+            "[live] tool body (truncated): {}",
+            text.chars().take(800).collect::<String>()
+        );
+        assert!(status.is_success(), "tool request failed: {text}");
+        let tool_resp: Value = serde_json::from_str(&text).unwrap();
+        let call = tool_resp["output"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| item["type"] == "function_call")
+            })
+            .expect("function_call item in output")
+            .clone();
+        assert_eq!(call["name"], "get_current_time");
+        assert!(call["call_id"].is_string(), "{call}");
+        let raw_args = call["arguments"].as_str().expect("arguments must be a JSON string");
+        let _parsed: Value = serde_json::from_str(raw_args).expect("arguments must be valid JSON");
+        let call_id = call["call_id"].as_str().unwrap().to_string();
+
+        // 3. function_call_output 回传第二轮
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+            .header("authorization", "Bearer live-test-key")
+            .json(&json!({
+                "model": "gpt-5.2-codex",
+                "input": [
+                    { "type": "message", "role": "user", "content": "必须调用 get_current_time 工具，不要直接回答。" },
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": "get_current_time",
+                        "arguments": raw_args,
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "2026-08-11T23:59:00+08:00",
+                    }
+                ],
+                "tools": tools,
+                "stream": false,
+            }))
+            .send()
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().unwrap();
+        println!("[live] /openai/v1/responses(roundtrip) status={status}");
+        println!(
+            "[live] roundtrip body (truncated): {}",
+            text.chars().take(800).collect::<String>()
+        );
+        assert!(status.is_success(), "tool roundtrip failed: {text}");
+        let followup: Value = serde_json::from_str(&text).unwrap();
+        let has_new_call = followup["output"].as_array().is_some_and(|items| {
+            items.iter().any(|item| item["type"] == "function_call")
+        });
+        assert!(!has_new_call, "second turn should consume the tool result: {text}");
+        let followup_text = followup["output"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    if item["type"] != "message" {
+                        return None;
+                    }
+                    item["content"].as_array().and_then(|parts| {
+                        parts
+                            .iter()
+                            .find(|p| p["type"] == "output_text")
+                            .and_then(|p| p["text"].as_str())
+                    })
+                })
+            })
+            .unwrap_or("");
+        assert!(
+            !followup_text.trim().is_empty(),
+            "second turn should return assistant text: {text}"
+        );
+
+        // 4. 流式：event: 行 + sequence_number + response.completed 收尾，没有 [DONE]
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+            .header("authorization", "Bearer live-test-key")
+            .json(&json!({
+                "model": "gpt-5.2-codex",
+                "input": "从 1 数到 3，只输出数字。",
+                "stream": true,
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200, "stream should return 200");
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/event-stream"));
+        let sse = resp.text().unwrap();
+        println!("[live] sse (truncated): {}", sse.chars().take(800).collect::<String>());
+        assert!(sse.contains("event: response.created"), "{sse}");
+        assert!(sse.contains("event: response.output_text.delta"), "{sse}");
+        assert!(sse.contains("event: response.completed"), "{sse}");
+        assert!(!sse.contains("[DONE]"), "Responses SSE must not carry [DONE]: {sse}");
+        // 每帧都是合法 JSON，事件类型与 data.type 一致，sequence_number 单调递增
+        let mut last_seq: i64 = -1;
+        let mut saw_delta = false;
+        let mut lines = sse.lines().peekable();
+        while let Some(line) = lines.next() {
+            let Some(event_type) = line.strip_prefix("event: ") else {
+                continue;
+            };
+            let data_line = lines
+                .find(|l| l.starts_with("data: "))
+                .expect("event line must be followed by data line");
+            let frame: Value = serde_json::from_str(data_line.trim_start_matches("data: ").trim())
+                .unwrap_or_else(|e| panic!("non-JSON SSE frame ({e}): {data_line}"));
+            assert_eq!(frame["type"], event_type, "event/data type mismatch: {frame}");
+            let seq = frame["sequence_number"].as_i64().unwrap_or(-1);
+            assert!(seq > last_seq, "sequence_number must increase: {frame}");
+            last_seq = seq;
+            if event_type == "response.output_text.delta" {
+                assert!(frame["delta"].is_string(), "text delta must be a string: {frame}");
+                saw_delta = true;
+            }
+            if event_type == "response.completed" {
+                assert!(frame["response"]["usage"]["output_tokens"].is_u64(), "{frame}");
+            }
+        }
+        assert!(saw_delta, "stream should deliver text deltas: {sse}");
+
+        handle.stop();
+        println!("[live] RESPONSES DONE");
+    }
+
     fn test_config(port: u16) -> ProxyConfig {
         ProxyConfig {
             host: "127.0.0.1".to_string(),
@@ -4877,6 +5597,83 @@ mod tests {
         assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
         // OpenAI 帧不应带 event: 行
         assert!(!text.contains("event:"), "{text}");
+
+        handle.stop();
+    }
+
+    /// Responses 入口的路由、鉴权与错误信封形状（与 chat 入口同一套门禁，不同的报文）。
+    #[test]
+    fn responses_route_is_gated_and_uses_openai_error_envelope() {
+        let mut handle = start_proxy(test_config(39885)).expect("proxy starts");
+        let port = handle.port;
+        let client = reqwest::blocking::Client::new();
+
+        // 1) 无 key → 401，OpenAI 信封
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+            .json(&json!({ "model": "claude-opus-5", "input": "hi" }))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let body: Value = resp.json().unwrap();
+        assert!(body.get("type").is_none(), "顶层不应有 type 字段: {body}");
+        assert!(body["error"]["message"].is_string());
+        assert!(body["error"].get("code").is_some(), "{body}");
+
+        // 2) 带 key 但 input 为空 → 400 由入参校验拦下（证明已通过鉴权、进入 handler）
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+            .header("authorization", "Bearer test-key")
+            .json(&json!({ "model": "claude-opus-5", "input": "" }))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: Value = resp.json().unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("messages"));
+
+        handle.stop();
+    }
+
+    /// Responses 流式入口在缺少上游凭据时，必须以 `response.failed` 事件收尾而不是 HTTP 错误。
+    ///
+    /// Codex 已经收到 200；Responses 协议没有 `[DONE]`，正常结束与失败都以
+    /// terminal 事件（completed / failed）声明，客户端据此停止读取。
+    #[test]
+    fn responses_stream_failure_finishes_as_responses_sse() {
+        let mut handle = start_proxy(test_config(39887)).expect("proxy starts");
+        let port = handle.port;
+        let client = reqwest::blocking::Client::new();
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+            .header("authorization", "Bearer test-key")
+            .json(&json!({
+                "model": "claude-opus-5",
+                "input": "hi",
+                "stream": true,
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+
+        let text = resp.text().unwrap();
+        // 先有 response.created 建立流上下文，再以 response.failed 终止
+        assert!(text.contains("event: response.created"), "{text}");
+        assert!(text.contains("\"type\":\"response.created\""), "{text}");
+        assert!(text.contains("event: response.failed"), "{text}");
+        assert!(text.contains("\"type\":\"response.failed\""), "{text}");
+        // Responses 协议没有 [DONE] 终止标记
+        assert!(!text.contains("[DONE]"), "{text}");
 
         handle.stop();
     }

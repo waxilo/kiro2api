@@ -9,13 +9,14 @@ import { listen } from '@tauri-apps/api/event';
 
 import { englishOnly, errorText } from '../core/format';
 import { backend } from '../core/ipc';
-import type { CopyKind, ModelsState, RevealTarget, UsageInfo } from '../core/types';
+import type { CopyKind, ModelsState, ProxyStatus, RevealTarget, UsageInfo } from '../core/types';
 import { updater } from '../services/updater';
 import {
   blockingLabel,
   isPending,
   store,
   type PendingAction,
+  type ThirdPartyTab,
   type ViewId,
 } from './app-state';
 
@@ -43,18 +44,10 @@ export const ACTION = {
   queryUsage: '查询额度',
   resetKey: '重置密钥',
   savePort: '保存端口',
+  workbuddyApply: '应用 WorkBuddy 变更',
+  codexApply: '接入 Codex',
+  codexRemove: '移除 Codex 接入',
 } as const;
-
-/** 每个复制目标在提示里的说法。集中在这里，避免散落在分支里对不上。 */
-const COPY_LABELS: Record<CopyKind, string> = {
-  api_key: '代理密钥',
-  anthropic_base_url: 'Anthropic 地址',
-  openai_base_url: 'OpenAI 地址',
-  anthropic_env: 'Anthropic .env',
-  anthropic_json: 'Anthropic JSON',
-  openai_env: 'OpenAI .env',
-  openai_json: 'OpenAI JSON',
-};
 
 /**
  * 动作的占用范围。
@@ -107,6 +100,56 @@ const ACTION_TIMEOUT_MS = 45_000;
 
 export function navigate(view: ViewId): void {
   store.set({ view });
+  // 进入三方接入分区时拉一次扫描：两份配置用户随时可能手改，每次进分区都读一遍盘
+  // （纯本地小文件），看到的一定是当下的状态。
+  if (view === 'thirdparty') void loadThirdPartyScans();
+}
+
+/** 同时拉 WorkBuddy 与 Codex 的扫描（都是纯本地读盘）。单个失败不影响另一个。 */
+function loadThirdPartyScans(): Promise<void> {
+  return Promise.all([loadWorkbuddyScan(), loadCodexScan()]).then(() => undefined);
+}
+
+/**
+ * 扫描 WorkBuddy 里指向本应用的自定义模型。失败只写 `error` 清掉旧结果，
+ * 让分区就地呈现原因；不打断界面上其它部分。
+ */
+async function loadWorkbuddyScan(): Promise<void> {
+  try {
+    store.set({ workbuddyScan: await backend.workbuddyList() });
+  } catch (error) {
+    store.set({ error: errorText(error) });
+  }
+}
+
+/**
+ * 扫描 Codex 配置里指向本应用的 provider。失败策略与 WorkBuddy 相同：
+ * 分区就地呈现原因，不弹 toast。
+ */
+async function loadCodexScan(): Promise<void> {
+  try {
+    store.set({ codexScan: await backend.codexList() });
+  } catch (error) {
+    store.set({ error: errorText(error) });
+  }
+}
+
+/** 扫描结果里已接入的模型 id（去重）。扫描还没回来时是空集。 */
+function scanIds(): string[] {
+  return [...new Set((store.get().workbuddyScan?.entries ?? []).map((entry) => entry.id))];
+}
+
+/**
+ * 「搜索词只收 ASCII」这把尺子，两个搜索框（可用模型分区、三方接入分区）共用。
+ *
+ * 裁掉过东西就说一句：否则用户看到自己刚贴进去的字凭空消失，只会以为是坏了。
+ */
+function asciiOnly(query: string): string {
+  const ascii = englishOnly(query);
+  if (ascii !== query) {
+    feedback.toast('模型名是英文，搜索框只接受 ASCII 字符');
+  }
+  return ascii;
 }
 
 /**
@@ -121,12 +164,12 @@ export function navigate(view: ViewId): void {
  * 由这里一把尺子量完，也由这里负责告诉用户裁掉了什么。
  */
 export function setModelFilter(query: string): void {
-  const ascii = englishOnly(query);
-  // 裁掉过东西就说一句：否则用户看到自己刚贴进去的字凭空消失，只会以为是坏了
-  if (ascii !== query) {
-    feedback.toast('模型名是英文，搜索框只接受 ASCII 字符');
-  }
-  store.set({ modelFilter: ascii });
+  store.set({ modelFilter: asciiOnly(query) });
+}
+
+/** 更新「三方接入」分区的搜索词。分区不在时忽略：值没有归属地。 */
+export function setWorkbuddyFilter(query: string): void {
+  store.set({ workbuddyFilter: asciiOnly(query) });
 }
 
 /**
@@ -154,6 +197,8 @@ export async function refresh(): Promise<void> {
       usage: store.get().usage ?? cachedUsage,
       error: null,
     });
+    // 正在看「三方接入」分区时，把两份扫描也带上：它们同样只读本地盘。
+    if (store.get().view === 'thirdparty') await loadThirdPartyScans();
   } catch (error) {
     store.set({ error: errorText(error) });
   }
@@ -233,13 +278,101 @@ export async function run(
 
 // ── 动作实现 ────────────────────────────────────────────────────────────
 
+/**
+ * invoke 回话与后端事件的赛跑：哪边先落地就用哪边的载荷。
+ *
+ * 为什么要赛跑：回话和事件最终都投递进 WebView，但窗口最小化/被遮挡期间 WebView2
+ * 会节流任务投递 —— 实测（kiro-debug.log 分阶段计时）后端 1.1 秒就刷新完凭据、
+ * emit 了事件，回话却能迟到 45 秒以上。只等回话，45 秒闸门必然误报「超时」，
+ * 而数据明明早就到了。事件在命令 return 前发出、载荷就是同一份结果，两边等价。
+ *
+ * `extra` 是第三条 contender（刷新凭据的轮询路，见 pollForRefreshedStatus）。
+ * 它必须进**这一个** race：善后统一挂在结算的 finally 上 —— 若把它嵌套在外层
+ * 再赛一次，内层 race 在轮询先赢时永不结算，挂在 finally 上的事件监听注销
+ * 就永远不会执行，每刷一次漏一个监听。
+ *
+ * 其余善后：回话先赢时撤掉事件监听（包括「结算早于监听挂上」的窗口期）；
+ * 事件先赢时，迟到的那份回话可能才 reject —— 提前挂上空 catch，别变成
+ * unhandledrejection。真正两边都没到的死局仍由 `run()` 的闸门兜底。
+ */
+function raceWithEvent<T>(invoke: Promise<T>, eventName: string, extra?: Promise<T>): Promise<T> {
+  let settled = false;
+  let unlisten: (() => void) | undefined;
+  const eventPromise = new Promise<T>((resolve) => {
+    void listen<T>(eventName, (event) => resolve(event.payload)).then((off) => {
+      if (settled) off();
+      else unlisten = off;
+    });
+  });
+  invoke.catch(() => {});
+  const contenders: Promise<T>[] = [invoke, eventPromise];
+  if (extra) contenders.push(extra);
+  return Promise.race(contenders).finally(() => {
+    settled = true;
+    unlisten?.();
+  });
+}
+
+/** 轮询间隔。后端实测 ~1.1s 完成；2s 一查跟得上，也不至于在节流期间堆积请求。 */
+const REFRESH_POLL_MS = 2_000;
+
+/**
+ * 到期时间是否比基线新 —— 轮询判定「凭据确实换过了」的唯一依据。
+ *
+ * 基线取点击那一刻 store 里的旧值：后端 force_refresh 必产新 token，新到期时间必然更晚；
+ * 反过来刷新还没写完（或失败）时读到的仍是旧值，继续等。没有基线（点之前就没有到期时间）
+ * 时，只要读到了就算前进。
+ */
+function expiryAdvanced(next: string | null | undefined, baseline: string | null): boolean {
+  if (!next) return false;
+  if (!baseline) return true;
+  return new Date(next).getTime() > new Date(baseline).getTime();
+}
+
+/**
+ * 刷新凭据的轮询路：pending 期间每 2 秒主动读一次本地状态，到期时间前进即视为完成。
+ *
+ * 这是第三条结算通道，专治「窗口最小化时回话和事件一起被 WebView2 压住」的场景 ——
+ * 被动投递不可信，但**新发起**的 invoke 实测能正常往返（45 秒闸门的 resync 就是这么
+ * 活下来的）。轮询不依赖任何投递时序，把「知道刷新完成了」从投递层解耦出来。
+ * 单跳失败（读状态出错）不结算，等下一跳；调用方在 race 落地后 cancel 掉定时器。
+ */
+function pollForRefreshedStatus(baseline: string | null): {
+  promise: Promise<ProxyStatus>;
+  cancel: () => void;
+} {
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const promise = new Promise<ProxyStatus>((resolve) => {
+    timer = setInterval(() => {
+      void backend.status().then(
+        (status) => {
+          if (expiryAdvanced(status.expiresAt, baseline)) resolve(status);
+        },
+        () => {},
+      );
+    }, REFRESH_POLL_MS);
+  });
+  return { promise, cancel: () => clearInterval(timer) };
+}
+
+/** 「已复制」在按钮上停留多久。短于一次犹豫，长于一次眨眼。 */
+const COPIED_RESET_MS = 1600;
+
+/**
+ * 复制接入片段。成功反馈长在按钮上（见 `AppState.copiedKind`），
+ * 失败仍然走 toast —— 失败要给出真实原因，不能只把按钮变红了事。
+ */
 async function copyToClipboard(kind: CopyKind): Promise<void> {
   try {
     const copied = await backend.copyAccess(kind);
-    feedback.toast(
-      copied ? `已复制${COPY_LABELS[kind]}` : '没有可复制的内容',
-      copied ? 'info' : 'error',
-    );
+    if (!copied) {
+      feedback.toast('没有可复制的内容', 'error');
+      return;
+    }
+    store.set({ copiedKind: kind });
+    setTimeout(() => {
+      if (store.get().copiedKind === kind) store.set({ copiedKind: null });
+    }, COPIED_RESET_MS);
   } catch (error) {
     feedback.toast(errorText(error), 'error');
   }
@@ -273,7 +406,9 @@ async function queryUsage(): Promise<void> {
   await run(
     ACTION.queryUsage,
     async () => {
-      store.set({ usage: await backend.usage() });
+      // 同刷新凭据：回话可能被节流压住，但命令在 return 前 emit 了同一份结果，
+      // 赛跑着等，谁先到用谁 —— 事件先到时额度数字先亮出来，闸门不再空等。
+      store.set({ usage: await raceWithEvent(backend.usage(), 'proxy://usage-updated') });
     },
     { resync: false },
   );
@@ -316,16 +451,33 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
       return;
 
     case 'refresh-token':
-      // 后端已经把刷新后的 `ProxyStatus` 作为返回值送回来了，直接写进 store：
+      // 后端把刷新后的 `ProxyStatus` 作为返回值送回来，直接写进 store：
       // invoke 一落地，界面上的到期时间就是新的，不用再打一轮 IPC 去重新读。
       // 凭据刷新不会改动 access / models，所以这一次跳过最终的整体同步。
+      //
+      // 但回话本身可能被 WebView2 的节流压住几十秒（实测复现过，见 raceWithEvent
+      // 的注释与 kiro-debug.log 的分阶段计时），最小化时连事件也可能一起被压 ——
+      // 所以三条通道赛跑，谁先到用谁：回话、`proxy://token-refreshed` 事件
+      // （载荷就是同一份 ProxyStatus）、轮询（主动拉，见 pollForRefreshedStatus）。
+      // 45 秒闸门只兜「三条全断」的底。
       //
       // `scoped`（见 ACTION_SCOPE）：它等的是最长 30 秒的上游 HTTP，只碰凭据文件、
       // 不改配置，因此不占用全局门控 —— 这 30 秒里用户想启动代理、复制地址、查额度都照常。
       await run(
         ACTION.refreshToken,
         async () => {
-          store.set({ status: await backend.refreshToken() });
+          const poll = pollForRefreshedStatus(store.get().status?.expiresAt ?? null);
+          try {
+            store.set({
+              status: await raceWithEvent(
+                backend.refreshToken(),
+                'proxy://token-refreshed',
+                poll.promise,
+              ),
+            });
+          } finally {
+            poll.cancel();
+          }
           feedback.toast('凭据已刷新');
         },
         { resync: false },
@@ -363,6 +515,89 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
       await run(ACTION.resetKey, async () => {
         store.set({ access: await backend.resetKey() });
         feedback.toast('已生成新密钥，旧密钥立即失效');
+      });
+      return;
+
+    case 'thirdparty-tab': {
+      const tab = dataset.tab as ThirdPartyTab | undefined;
+      if (tab) store.set({ thirdPartyTab: tab });
+      return;
+    }
+
+    case 'workbuddy-toggle': {
+      const model = dataset.model ?? '';
+      if (!model) return;
+      const state = store.get();
+      // 勾选的基准是「扫描到的已接入集合」；第一次点卡片时把它物化成完整集合，
+      // 之后焦点刷新重扫清单也不会覆盖未应用的改动。
+      const importedIds = scanIds();
+      const current = state.workbuddyChecked ?? importedIds;
+      const next = current.includes(model)
+        ? current.filter((item) => item !== model)
+        : [...current, model];
+      // 拨回与扫描一致时退回 null：应用按钮随之回到不可用，状态也不再「悬着」
+      const same =
+        next.length === importedIds.length && next.every((id) => importedIds.includes(id));
+      store.set({ workbuddyChecked: same ? null : next });
+      return;
+    }
+
+    case 'clear-workbuddy-filter':
+      setWorkbuddyFilter('');
+      return;
+
+    case 'workbuddy-reset':
+      // 恢复 = 丢掉未应用的勾选、回到扫描到的现状。纯本地状态重置，
+      // 不走 run()：没有后端命令，也不该被别的动作的门控拦住。
+      store.set({ workbuddyChecked: null });
+      return;
+
+    case 'workbuddy-apply': {
+      const state = store.get();
+      const checked = state.workbuddyChecked;
+      if (!checked) return;
+      // 没登记进 ACTION_SCOPE，按默认 `global` 处理：写 WorkBuddy 读的是同一份配置
+      // （地址与密钥），和改配置的动作串行才不会拿到「改到一半」的值 ——
+      // 与复制按钮的门控同理。收尾的 refresh() 会顺带重扫清单。
+      const remove = scanIds().filter((id) => !checked.includes(id));
+      await run(ACTION.workbuddyApply, async () => {
+        // 写入的是全部勾选项而不是只写新增的：导入是合并式的（一致的条目「无变化」），
+        // 密钥不一致的条目借此用当前密钥覆盖 —— 原先单独的「同步密钥」并进了这一步。
+        const summary = checked.length ? await backend.workbuddyImport(checked) : null;
+        let removed = 0;
+        for (const model of remove) removed += await backend.workbuddyRemove(model);
+        store.set({ workbuddyChecked: null });
+        const parts = [
+          summary?.added ? `新增 ${summary.added}` : '',
+          summary?.updated ? `更新 ${summary.updated}` : '',
+          removed ? `移除 ${removed}` : '',
+        ].filter(Boolean);
+        feedback.toast(
+          parts.length ? `已同步 WorkBuddy：${parts.join('、')}` : 'WorkBuddy 已与勾选一致，没有变更',
+        );
+      });
+      return;
+    }
+
+    case 'codex-apply':
+      // 与 WorkBuddy 同理按默认 `global` 门控。接入是幂等的：已一致时后端不写盘。
+      await run(ACTION.codexApply, async () => {
+        const summary = await backend.codexImport();
+        const parts = [
+          summary.configWritten ? 'provider 已写入' : '',
+          summary.authWritten ? '密钥已同步' : '',
+        ].filter(Boolean);
+        feedback.toast(parts.length ? `已接入 Codex：${parts.join('、')}` : 'Codex 已是最新配置，没有变更');
+      });
+      return;
+
+    case 'codex-remove':
+      await run(ACTION.codexRemove, async () => {
+        const removed = await backend.codexRemove();
+        feedback.toast(
+          removed ? '已移除 Codex 的接入配置' : '没有找到指向本应用的 Codex 配置',
+          removed ? 'info' : 'error',
+        );
       });
       return;
 

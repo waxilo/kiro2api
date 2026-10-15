@@ -2,7 +2,7 @@
 //
 // 只用数字说明用量时，用户必须心算 `currentUsage / usageLimit`；给一条带刻度的条，
 // 一眼就知道是不是快用完了。颜色在 75% / 90% 两档变调，对应「该留意了」与「要断了」。
-import { esc } from '../../core/format';
+import { esc, localTime, percent4 } from '../../core/format';
 import type { UsageInfo } from '../../core/types';
 import { ACTION } from '../../state/actions';
 import { isPending } from '../../state/app-state';
@@ -29,7 +29,7 @@ function renderMeter(usage: UsageInfo): string {
         <span class="meter-usage">
           已用 <strong>${esc(money(usage.currentUsage))}</strong> / ${esc(money(usage.usageLimit))}
         </span>
-        <span class="meter-percent">${percent}%</span>
+        <span class="meter-percent">${percent4(usage.percentUsed)}%</span>
       </div>
       <div class="meter-track">
         <div class="meter-fill" style="width:${percent}%"></div>
@@ -38,7 +38,7 @@ function renderMeter(usage: UsageInfo): string {
         <span>剩余 ${esc(usage.remaining)}</span>
         ${
           usage.nextResetAt
-            ? `<span>下次重置 ${esc(usage.nextResetAt)}${
+            ? `<span>下次重置 ${esc(localTime(usage.nextResetAt))}${
                 usage.daysUntilReset != null ? `（${usage.daysUntilReset} 天）` : ''
               }</span>`
             : ''
@@ -74,6 +74,7 @@ export const usageView: ViewSpec = {
         <div class="card-head">
           <span class="card-title">用量</span>
           <span class="card-head-spacer"></span>
+          ${usage?.fetchedAt ? `<span class="card-sub">上次刷新 ${esc(localTime(usage.fetchedAt))}</span>` : ''}
           <button class="small" data-action="usage"${actionAttrs(state, ACTION.queryUsage)}>
             ${loading ? '查询中…' : '查询额度'}
           </button>

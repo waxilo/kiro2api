@@ -37,6 +37,54 @@ export interface ProxyAccess {
   hasApiKey: boolean;
 }
 
+/** `k2a_workbuddy_import` 的返回：按「地址 + 模型 id」合并进 WorkBuddy 后的摘要。 */
+export interface WorkbuddyImportSummary {
+  added: number;
+  updated: number;
+  unchanged: number;
+}
+
+/** 一条指向本应用的 WorkBuddy 自定义模型。 */
+export interface WorkbuddyEntry {
+  id: string;
+  /** 条目里写的完整地址（host+端口必然与代理一致，路径可能各不相同）。 */
+  url: string;
+  /** 条目密钥与当前代理密钥是否一致；false 时界面提示重置密钥已让它过期。 */
+  keyMatches: boolean;
+}
+
+/** `k2a_workbuddy_list` 的返回。读盘失败不作为命令错误，就地放在 error 里。 */
+export interface WorkbuddyScan {
+  /** ~/.workbuddy 目录不存在 = WorkBuddy 未安装。 */
+  installed: boolean;
+  entries: WorkbuddyEntry[];
+  error: string | null;
+}
+
+/** 一条指向本应用的 Codex provider（`~/.codex/config.toml` 的 model_providers 条目）。 */
+export interface CodexEntry {
+  id: string;
+  base_url: string;
+  /** 顶层 `model_provider` 是否指向它 —— 即 Codex 当前是否正在用它。 */
+  active: boolean;
+  /** auth.json 里的密钥与当前代理密钥是否一致；false 时界面提示重置密钥已让它过期。 */
+  keyMatches: boolean;
+}
+
+/** `k2a_codex_list` 的返回。读盘失败不作为命令错误，就地放在 error 里。 */
+export interface CodexScan {
+  /** ~/.codex 目录不存在 = Codex 未安装。 */
+  installed: boolean;
+  entries: CodexEntry[];
+  error: string | null;
+}
+
+/** `k2a_codex_import` 的返回：接入 Codex 后哪些文件真的写了。 */
+export interface CodexImportSummary {
+  configWritten: boolean;
+  authWritten: boolean;
+}
+
 /** `k2a_usage` 的返回。 */
 export interface UsageInfo {
   subscriptionTitle: string | null;
@@ -50,6 +98,8 @@ export interface UsageInfo {
   overageStatus: string | null;
   currency: string | null;
   email: string | null;
+  /** 数据取得时刻（UTC ISO）。后端在查询 / 读缓存时按落盘时间戳补上；拿不到时为 null。 */
+  fetchedAt: string | null;
 }
 
 /** 复制类型：与 Rust 侧 `format_access_text` 支持的种类保持一致。 */

@@ -61,13 +61,13 @@ Kiro 的接口是私有的（AWS Event Stream 二进制流），并不能直接�
 
 ### 3. 接入客户端
 
-在左侧「双协议接入」分区里，两套协议各有一组一键复制按钮：**复制地址**、**复制 .env**、**复制 JSON**。
+在左侧「协议接入」分区里，两套协议各有一组一键复制按钮：**复制地址**、**复制 .env**、**复制 JSON**。
 
 **Anthropic 协议**（Claude Code / Anthropic SDK）
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:5680
-ANTHROPIC_AUTH_TOKEN=<在「双协议接入」复制的密钥>
+ANTHROPIC_AUTH_TOKEN=<在「协议接入」复制的密钥>
 ```
 
 **OpenAI 协议**（OpenAI SDK / LangChain / 兼容客户端）
@@ -86,6 +86,12 @@ OPENAI_API_KEY=<同一个密钥>
 
 健康检查：`curl http://127.0.0.1:5680/health`。
 
+**WorkBuddy 一键接入**：左侧「三方接入」分区把每个可用模型展示成一张卡片，选中即写入
+WorkBuddy 的自定义模型清单（`~/.workbuddy/models.json`）、取消选中即移除，点「应用」一次
+生效（「恢复」放弃未应用的改动）；重置密钥后把全部选中项再应用一遍即可同步新密钥。
+该分区只列出并管理「指向本应用」的条目（按地址与端口匹配）—— WorkBuddy 里配给其它服务的
+模型不会被看到，更不会被改动。
+
 ### 4. 可用模型与账户额度
 
 左侧「可用模型」分区列出当前 Kiro 账户可用的模型，「账户额度」分区显示用量与剩余。
@@ -102,7 +108,7 @@ OPENAI_API_KEY=<同一个密钥>
 
 代理密钥首次启动时自动生成并持久化，重启后不变，方便你把它配置到多个客户端里长期使用。
 密钥只在本机内网生效，且服务只监听 `127.0.0.1`，同网段其它设备无法访问。
-需要换密钥时：先停止代理 → 在「双协议接入」分区点「重置密钥」→ 重新启动（旧密钥立即失效，
+需要换密钥时：先停止代理 → 在「协议接入」分区点「重置密钥」→ 重新启动（旧密钥立即失效，
 客户端需要重新粘贴）。
 
 ---
@@ -154,7 +160,7 @@ src/                     前端（TypeScript + Vite，无框架）
   ui/
     shared/              通用片段：icons / render / toast / scroll-area（自绘滚动条）
     shell/               外壳：titlebar / rail（左导航）/ statusbar / shell（唯一渲染循环）
-    views/               6 个分区视图，都是 (state) => HTML 的纯函数
+    views/               7 个分区视图，都是 (state) => HTML 的纯函数
   styles/                tokens → base → components → shell → views 五层
 src-tauri/src/
   lib.rs                 应用装配：插件、命令注册、托盘、退出钩子

@@ -4,11 +4,14 @@
 // 不放 HTML —— 拼 HTML 属于表现层。这样状态语义只有一个来源，
 // 状态栏、侧边栏、卡片三处显示的运行状态永远不会各说各话。
 import type {
+  CodexScan,
+  CopyKind,
   ModelsState,
   ProxyAccess,
   ProxyStatus,
   UpdateState,
   UsageInfo,
+  WorkbuddyScan,
 } from '../core/types';
 import { createStore } from './store';
 
@@ -16,6 +19,7 @@ import { createStore } from './store';
 export const VIEW_IDS = [
   'overview',
   'endpoints',
+  'thirdparty',
   'models',
   'usage',
   'updates',
@@ -63,7 +67,53 @@ export interface AppState {
    */
   error: string | null;
   update: UpdateState;
+  /**
+   * 「三方接入」分区里当前的 tab。tab 结构先于内容存在：
+   * 现在只有 WorkBuddy 一个，但接入方式（tab 条）已经按多个客户端设计。
+   */
+  thirdPartyTab: ThirdPartyTab;
+  /**
+   * 「三方接入」分区的 WorkBuddy 扫描结果；null 表示还没扫过（首次进入分区时拉取）。
+   *
+   * 只含「指向本应用」的条目 —— host+端口匹配才进得来，WorkBuddy 里配给别的服务的
+   * 条目一概不出现。进分区与焦点回到窗口时各刷一次，用户在 WorkBuddy 侧手工改动后
+   * 切回来就能看到。
+   */
+  workbuddyScan: WorkbuddyScan | null;
+  /**
+   * 「三方接入」分区的搜索词。语义与 `modelFilter` 相同：只影响显示，
+   * 不碰勾选；纯界面状态，不落盘。
+   */
+  workbuddyFilter: string;
+  /**
+   * 三方接入卡片的勾选状态（模型 id 集合）。勾选即语义：在集合里 = 该模型
+   * 应写进 WorkBuddy，不在 = 应从 WorkBuddy 移除。
+   *
+   * null 表示用户还没动过，勾选跟随扫描结果；点过一张卡后物化成完整集合，
+   * 此后焦点刷新（会重扫清单）不再覆盖未应用的改动，直到「应用变更」落地
+   * 或把勾选拨回与扫描一致。
+   */
+  workbuddyChecked: string[] | null;
+  /**
+   * 「三方接入」分区的 Codex 扫描结果；null 表示还没扫过（进分区时拉取）。
+   *
+   * 与 WorkBuddy 不同构：Codex 是单 provider 模型（`model_providers` 表 +
+   * 顶层 `model_provider` 选择），没有可多选的模型清单，交互是「一键接入 /
+   * 移除」。只含指向本应用的条目，其余 provider 看不见也就动不到。
+   */
+  codexScan: CodexScan | null;
+  /**
+   * 刚复制成功的复制类型；对应的复制按钮把文案短暂换成「已复制」。
+   *
+   * 反馈长在按钮上而不是 toast：地址 / .env / JSON 三颗按钮挨在一起，每点一下都弹
+   * 浮层会很吵；按钮自己是「按了哪里哪里亮」。1.6 秒后由 actions 里的定时器清空，
+   * 连续复制不同种类时以最后一次为准。
+   */
+  copiedKind: CopyKind | null;
 }
+
+/** 「三方接入」分区的 tab 标识。接入新的第三方客户端时在这里扩。 */
+export type ThirdPartyTab = 'workbuddy' | 'codex';
 
 /** 一个正在执行的动作。 */
 export interface PendingAction {
@@ -107,6 +157,12 @@ export const store = createStore<AppState>({
   pending: [],
   error: null,
   update: { ...INITIAL_UPDATE },
+  thirdPartyTab: 'workbuddy',
+  workbuddyScan: null,
+  workbuddyFilter: '',
+  workbuddyChecked: null,
+  codexScan: null,
+  copiedKind: null,
 });
 
 /**
@@ -150,5 +206,5 @@ export function summarizeStatus(state: AppState): StatusSummary {
   if (!status.available) {
     return { tone: 'warn', label: '缺少凭据', detail: '未找到 Kiro 凭据，无法启动代理' };
   }
-  return { tone: 'off', label: '已停止', detail: '代理未运行，双协议接口不可用' };
+  return { tone: 'off', label: '已停止', detail: '代理未运行，协议接口不可用' };
 }

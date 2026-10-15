@@ -7,6 +7,8 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import type {
+  CodexImportSummary,
+  CodexScan,
   CopyKind,
   ModelsState,
   ProxyAccess,
@@ -14,6 +16,8 @@ import type {
   RevealTarget,
   UpdateSourceState,
   UsageInfo,
+  WorkbuddyImportSummary,
+  WorkbuddyScan,
 } from './types';
 
 export const backend = {
@@ -54,6 +58,29 @@ export const backend = {
    */
   copyText: (text: string) => invoke<boolean>('k2a_copy_text', { text }),
   resetKey: () => invoke<ProxyAccess>('k2a_reset_key'),
+
+  // ── WorkBuddy 接入管理 ────────────────────────────────────────────────
+  /**
+   * 把选中的模型写入 WorkBuddy 的自定义模型清单。只传模型 id：
+   * 地址与密钥由后端从当前配置里取 —— 密钥不经过前端，与「复制」同一条纪律。
+   */
+  workbuddyImport: (models: string[]) =>
+    invoke<WorkbuddyImportSummary>('k2a_workbuddy_import', { models }),
+  /** 扫描 WorkBuddy 清单里指向本应用（host+端口匹配）的自定义模型。 */
+  workbuddyList: () => invoke<WorkbuddyScan>('k2a_workbuddy_list'),
+  /** 从 WorkBuddy 清单移除一个指向本应用的模型，返回移除条数。 */
+  workbuddyRemove: (model: string) => invoke<number>('k2a_workbuddy_remove', { model }),
+
+  // ── Codex 接入管理 ─────────────────────────────────────────────────────
+  /**
+   * 接入 Codex：写 provider 表、激活它、同步密钥到 auth.json。不传参数：
+   * 地址与密钥由后端从当前配置里取 —— 密钥不经过前端，与「复制」同一条纪律。
+   */
+  codexImport: () => invoke<CodexImportSummary>('k2a_codex_import'),
+  /** 扫描 Codex 配置里指向本应用（host+端口匹配）的 provider。 */
+  codexList: () => invoke<CodexScan>('k2a_codex_list'),
+  /** 移除指向本应用的 Codex provider（含顶层选择与密钥），返回是否确有移除。 */
+  codexRemove: () => invoke<boolean>('k2a_codex_remove'),
 
   // ── 更新下载源 ────────────────────────────────────────────────────────
   /**

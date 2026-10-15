@@ -1,7 +1,7 @@
-// 左侧导航：把六个分区按「运行 / 接入 / 系统」分组，分组标签给出分区之间的关系。
+// 左侧导航：把七个分区按「运行 / 接入 / 系统」分组，分组标签给出分区之间的关系。
 //
-// 分组而不是平铺六个入口，是因为这六件事的归属本来就不同：概览是「现在怎么样」，
-// 接入三项是「谁在用、账上有哪些模型、还剩多少」，系统两项是「这台机器上的应用本身」。
+// 分组而不是平铺七个入口，是因为这七件事的归属本来就不同：概览是「现在怎么样」，
+// 接入四项是「谁在用、账上有哪些模型、还剩多少」，系统两项是「这台机器上的应用本身」。
 // 平铺会让人以为它们是同一层的东西。
 //
 // 结构与状态分离：`renderRail()` 只建一次，`updateRail()` 只切当前项与角标 ——
@@ -29,7 +29,8 @@ const GROUPS: RailGroup[] = [
   {
     label: '接入',
     items: [
-      { id: 'endpoints', label: '双协议接入', icon: ICON.endpoints },
+      { id: 'endpoints', label: '协议接入', icon: ICON.endpoints },
+      { id: 'thirdparty', label: '三方接入', icon: ICON.thirdparty },
       { id: 'models', label: '可用模型', icon: ICON.models },
       { id: 'usage', label: '账户额度', icon: ICON.usage },
     ],

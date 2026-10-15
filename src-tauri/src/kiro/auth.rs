@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
@@ -48,6 +48,8 @@ pub struct KiroUsageInfo {
     pub overage_status: Option<String>,
     pub currency: Option<String>,
     pub email: Option<String>,
+    /// 数据取得时刻（UTC，RFC3339）。上游响应里没有这个信息，由命令层在查询 / 读缓存时补上。
+    pub fetched_at: Option<String>,
 }
 
 pub struct Auth {
@@ -139,7 +141,20 @@ impl Auth {
         fs::rename(&tmp_path, path).map_err(|e| format!("Failed to rename token file: {e}"))
     }
 
-    fn write_sso_token(&self, token: &Value) -> Result<(), String> {
+    /// 写入耗时进诊断日志：缓存文件被 IDE/CLI 占住时 rename 可能失败甚至卡住，
+    /// 是「刷新超时」的候选原因之一 —— 没有耗时数据就无法证实或排除。
+    fn write_sso_token(&self, token: &Value, source: &'static str) -> Result<(), String> {
+        let started = Instant::now();
+        let result = self.write_sso_token_inner(token);
+        let suffix = if result.is_ok() { "" } else { "，失败" };
+        crate::diag::log(&format!(
+            "[refresh:{source}] 写入凭据缓存：{}{suffix}",
+            crate::diag::secs(started.elapsed())
+        ));
+        result
+    }
+
+    fn write_sso_token_inner(&self, token: &Value) -> Result<(), String> {
         let mut clean = token.clone();
         if let Some(obj) = clean.as_object_mut() {
             obj.remove("cachePath");
@@ -201,7 +216,7 @@ impl Auth {
         Ok(result)
     }
 
-    fn refresh_idc(&self, token: &Value) -> Result<Value, String> {
+    fn refresh_idc(&self, token: &Value, source: &'static str) -> Result<Value, String> {
         let client_registration = self.read_client_registration(token);
         let (client_id, client_secret) = match client_registration.as_ref() {
             Some(registration) => (
@@ -220,9 +235,13 @@ impl Auth {
         }
 
         let region = token.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
+        let url = format!("https://oidc.{region}.amazonaws.com/token");
+        // 请求耗时单独成行：国内网络下这条请求顶满 30s 超时是「刷新超时」最常见的原因，
+        // 状态码 / 错误文本配合耗时就能把「上游慢」和「回话丢」区分开。
+        let started = Instant::now();
         let response = self
             .http
-            .post(format!("https://oidc.{region}.amazonaws.com/token"))
+            .post(url.as_str())
             .header("accept", "application/json")
             .header("content-type", "application/json")
             .header("user-agent", "KiroIDE")
@@ -232,8 +251,13 @@ impl Auth {
                 "grantType": "refresh_token",
                 "refreshToken": token.get("refreshToken").and_then(|v| v.as_str()).unwrap_or(""),
             }))
-            .send()
-            .map_err(|e| format!("SSO OIDC refresh request failed: {e}"))?;
+            .send();
+        let elapsed = crate::diag::secs(started.elapsed());
+        crate::diag::log(&match &response {
+            Ok(r) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，HTTP {}", r.status()),
+            Err(e) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，失败：{e}"),
+        });
+        let response = response.map_err(|e| format!("SSO OIDC refresh request failed: {e}"))?;
 
         let status = response.status();
         let text = response.text().unwrap_or_default();
@@ -260,23 +284,29 @@ impl Auth {
             obj.insert("provider".to_string(), token.get("provider").cloned().unwrap_or(Value::Null));
             obj.insert("region".to_string(), Value::String(region.to_string()));
         }
-        self.write_sso_token(&refreshed)?;
+        self.write_sso_token(&refreshed, source)?;
         Ok(refreshed)
     }
 
-    fn refresh_social(&self, token: &Value) -> Result<Value, String> {
-        let auth_service_url = "https://prod.us-east-1.auth.desktop.kiro.dev";
+    fn refresh_social(&self, token: &Value, source: &'static str) -> Result<Value, String> {
+        let url = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken";
+        let started = Instant::now();
         let response = self
             .http
-            .post(format!("{auth_service_url}/refreshToken"))
+            .post(url)
             .header("accept", "application/json")
             .header("content-type", "application/json")
             .header("user-agent", "KiroIDE")
             .json(&json!({
                 "refreshToken": token.get("refreshToken").and_then(|v| v.as_str()).unwrap_or(""),
             }))
-            .send()
-            .map_err(|e| format!("Kiro auth refresh request failed: {e}"))?;
+            .send();
+        let elapsed = crate::diag::secs(started.elapsed());
+        crate::diag::log(&match &response {
+            Ok(r) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，HTTP {}", r.status()),
+            Err(e) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，失败：{e}"),
+        });
+        let response = response.map_err(|e| format!("Kiro auth refresh request failed: {e}"))?;
 
         let status = response.status();
         let text = response.text().unwrap_or_default();
@@ -314,17 +344,17 @@ impl Auth {
                 obj.insert("profileArn".to_string(), Value::String(profile_arn.to_string()));
             }
         }
-        self.write_sso_token(&refreshed)?;
+        self.write_sso_token(&refreshed, source)?;
         Ok(refreshed)
     }
 
-    fn refresh_sso_token(&self, token: &Value) -> Result<Value, String> {
+    fn refresh_sso_token(&self, token: &Value, source: &'static str) -> Result<Value, String> {
         if token.get("refreshToken").and_then(|v| v.as_str()).is_none() {
             return Err("SSO access token expired, and no refreshToken was found.".to_string());
         }
         match token.get("authMethod").and_then(|v| v.as_str()) {
-            Some("IdC") => self.refresh_idc(token),
-            Some("social") => self.refresh_social(token),
+            Some("IdC") => self.refresh_idc(token, source),
+            Some("social") => self.refresh_social(token, source),
             other => Err(format!(
                 "Unsupported authMethod for refresh: {}",
                 other.unwrap_or("unknown")
@@ -347,7 +377,7 @@ impl Auth {
         {
             return Ok(Some(token));
         }
-        let refreshed = self.refresh_sso_token(&token)?;
+        let refreshed = self.refresh_sso_token(&token, "到期自动")?;
         Ok(Some(refreshed))
     }
 
@@ -537,7 +567,7 @@ impl Auth {
         }
         if let Some(token) = self.read_sso_token() {
             if token.get("refreshToken").and_then(|v| v.as_str()).is_some() {
-                self.refresh_sso_token(&token)?;
+                self.refresh_sso_token(&token, "请求重试")?;
                 return Ok(true);
             }
         }
@@ -545,10 +575,10 @@ impl Auth {
     }
 
     /// 强制刷新 SSO。成功时返回 `(true, 新的 expiresAt)`，便于调用方直接回传 UI。
-    pub fn force_refresh(&self) -> Result<(bool, Option<String>), String> {
+    pub fn force_refresh(&self, source: &'static str) -> Result<(bool, Option<String>), String> {
         if let Some(token) = self.read_sso_token() {
             if token.get("refreshToken").and_then(|v| v.as_str()).is_some() {
-                let refreshed = self.refresh_sso_token(&token)?;
+                let refreshed = self.refresh_sso_token(&token, source)?;
                 let expires = refreshed
                     .get("expiresAt")
                     .and_then(|v| v.as_str())
@@ -919,6 +949,7 @@ fn parse_kiro_usage_limits(data: &Value) -> KiroUsageInfo {
             .get("email")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        fetched_at: None,
     }
 }
 
