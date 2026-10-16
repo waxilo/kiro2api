@@ -2019,33 +2019,47 @@ fn pipe_kiro_body_to_openai_sse(
         }
     }
 
-    // 文本恢复出的工具调用：只有在整轮没有原生工具时才作为 tool_calls 补发，
-    // 避免与已发出的增量重复（`is_native_mirror` 判定同一调用）。
+    // 文本恢复出的内容：guard 只要见到请求声明了 tools 就会滞留末尾字符，见到
+    // `{`/`[`/```/`<invoke` 起更是把后续正文整段缓冲到 finish 才归还 —— Text 必须
+    // 补发为正文，否则上游明明说完，客户端却看到回复句中截断。Tool 只有在整轮
+    // 没有原生工具时才作为 tool_calls 补发，避免与已发出的增量重复
+    // （`is_native_mirror` 判定同一调用）。
     let mut recovered_tool_index = tool_order.len();
-    if !invalid_native_tool {
-        for part in recovered_finish.parts {
-            let RecoveredContent::Tool(tool) = part else {
-                continue;
-            };
-            if tool_blocks.values().any(|native| {
-                native.name == tool.get("name").and_then(Value::as_str).unwrap_or("")
-                    && serde_json::from_str::<Value>(native.arguments.trim())
-                        .ok()
-                        .is_some_and(|input| recovery_spec.is_native_mirror(&tool, &json!({ "input": input })))
-            }) {
-                continue;
+    for part in recovered_finish.parts {
+        match part {
+            RecoveredContent::Text(text) if !text.is_empty() => {
+                send(openai_sse_data(&openai_chunk(
+                    chat_id,
+                    response_model,
+                    json!({ "content": text }),
+                    None,
+                )));
             }
-            let Some(call) = anthropic_tool_use_to_openai(&tool, recovered_tool_index) else {
-                continue;
-            };
-            recovered_tool_index += 1;
-            emitted_any_tool_call = true;
-            send(openai_sse_data(&openai_chunk(
-                chat_id,
-                response_model,
-                json!({ "tool_calls": [call] }),
-                None,
-            )));
+            RecoveredContent::Tool(tool) => {
+                if invalid_native_tool {
+                    continue;
+                }
+                if tool_blocks.values().any(|native| {
+                    native.name == tool.get("name").and_then(Value::as_str).unwrap_or("")
+                        && serde_json::from_str::<Value>(native.arguments.trim())
+                            .ok()
+                            .is_some_and(|input| recovery_spec.is_native_mirror(&tool, &json!({ "input": input })))
+                }) {
+                    continue;
+                }
+                let Some(call) = anthropic_tool_use_to_openai(&tool, recovered_tool_index) else {
+                    continue;
+                };
+                recovered_tool_index += 1;
+                emitted_any_tool_call = true;
+                send(openai_sse_data(&openai_chunk(
+                    chat_id,
+                    response_model,
+                    json!({ "tool_calls": [call] }),
+                    None,
+                )));
+            }
+            RecoveredContent::Text(_) => {}
         }
     }
 
@@ -2137,7 +2151,10 @@ impl OpenAiToolBlock {
 /// schema 校验，只是出参形状换成 Responses 事件（见 `kiro::responses`）。两处刻意
 /// 的差异：思维链增量不进 Responses 流（需要 reasoning item 信封，本期不做）；
 /// 读流失败发 `response.failed` 而不是伪造正文 —— Codex 对失败事件有专门处理，
-/// 比假装成功更诚实。
+/// 比假装成功更诚实。同理，上游在事件之间**干净断流**（读到了 EOF、没报错，但整轮
+/// 没出现 `metadataEvent`）时按截断收尾：`incomplete_details = max_tokens` + 诊断
+/// 日志，不把半截正文伪装成完整回答 —— 正常结束的流必带 metadataEvent（见
+/// `eventstream` 测试样本），缺了它就是没说完。
 fn pipe_kiro_body_to_responses_sse(
     response: ReqwestResponse,
     recovery_spec: ToolRecoverySpec,
@@ -2154,6 +2171,7 @@ fn pipe_kiro_body_to_responses_sse(
     let mut read_buf = [0u8; 8192];
     let mut full_text = String::new();
     let mut stop_reason = "end_turn".to_string();
+    let mut saw_metadata = false;
     let mut protocol_guard = ProtocolTextGuard::default();
     let mut text_tool_guard = TextToolRecoveryGuard::new(recovery_spec.clone());
 
@@ -2251,6 +2269,7 @@ fn pipe_kiro_body_to_responses_sse(
                     }
                 }
                 "metadataEvent" => {
+                    saw_metadata = true;
                     if let Some(reason) = event.payload.get("stopReason").and_then(|v| v.as_str()) {
                         stop_reason = map_kiro_stop_reason(reason);
                     }
@@ -2262,6 +2281,16 @@ fn pipe_kiro_body_to_responses_sse(
 
     let event_stream_clean = parser.finish();
     if !event_stream_clean {
+        stop_reason = "max_tokens".to_string();
+    } else if !saw_metadata {
+        // 上游在事件之间干净断流：EOF 没报错，但整轮连 metadataEvent 都没有 ——
+        // 正常结束的流必带它（eventstream 测试样本），缺了就是没说完。按截断收尾
+        // 并留诊断，不再把半截正文伪装成完整的 end_turn。
+        diag_log(&format!(
+            "[responses-stream] eof_without_metadata text_len={} tool_calls={}",
+            full_text.len(),
+            tool_order.len()
+        ));
         stop_reason = "max_tokens".to_string();
     }
 
@@ -2306,31 +2335,41 @@ fn pipe_kiro_body_to_responses_sse(
         }
     }
 
-    // 文本恢复出的工具调用：只在整轮没有原生工具时补发（同 chat 的 is_native_mirror 判定）
-    if !invalid_native_tool {
-        for part in recovered_finish.parts {
-            let RecoveredContent::Tool(tool) = part else {
-                continue;
-            };
-            if tool_blocks.values().any(|native| {
-                native.name == tool.get("name").and_then(Value::as_str).unwrap_or("")
-                    && serde_json::from_str::<Value>(native.arguments.trim())
-                        .ok()
-                        .is_some_and(|input| recovery_spec.is_native_mirror(&tool, &json!({ "input": input })))
-            }) {
-                continue;
+    // 文本恢复出的内容：guard 只要见到请求声明了 tools 就会滞留末尾字符，见到
+    // `{`/`[`/```/`<invoke` 起更是把后续正文整段缓冲到 finish 才归还 —— Text 必须
+    // 补发为正文，否则上游明明说完，客户端却看到回复句中截断（Codex 实测即此）。
+    // Tool 仍只在整轮没有非法原生工具时补发（同 chat 的 is_native_mirror 判定）。
+    for part in recovered_finish.parts {
+        match part {
+            RecoveredContent::Text(text) if !text.is_empty() => {
+                emitter.open_message(&mut send);
+                emitter.push_text(&mut send, &text);
             }
-            let Some(name) = tool.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let call_id = tool.get("id").and_then(Value::as_str).unwrap_or("");
-            let input = tool.get("input").cloned().unwrap_or_else(|| json!({}));
-            let arguments =
-                serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-            emitter.open_function_call(&mut send, call_id, name);
-            emitter.push_function_arguments(&mut send, &arguments);
-            emitter.close_function_call(&mut send);
-            emitted_any_tool_call = true;
+            RecoveredContent::Tool(tool) => {
+                if invalid_native_tool {
+                    continue;
+                }
+                if tool_blocks.values().any(|native| {
+                    native.name == tool.get("name").and_then(Value::as_str).unwrap_or("")
+                        && serde_json::from_str::<Value>(native.arguments.trim())
+                            .ok()
+                            .is_some_and(|input| recovery_spec.is_native_mirror(&tool, &json!({ "input": input })))
+                }) {
+                    continue;
+                }
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let call_id = tool.get("id").and_then(Value::as_str).unwrap_or("");
+                let input = tool.get("input").cloned().unwrap_or_else(|| json!({}));
+                let arguments =
+                    serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                emitter.open_function_call(&mut send, call_id, name);
+                emitter.push_function_arguments(&mut send, &arguments);
+                emitter.close_function_call(&mut send);
+                emitted_any_tool_call = true;
+            }
+            RecoveredContent::Text(_) => {}
         }
     }
 
@@ -4547,6 +4586,206 @@ mod tests {
         dedup.append(&entry, b"complete-after-disconnect");
         assert!(dedup.mark_completed(&entry));
         assert!(matches!(dedup.acquire(key), DedupAcquire::Replay(_)));
+    }
+
+    /// 起一个只回一次给定字节的本地 HTTP 服务，返回其 URL。
+    /// 正文写完即关闭连接 = 干净 EOF —— 正是「上游在事件之间断流」的模拟方式。
+    fn serve_bytes_once(body: Vec<u8>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+        });
+        format!("http://{addr}/")
+    }
+
+    fn completed_snapshot(frames: &[String]) -> Value {
+        frames
+            .iter()
+            .find(|f| f.starts_with("event: response.completed"))
+            .and_then(|f| f.split_once("\ndata: "))
+            .map(|(_, data)| serde_json::from_str::<Value>(data.trim_end()).unwrap())
+            .expect("completed event must be present")
+    }
+
+    #[test]
+    fn responses_pipe_marks_incomplete_when_eof_has_no_metadata() {
+        use crate::kiro::eventstream::build_frame;
+
+        let mut body =
+            build_frame("assistantResponseEvent", &json!({ "content": "回答了一半" }));
+        body.extend(build_frame("assistantResponseEvent", &json!({ "content": "就断了" })));
+        let url = serve_bytes_once(body);
+
+        let response = reqwest::blocking::get(&url).unwrap();
+        let mut frames = Vec::new();
+        let clean = pipe_kiro_body_to_responses_sse(
+            response,
+            ToolRecoverySpec::default(),
+            "resp_trunc",
+            "gpt-5.2-codex",
+            |frame| frames.push(frame),
+        );
+
+        // EOF 干净没报错 —— 旧实现正是在这里静默 completed 的
+        assert!(clean);
+        let snapshot = completed_snapshot(&frames);
+        assert_eq!(snapshot["response"]["status"], "completed", "{snapshot}");
+        assert_eq!(
+            snapshot["response"]["incomplete_details"]["reason"], "max_tokens",
+            "无 metadataEvent 必须按截断标记: {snapshot}"
+        );
+        assert!(
+            frames.iter().any(|f| f.contains("回答了一半")),
+            "半截正文仍要正常发出"
+        );
+    }
+
+    #[test]
+    fn responses_pipe_completes_normally_with_metadata() {
+        use crate::kiro::eventstream::build_frame;
+
+        let mut body =
+            build_frame("assistantResponseEvent", &json!({ "content": "完整回答" }));
+        body.extend(build_frame("metadataEvent", &json!({ "stopReason": "END_TURN" })));
+        let url = serve_bytes_once(body);
+
+        let response = reqwest::blocking::get(&url).unwrap();
+        let mut frames = Vec::new();
+        let clean = pipe_kiro_body_to_responses_sse(
+            response,
+            ToolRecoverySpec::default(),
+            "resp_ok",
+            "gpt-5.2-codex",
+            |frame| frames.push(frame),
+        );
+
+        assert!(clean);
+        let snapshot = completed_snapshot(&frames);
+        assert_eq!(snapshot["response"]["status"], "completed", "{snapshot}");
+        assert!(
+            snapshot["response"]["incomplete_details"].is_null(),
+            "带 metadataEvent 的正常完成不得标截断: {snapshot}"
+        );
+    }
+
+    /// 回归：声明 tools 后 guard 会把含 `{`/``` 的正文整段缓冲到 finish 归还，
+    /// Responses 管道必须把归还的 Text 补发为正文 —— 否则 Codex 看到回复句中截断
+    /// （上游其实已完整发出 + END_TURN + 干净 EOF，实测即此）。
+    #[test]
+    fn responses_pipe_emits_guard_buffered_text_when_tools_declared() {
+        use crate::kiro::eventstream::build_frame;
+
+        let spec = ToolRecoverySpec::from_body(&json!({
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } },
+            }],
+        }));
+        assert!(!spec.is_empty());
+
+        let mut body = build_frame("assistantResponseEvent", &json!({ "content": "好的，" }));
+        body.extend(build_frame(
+            "assistantResponseEvent",
+            &json!({ "content": "配置如 { 示例 } 所示。" }),
+        ));
+        body.extend(build_frame("metadataEvent", &json!({ "stopReason": "END_TURN" })));
+        let url = serve_bytes_once(body);
+
+        let response = reqwest::blocking::get(&url).unwrap();
+        let mut frames = Vec::new();
+        let clean = pipe_kiro_body_to_responses_sse(
+            response,
+            spec,
+            "resp_guard_text",
+            "gpt-5.2-codex",
+            |frame| frames.push(frame),
+        );
+
+        assert!(clean);
+        let joined: String = frames
+            .iter()
+            .filter_map(|f| {
+                f.split_once("\ndata: ")
+                    .and_then(|(_, data)| serde_json::from_str::<Value>(data.trim_end()).ok())
+                    .filter(|frame| frame["type"] == "response.output_text.delta")
+                    .and_then(|frame| frame["delta"].as_str().map(str::to_string))
+            })
+            .collect();
+        assert_eq!(
+            joined, "好的，配置如 { 示例 } 所示。",
+            "缓冲的正文必须在收尾补发，客户端拿到的应是完整回复"
+        );
+        let snapshot = completed_snapshot(&frames);
+        assert_eq!(snapshot["response"]["status"], "completed", "{snapshot}");
+    }
+
+    /// 同上，chat/completions 管道的同型回归。
+    #[test]
+    fn openai_pipe_emits_guard_buffered_text_when_tools_declared() {
+        use crate::kiro::eventstream::build_frame;
+
+        let spec = ToolRecoverySpec::from_body(&json!({
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } },
+            }],
+        }));
+
+        let mut body = build_frame("assistantResponseEvent", &json!({ "content": "好的，" }));
+        body.extend(build_frame(
+            "assistantResponseEvent",
+            &json!({ "content": "配置如 { 示例 } 所示。" }),
+        ));
+        body.extend(build_frame("metadataEvent", &json!({ "stopReason": "END_TURN" })));
+        let url = serve_bytes_once(body);
+
+        let response = reqwest::blocking::get(&url).unwrap();
+        let mut chunks: Vec<Value> = Vec::new();
+        let clean = pipe_kiro_body_to_openai_sse(
+            response,
+            spec,
+            "chat_guard_text",
+            "gpt-5.2-codex",
+            |frame| {
+                if let Some(data) = frame.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
+                        chunks.push(v);
+                    }
+                }
+            },
+        );
+
+        assert!(clean);
+        let joined: String = chunks
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            joined, "好的，配置如 { 示例 } 所示。",
+            "缓冲的正文必须在收尾补发，客户端拿到的应是完整回复"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c["choices"][0]["finish_reason"] == "stop"),
+            "无工具调用应以 stop 收尾: {chunks:?}"
+        );
     }
 
     /// 临时手工验证（非 CI）：使用真实 Kiro SSO 凭据走一遍完整 Anthropic 协议链路。

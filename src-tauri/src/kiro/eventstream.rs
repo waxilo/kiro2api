@@ -259,34 +259,36 @@ fn parse_event_stream(input: &[u8]) -> Vec<KiroEvent> {
     parse_event_stream_checked(input).unwrap_or_default()
 }
 
+/// 测试专用：构造一条合法的 Event Stream 帧。server 的管道测试借它喂
+/// 「正常完成」与「事件间干净断流」两类上游流。
+#[cfg(test)]
+pub(crate) fn build_frame(event_type: &str, payload: &Value) -> Vec<u8> {
+    let name = b":event-type";
+    let value = event_type.as_bytes();
+    let mut headers = Vec::new();
+    headers.push(name.len() as u8);
+    headers.extend_from_slice(name);
+    headers.push(7u8); // string 类型
+    headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    headers.extend_from_slice(value);
+
+    let payload_bytes = serde_json::to_vec(payload).unwrap();
+    let total_len = 12 + headers.len() + payload_bytes.len() + 4;
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+    frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&crc32(&frame[..8]).to_be_bytes());
+    frame.extend_from_slice(&headers);
+    frame.extend_from_slice(&payload_bytes);
+    let message_crc = crc32(&frame);
+    frame.extend_from_slice(&message_crc.to_be_bytes());
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn build_frame(event_type: &str, payload: &Value) -> Vec<u8> {
-        let name = b":event-type";
-        let value = event_type.as_bytes();
-        let mut headers = Vec::new();
-        headers.push(name.len() as u8);
-        headers.extend_from_slice(name);
-        headers.push(7u8); // string 类型
-        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
-        headers.extend_from_slice(value);
-
-        let payload_bytes = serde_json::to_vec(payload).unwrap();
-        let total_len = 12 + headers.len() + payload_bytes.len() + 4;
-
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&(total_len as u32).to_be_bytes());
-        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&crc32(&frame[..8]).to_be_bytes());
-        frame.extend_from_slice(&headers);
-        frame.extend_from_slice(&payload_bytes);
-        let message_crc = crc32(&frame);
-        frame.extend_from_slice(&message_crc.to_be_bytes());
-        frame
-    }
 
     #[test]
     fn parses_assistant_response() {
