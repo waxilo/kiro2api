@@ -4,13 +4,17 @@
 //! 接入或清空之后不重启不生效 —— 这条命令把「重启」做成一步：
 //! 找到 OpenAI 桌面应用的主进程，强制结束整个进程树，再按包装身份重新拉起。
 //!
-//! 两个刻意的收窄：
+//! 两个刻意的收窄（Windows）：
 //! * 只结束「有窗口 + 进程名 codex*/chatgpt* + 路径属于 OpenAI 桌面应用」的进程：
 //!   终端里跑的 codex CLI（没有自己的窗口）与 codex-windows-sandbox-service
 //!   这类无窗口辅助进程不会被误伤；
 //! * 拉起不走 exe 路径：OpenAI 桌面应用是 MSIX 包（装在 ACL 保护的
 //!   WindowsApps 下），直接 spawn 不可靠 —— 解析 AUMID 后走
 //!   `explorer shell:appsFolder\<AUMID>`，与「打开数据目录」同款机制。
+//!
+//! macOS 按 bundle id（`com.openai.*`，实测 ChatGPT.app → `com.openai.codex`）
+//! 识别应用，只对该 bundle 路径下的进程下手；终端里跑的 codex CLI 命令行
+//! 不含 bundle 路径，同样不会被误伤。拉起走 `open -b <bundle-id>`。
 
 use std::process::Command;
 use std::time::Duration;
@@ -38,14 +42,22 @@ pub async fn k2a_codex_restart() -> Result<CodexRestartOutcome, String> {
 /// Codex 桌面应用现在是否在跑。给「要不要弹重启确认」用：
 /// 没在跑就没有「重启才生效」的问题，下次启动自然读到新配置，不该打扰。
 /// 探测失败按「没在跑」处理 —— 重启走的也是同一条探测路，这里失败了弹窗
-/// 也只会让用户按出一颗必然报错的按钮。非 Windows 探测不了，保持旧有
+/// 也只会让用户按出一颗必然报错的按钮。Linux 不支持重启，保持旧有
 /// 「总是提示」的行为。
 pub(crate) fn codex_app_running() -> bool {
     #[cfg(target_os = "windows")]
     {
         discover_app_processes().is_ok_and(|apps| !apps.is_empty())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        match discover_app_bundle() {
+            Ok(Some(bundle)) => processes_running(&bundle.path).unwrap_or(true),
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         true
     }
@@ -73,9 +85,33 @@ fn restart_codex_app() -> Result<CodexRestartOutcome, String> {
             app: Some(name),
         })
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        Err("重启 Codex 应用目前只支持 Windows".to_string())
+        let Some(bundle) = discover_app_bundle()? else {
+            return Ok(CodexRestartOutcome {
+                running: false,
+                restarted: false,
+                app: None,
+            });
+        };
+        if !processes_running(&bundle.path).unwrap_or(false) {
+            return Ok(CodexRestartOutcome {
+                running: false,
+                restarted: false,
+                app: Some(bundle.name),
+            });
+        }
+        terminate_app(&bundle)?;
+        relaunch_app(&bundle)?;
+        Ok(CodexRestartOutcome {
+            running: true,
+            restarted: true,
+            app: Some(bundle.name),
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Err("重启 Codex 应用目前只支持 Windows 与 macOS".to_string())
     }
 }
 
@@ -207,6 +243,168 @@ fn run_powershell(script: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// macOS 上一个可识别为「OpenAI 桌面应用」的 .app 包。
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct AppBundle {
+    path: std::path::PathBuf,
+    bundle_id: String,
+    name: String,
+}
+
+/// OpenAI 桌面应用的 bundle id 前缀。不写死完整 id —— 应用可能换代
+/// （com.openai.chat → com.openai.chatgpt → com.openai.codex），前缀通吃。
+#[cfg(target_os = "macos")]
+fn is_openai_bundle_id(id: &str) -> bool {
+    id.strip_prefix("com.openai.")
+        .is_some_and(|rest| rest.starts_with("codex") || rest.starts_with("chat"))
+}
+
+/// 在 /Applications 与 ~/Applications 里找 OpenAI 桌面应用（取第一个命中）。
+#[cfg(target_os = "macos")]
+fn discover_app_bundle() -> Result<Option<AppBundle>, String> {
+    let mut roots = vec![std::path::PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(std::path::PathBuf::from(home).join("Applications"));
+    }
+    for root in roots {
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("app") {
+                continue;
+            }
+            let plist = path.join("Contents").join("Info.plist");
+            if !plist.is_file() {
+                continue;
+            }
+            let Ok(bundle_id) = run_capture(
+                "plutil",
+                &["-extract", "CFBundleIdentifier", "raw", "-o", "-"],
+                Some(&plist),
+            ) else {
+                continue;
+            };
+            let bundle_id = bundle_id.trim().to_string();
+            if !is_openai_bundle_id(&bundle_id) {
+                continue;
+            }
+            let name = run_capture(
+                "plutil",
+                &["-extract", "CFBundleName", "raw", "-o", "-"],
+                Some(&plist),
+            )
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ChatGPT")
+                    .to_string()
+            });
+            return Ok(Some(AppBundle {
+                path,
+                bundle_id,
+                name,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// 该 bundle 路径下是否还有进程在跑（主进程与全部 helper 都以
+/// `…/Foo.app/Contents/…` 为命令行前缀，一个模式全覆盖）。
+/// `None` = pgrep 本身失败，调用方自行决定兜底方向。
+#[cfg(target_os = "macos")]
+fn processes_running(bundle_path: &std::path::Path) -> Option<bool> {
+    let mut cmd = Command::new("pgrep");
+    cmd.arg("-f").arg(bundle_path.as_os_str());
+    suppress_console_window(&mut cmd);
+    let output = cmd.output().ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// 先 TERM 等它自己退（比 Windows 的 taskkill /F 温和），4 秒不退再 KILL。
+#[cfg(target_os = "macos")]
+fn terminate_app(bundle: &AppBundle) -> Result<(), String> {
+    let mut cmd = Command::new("pkill");
+    cmd.args(["-TERM", "-f"]).arg(bundle.path.as_os_str());
+    suppress_console_window(&mut cmd);
+    let _ = cmd.output();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        if processes_running(&bundle.path) == Some(false) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let mut cmd = Command::new("pkill");
+    cmd.args(["-9", "-f"]).arg(bundle.path.as_os_str());
+    suppress_console_window(&mut cmd);
+    let _ = cmd.output();
+    std::thread::sleep(Duration::from_millis(500));
+
+    if processes_running(&bundle.path) == Some(false) {
+        Ok(())
+    } else {
+        Err(format!(
+            "无法结束 {} 的进程，请手动退出后重试",
+            bundle.name
+        ))
+    }
+}
+
+/// 走 LaunchServices 按 bundle id 拉起（等价于点图标）；解不开再退回直接开路径。
+#[cfg(target_os = "macos")]
+fn relaunch_app(bundle: &AppBundle) -> Result<(), String> {
+    let mut cmd = Command::new("open");
+    cmd.args(["-b", &bundle.bundle_id]);
+    suppress_console_window(&mut cmd);
+    if cmd.status().is_ok_and(|s| s.success()) {
+        return Ok(());
+    }
+    let mut cmd = Command::new("open");
+    cmd.arg(&bundle.path);
+    suppress_console_window(&mut cmd);
+    cmd.status()
+        .ok()
+        .filter(|s| s.success())
+        .map(|_| ())
+        .ok_or_else(|| format!("已结束 {} 的进程，但重新启动失败（可手动启动）", bundle.name))
+}
+
+#[cfg(target_os = "macos")]
+fn run_capture(
+    program: &str,
+    args: &[&str],
+    file: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(file) = file {
+        cmd.arg(file);
+    }
+    suppress_console_window(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("无法启动 {program}：{e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("{program} 查询失败：{stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
@@ -247,6 +445,41 @@ mod tests {
                 name: "Codex".to_string(),
                 path: "C:\\a.exe".to_string(),
             }]
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn bundle_id_prefix_matches_all_openai_app_generations() {
+        assert!(is_openai_bundle_id("com.openai.codex"));
+        assert!(is_openai_bundle_id("com.openai.chatgpt"));
+        assert!(is_openai_bundle_id("com.openai.chat"));
+        assert!(!is_openai_bundle_id("com.apple.finder"));
+        assert!(!is_openai_bundle_id("org.openai.codex"));
+        assert!(!is_openai_bundle_id("openai.codex"));
+    }
+
+    #[test]
+    fn discovery_finds_openai_app_when_installed() {
+        // 不装应用也必须返回 Ok(None)；装了则必须能读出 bundle id 与名字
+        let bundle = discover_app_bundle().unwrap();
+        if let Some(bundle) = bundle {
+            assert!(is_openai_bundle_id(&bundle.bundle_id));
+            assert!(bundle.path.is_dir());
+            assert!(!bundle.name.is_empty());
+        }
+    }
+
+    #[test]
+    fn process_probe_answers_false_for_path_without_processes() {
+        // 系统目录下必然没有进程，命令行里不会出现这个路径
+        assert_eq!(
+            processes_running(std::path::Path::new("/Library/TestScripts")),
+            Some(false)
         );
     }
 }
