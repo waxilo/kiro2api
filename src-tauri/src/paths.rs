@@ -20,6 +20,16 @@ pub(crate) fn kiro_sso_cache_dir() -> PathBuf {
         .join("cache")
 }
 
+/// kiro-cli（>= 2.31）自己的凭据库：macOS 实测为
+/// `~/Library/Application Support/kiro-cli/data.sqlite3`。
+/// 只读桥接用，见 kiro::cli_bridge。
+pub(crate) fn kiro_cli_db_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("kiro-cli")
+        .join("data.sqlite3")
+}
+
 /// 上游请求诊断日志（排查 502 / schema 报错时用）。
 pub(crate) fn get_debug_log_path() -> PathBuf {
     get_data_path().join("kiro-debug.log")

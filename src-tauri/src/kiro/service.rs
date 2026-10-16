@@ -106,8 +106,10 @@ fn new_auth() -> super::auth::Auth {
 }
 
 /// 本机是否有可用 Kiro 凭据（凭据文件或环境变量），不发网络请求。
+/// 凭据文件缺失时先尝试从 kiro-cli 的凭据库桥接一份（只读 CLI 侧数据，
+/// 且不覆盖已有文件），再按文件是否存在判定。
 pub(crate) fn has_credential_file() -> bool {
-    kiro_sso_cache_dir().join("kiro-auth-token.json").is_file()
+    super::cli_bridge::ensure_bridged()
 }
 
 pub(crate) fn is_locally_available() -> bool {

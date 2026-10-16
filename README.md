@@ -52,6 +52,12 @@ Kiro 的接口是私有的（AWS Event Stream 二进制流），并不能直接�
 
 - Windows / macOS：`~/.aws/sso/cache/kiro-auth-token.json`
 
+新版 kiro-cli（≥ 2.31）的登录凭据存在它自己的密钥库里
+（macOS：`~/Library/Application Support/kiro-cli/data.sqlite3`），不再写上述文件。
+应用检测不到凭据文件时会自动从该库只读桥接一份（不改动 kiro-cli 的任何数据），
+之后照常自动续期；也可以手动执行 `python3 scripts/bridge-kiro-cli-credentials.py`。
+注意：桥接后若在 kiro-cli 里重新登录，需重跑一次桥接（自动桥接会在凭据库更新时重试）。
+
 概览页「Kiro 凭据」卡片里的「来源」会显示它读到的凭据状态。若显示未找到凭据的提示，
 先登录再回到应用点「刷新凭据」。
 

@@ -13,6 +13,7 @@
 //! 与 Kiro 上游事实源（`runtime.us-east-1.kiro.dev`）的对接细节保持一致。
 
 pub mod auth;
+pub mod cli_bridge;
 pub mod eventstream;
 pub mod models;
 pub mod openai;

@@ -35,3 +35,5 @@ regex = "1"
 arboard = "3"
 # Codex 的 config.toml 编辑用：只改目标键值、原样保留用户的注释与排列
 toml_edit = "0.22"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.10"
