@@ -95,6 +95,11 @@ const DEDUP_TTL: Duration = Duration::from_secs(300);
 const DEDUP_FOLLOWER_WAIT: Duration = Duration::from_secs(1500);
 /// 重放缓冲上限，超过则放弃缓冲（该请求不再可重放），避免内存膨胀。
 const DEDUP_BUFFER_CAP: usize = 16 * 1024 * 1024;
+/// 首字节前透明重试：上游首个数据块落地前的失败可安全重做整个请求 ——
+/// 此时首帧未发、dedup 缓冲为空，客户端完全无感。只覆盖建连失败与首读失败；
+/// 已开始外发后的中断仍按各管道现有逻辑收尾，避免重复内容。
+const UPSTREAM_FIRST_BYTE_ATTEMPTS: usize = 3;
+const UPSTREAM_FIRST_BYTE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// 代理自愈状态：跟踪连续失败（重试风暴），在重试请求前自检并恢复 token / ARN / 模型缓存。
 ///
@@ -1392,23 +1397,21 @@ fn emit_buffered_kiro_events_to_anthropic_sse(
 }
 
 fn pipe_buffered_kiro_tools_to_anthropic_sse(
-    response: ReqwestResponse,
+    mut reader: impl Read,
     recovery_spec: ToolRecoverySpec,
     mut send: impl FnMut(String),
 ) -> bool {
-    let bytes = match response.bytes() {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let mut block_counter = 0;
-            emit_fallback_text_block_sse(
-                &mut block_counter,
-                &format!("API Error: 读取 Kiro 流失败: {error}"),
-                &mut send,
-            );
-            emit_sse_message_delta_stop(&mut send, "end_turn", 0);
-            return false;
-        }
-    };
+    let mut bytes = Vec::new();
+    if let Err(error) = reader.read_to_end(&mut bytes) {
+        let mut block_counter = 0;
+        emit_fallback_text_block_sse(
+            &mut block_counter,
+            &format!("API Error: 读取 Kiro 流失败: {error}"),
+            &mut send,
+        );
+        emit_sse_message_delta_stop(&mut send, "end_turn", 0);
+        return false;
+    }
     let events = match parse_event_stream_checked(&bytes) {
         Ok(events) => events,
         Err(error) => {
@@ -1427,12 +1430,11 @@ fn pipe_buffered_kiro_tools_to_anthropic_sse(
 
 /// 解析上游 Event Stream，边收边推 Anthropic SSE。返回是否干净结束（流是否被完整读完）。
 fn pipe_kiro_body_to_anthropic_sse(
-    response: ReqwestResponse,
+    mut reader: impl Read,
     recovery_spec: ToolRecoverySpec,
     mut send: impl FnMut(String),
 ) -> bool {
     let mut parser = IncrementalEventStream::new();
-    let mut reader = response;
     let mut read_buf = [0u8; 8192];
     let mut full_text = String::new();
     let mut text_started = false;
@@ -1767,14 +1769,13 @@ fn pipe_kiro_body_to_anthropic_sse(
 /// 文本侧的协议泄漏清洗、antml 工具恢复全部沿用与 Anthropic 路径相同的构件，
 /// 保证两种协议下模型输出的处置结果一致。
 fn pipe_kiro_body_to_openai_sse(
-    response: ReqwestResponse,
+    mut reader: impl Read,
     recovery_spec: ToolRecoverySpec,
     chat_id: &str,
     response_model: &str,
     mut send: impl FnMut(String),
 ) -> bool {
     let mut parser = IncrementalEventStream::new();
-    let mut reader = response;
     let mut read_buf = [0u8; 8192];
     let mut full_text = String::new();
     let mut thinking_started = false;
@@ -2156,7 +2157,7 @@ impl OpenAiToolBlock {
 /// 日志，不把半截正文伪装成完整回答 —— 正常结束的流必带 metadataEvent（见
 /// `eventstream` 测试样本），缺了它就是没说完。
 fn pipe_kiro_body_to_responses_sse(
-    response: ReqwestResponse,
+    mut reader: impl Read,
     recovery_spec: ToolRecoverySpec,
     response_id: &str,
     response_model: &str,
@@ -2167,7 +2168,6 @@ fn pipe_kiro_body_to_responses_sse(
     send(emitter.event_in_progress());
 
     let mut parser = IncrementalEventStream::new();
-    let mut reader = response;
     let mut read_buf = [0u8; 8192];
     let mut full_text = String::new();
     let mut stop_reason = "end_turn".to_string();
@@ -2475,7 +2475,7 @@ fn respond_sse_stream_fetch(
             }
         };
 
-        send(sse_event(
+        let message_start = sse_event(
             "message_start",
             &json!({
                 "type": "message_start",
@@ -2490,25 +2490,50 @@ fn respond_sse_stream_fetch(
                     "usage": { "input_tokens": 0, "output_tokens": 0 },
                 }
             }),
-        ));
-        // 立即刷出首包，避免客户端一直空等
-        send(": keepalive\n\n".to_string());
+        );
 
-        let upstream = match kiro_post(
+        // 首字节前透明重试：拿到上游首个数据块之前不发 message_start，
+        // 建连/首读失败可整体重做，客户端无感；空窗期由心跳线程的 SSE 注释顶住。
+        let reader: Box<dyn Read> = match kiro_post_seeded(
             &auth.runtime,
             auth.as_ref(),
             &runtime_url,
             "KiroRuntimeService.GenerateAssistantResponse",
             &built,
+            "[stream]",
         ) {
-            Ok(response) => response,
-            Err(e) => {
+            Ok(SeededUpstream::Seeded(body)) => Box::new(body),
+            Ok(SeededUpstream::Empty(response)) => Box::new(response),
+            Ok(SeededUpstream::Status(response)) => {
                 health.record_failure();
+                let status = response.status();
+                let bytes = response.bytes().unwrap_or_default();
+                let text = String::from_utf8_lossy(&bytes).to_string();
                 diag_log(&format!(
-                    "[stream] network_error={e} body={}",
+                    "[stream] status={status} body={} resp={text}",
                     truncate_for_log(&serde_json::to_string(&built).unwrap_or_default(), 2048)
                 ));
-                // 已提前 message_start：以文本块正常收尾，再由 producer 发布 Failed。
+                let message = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("message")
+                            .or_else(|| v.get("reason"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or(text);
+                send(message_start);
+                finish_sse_after_error(&mut send, &message);
+                if let Some(entry) = &entry {
+                    dedup.mark_failed(entry);
+                }
+                let _ = eof_tx.send(Vec::new());
+                return;
+            }
+            Err(e) => {
+                health.record_failure();
+                // 重试耗尽：首帧仍未发出，先补 message_start 再按原样收尾。
+                send(message_start);
                 finish_sse_after_error(&mut send, &e);
                 if let Some(entry) = &entry {
                     dedup.mark_failed(entry);
@@ -2518,36 +2543,15 @@ fn respond_sse_stream_fetch(
             }
         };
 
-        let status = upstream.status();
-        if !status.is_success() {
-            health.record_failure();
-            let bytes = upstream.bytes().unwrap_or_default();
-            let text = String::from_utf8_lossy(&bytes).to_string();
-            diag_log(&format!(
-                "[stream] status={status} body={} resp={text}",
-                truncate_for_log(&serde_json::to_string(&built).unwrap_or_default(), 2048)
-            ));
-            let message = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.get("message")
-                        .or_else(|| v.get("reason"))
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or(text);
-            finish_sse_after_error(&mut send, &message);
-            if let Some(entry) = &entry {
-                dedup.mark_failed(entry);
-            }
-            let _ = eof_tx.send(Vec::new());
-            return;
-        }
+        // 上游已提交：此刻发首帧。
+        send(message_start);
+        // 立即刷出首包，避免客户端一直空等
+        send(": keepalive\n\n".to_string());
 
         let clean = if recovery_spec.is_empty() {
-            pipe_kiro_body_to_anthropic_sse(upstream, recovery_spec, send)
+            pipe_kiro_body_to_anthropic_sse(reader, recovery_spec, send)
         } else {
-            pipe_buffered_kiro_tools_to_anthropic_sse(upstream, recovery_spec, send)
+            pipe_buffered_kiro_tools_to_anthropic_sse(reader, recovery_spec, send)
         };
         if clean {
             health.record_success();
@@ -2668,26 +2672,59 @@ fn respond_openai_sse_stream_fetch(
         };
 
         // Responses 的首帧（response.created / in_progress）由出参管道自己发；
-        // chat 的首帧是 role 声明 chunk。
-        if flavor == SseFlavor::Chat {
-            send(openai_sse_data(&openai_role_chunk(&chat_id, &response_model)));
-        }
-        send(": keepalive\n\n".to_string());
-
-        let upstream = match kiro_post(
+        // chat 的首帧是 role 声明 chunk。两者都推迟到上游提交后发出，
+        // 建连/首读失败时整体重做，客户端无感（见 kiro_post_seeded）。
+        let reader: Box<dyn Read> = match kiro_post_seeded(
             &auth.runtime,
             auth.as_ref(),
             &runtime_url,
             "KiroRuntimeService.GenerateAssistantResponse",
             &built,
+            "[openai-stream]",
         ) {
-            Ok(response) => response,
-            Err(e) => {
+            Ok(SeededUpstream::Seeded(body)) => Box::new(body),
+            Ok(SeededUpstream::Empty(response)) => Box::new(response),
+            Ok(SeededUpstream::Status(response)) => {
                 health.record_failure();
+                let status = response.status();
+                let bytes = response.bytes().unwrap_or_default();
+                let text = String::from_utf8_lossy(&bytes).to_string();
                 diag_log(&format!(
-                    "[openai-stream] network_error={e} body={}",
+                    "[openai-stream] status={status} body={} resp={text}",
                     truncate_for_log(&serde_json::to_string(&built).unwrap_or_default(), 2048)
                 ));
+                let message = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("message")
+                            .or_else(|| v.get("reason"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or(text);
+                if flavor == SseFlavor::Chat {
+                    send(openai_sse_data(&openai_role_chunk(&chat_id, &response_model)));
+                }
+                match flavor {
+                    SseFlavor::Chat => {
+                        finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &message)
+                    }
+                    SseFlavor::Responses => {
+                        finish_responses_after_error(&mut send, &chat_id, &response_model, &message)
+                    }
+                }
+                if let Some(entry) = &entry {
+                    dedup.mark_failed(entry);
+                }
+                let _ = eof_tx.send(Vec::new());
+                return;
+            }
+            Err(e) => {
+                health.record_failure();
+                // 重试耗尽：首帧尚未发出，先补首帧再按原样收尾。
+                if flavor == SseFlavor::Chat {
+                    send(openai_sse_data(&openai_role_chunk(&chat_id, &response_model)));
+                }
                 match flavor {
                     SseFlavor::Chat => {
                         finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &e)
@@ -2704,49 +2741,21 @@ fn respond_openai_sse_stream_fetch(
             }
         };
 
-        let status = upstream.status();
-        if !status.is_success() {
-            health.record_failure();
-            let bytes = upstream.bytes().unwrap_or_default();
-            let text = String::from_utf8_lossy(&bytes).to_string();
-            diag_log(&format!(
-                "[openai-stream] status={status} body={} resp={text}",
-                truncate_for_log(&serde_json::to_string(&built).unwrap_or_default(), 2048)
-            ));
-            let message = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.get("message")
-                        .or_else(|| v.get("reason"))
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or(text);
-            match flavor {
-                SseFlavor::Chat => {
-                    finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &message)
-                }
-                SseFlavor::Responses => {
-                    finish_responses_after_error(&mut send, &chat_id, &response_model, &message)
-                }
-            }
-            if let Some(entry) = &entry {
-                dedup.mark_failed(entry);
-            }
-            let _ = eof_tx.send(Vec::new());
-            return;
+        if flavor == SseFlavor::Chat {
+            send(openai_sse_data(&openai_role_chunk(&chat_id, &response_model)));
         }
+        send(": keepalive\n\n".to_string());
 
         let clean = match flavor {
             SseFlavor::Chat => pipe_kiro_body_to_openai_sse(
-                upstream,
+                reader,
                 recovery_spec,
                 &chat_id,
                 &response_model,
                 send,
             ),
             SseFlavor::Responses => pipe_kiro_body_to_responses_sse(
-                upstream,
+                reader,
                 recovery_spec,
                 &chat_id,
                 &response_model,
@@ -2922,6 +2931,98 @@ fn call_kiro_generate(
         return Err(message);
     }
     parse_event_stream_checked(&bytes)
+}
+
+/// 已预读首个数据块的上游 body：先吐出预读块，再透传剩余内容，
+/// 让既有 pipe 函数无感知地接手「重试已提交」的流。
+struct SeededKiroBody {
+    first: Vec<u8>,
+    pos: usize,
+    inner: ReqwestResponse,
+}
+
+impl Read for SeededKiroBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.first.len() {
+            let n = std::cmp::min(buf.len(), self.first.len() - self.pos);
+            buf[..n].copy_from_slice(&self.first[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// 上游提交结果：首个数据块落地（或确认空流/拿到状态码）之前，首帧不允许外发。
+enum SeededUpstream {
+    /// 2xx 且已读到首个数据块。
+    Seeded(SeededKiroBody),
+    /// 2xx 但首读即 EOF：空流，没有可重试的数据，按原空流逻辑收尾。
+    Empty(ReqwestResponse),
+    /// 非 2xx：语义化失败不重试，交调用方读错误体按原逻辑收尾。
+    Status(ReqwestResponse),
+}
+
+/// 带「首字节前透明重试」的流式上游请求：建连失败与首读失败时重做整个请求
+/// （首帧未发、dedup 缓冲为空，客户端无感）。非 2xx 不重试；重试耗尽返回
+/// 最后一次的错误。每次失败的尝试都写诊断日志，便于定位上游断流的真实原因。
+fn kiro_post_seeded(
+    client: &Client,
+    auth: &Auth,
+    url: &str,
+    target: &str,
+    body: &Value,
+    tag: &str,
+) -> Result<SeededUpstream, String> {
+    let body_log = truncate_for_log(&serde_json::to_string(body).unwrap_or_default(), 2048);
+    kiro_post_seeded_with(tag, &body_log, || kiro_post(client, auth, url, target, body))
+}
+
+/// `kiro_post_seeded` 的可注入版本：请求怎么发由调用方决定，便于测试。
+fn kiro_post_seeded_with(
+    tag: &str,
+    body_log: &str,
+    mut send_request: impl FnMut() -> Result<ReqwestResponse, String>,
+) -> Result<SeededUpstream, String> {
+    let mut last_err = String::new();
+    for attempt in 1..=UPSTREAM_FIRST_BYTE_ATTEMPTS {
+        if attempt > 1 {
+            thread::sleep(UPSTREAM_FIRST_BYTE_BACKOFF);
+        }
+        let response = match send_request() {
+            Ok(response) => response,
+            Err(e) => {
+                diag_log(&format!(
+                    "{tag} first_byte_retry attempt={attempt} error={e} body={body_log}"
+                ));
+                last_err = e;
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            return Ok(SeededUpstream::Status(response));
+        }
+        let mut response = response;
+        let mut buf = [0u8; 8192];
+        match response.read(&mut buf) {
+            Ok(0) => return Ok(SeededUpstream::Empty(response)),
+            Ok(n) => {
+                return Ok(SeededUpstream::Seeded(SeededKiroBody {
+                    first: buf[..n].to_vec(),
+                    pos: 0,
+                    inner: response,
+                }));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                diag_log(&format!(
+                    "{tag} first_byte_retry attempt={attempt} error={msg} body={body_log}"
+                ));
+                last_err = msg;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn resolve_profile_arn(auth: &Auth) -> Result<Option<String>, String> {
@@ -4676,6 +4777,96 @@ mod tests {
             snapshot["response"]["incomplete_details"].is_null(),
             "带 metadataEvent 的正常完成不得标截断: {snapshot}"
         );
+    }
+
+    /// 第一次连接直接掐断（模拟建连后上游断流），第二次回完整事件流。
+    fn serve_drop_then_bytes(body: Vec<u8>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            {
+                let (sock, _) = listener.accept().unwrap();
+                drop(sock);
+            }
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+        });
+        format!("http://{addr}/")
+    }
+
+    /// 回归：上游首个数据块落地前的失败必须整体重做，且预读的首块数据要流入
+    /// 管道 —— 缺了它客户端会看到凭空缺失的开头（2026-10-16 实测断流场景）。
+    #[test]
+    fn first_byte_failure_is_retried_and_seeded_chunk_flows() {
+        use crate::kiro::eventstream::build_frame;
+
+        let mut body = build_frame("assistantResponseEvent", &json!({ "content": "重试成功" }));
+        body.extend(build_frame("metadataEvent", &json!({ "stopReason": "END_TURN" })));
+        let url = serve_drop_then_bytes(body);
+
+        let mut attempts = 0;
+        let seeded = kiro_post_seeded_with(
+            "[test]",
+            "body={}",
+            || {
+                attempts += 1;
+                reqwest::blocking::get(&url).map_err(|e| e.to_string())
+            },
+        )
+        .expect("第一次失败后重试应当成功并返回已提交的上游");
+        assert_eq!(attempts, 2, "只应重试一次");
+
+        let reader = match seeded {
+            SeededUpstream::Seeded(reader) => reader,
+            _ => panic!("expected SeededUpstream::Seeded"),
+        };
+        let mut frames = Vec::new();
+        let clean = pipe_kiro_body_to_responses_sse(
+            reader,
+            ToolRecoverySpec::default(),
+            "resp_retry",
+            "gpt-5.2-codex",
+            |frame| frames.push(frame),
+        );
+        assert!(clean);
+        assert!(
+            frames.iter().any(|f| f.contains("重试成功")),
+            "预读的首块数据必须流入管道: {frames:?}"
+        );
+    }
+
+    /// 重试耗尽：连续失败到上限后把最后一次错误交回调用方（按原失败收尾）。
+    #[test]
+    fn first_byte_retry_exhausts_after_attempt_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..UPSTREAM_FIRST_BYTE_ATTEMPTS {
+                let (sock, _) = listener.accept().unwrap();
+                drop(sock);
+            }
+        });
+
+        let mut attempts = 0;
+        let result = kiro_post_seeded_with(
+            "[test]",
+            "body={}",
+            || {
+                attempts += 1;
+                reqwest::blocking::get(format!("http://{addr}/")).map_err(|e| e.to_string())
+            },
+        );
+
+        assert_eq!(attempts, UPSTREAM_FIRST_BYTE_ATTEMPTS);
+        assert!(result.is_err());
     }
 
     /// 回归：声明 tools 后 guard 会把含 `{`/``` 的正文整段缓冲到 finish 归还，
