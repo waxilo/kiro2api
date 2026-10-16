@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "kiro2api"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "arboard",
  "base64 0.22.1",
