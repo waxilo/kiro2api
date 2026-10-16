@@ -173,7 +173,8 @@ function codexCard(state: AppState): string {
             `${actionAttrs(state, ACTION.codexRemove)}>清空</button>`
           : ''}
         <button class="small primary" type="button" data-action="codex-apply"` +
-        `${imported && keyOk && active && !dirty ? ' disabled' : ''}${actionAttrs(state, ACTION.codexApply)}>应用</button>
+        `${!dirty && (checked.size === 0 || (imported && keyOk && active)) ? ' disabled' : ''}` +
+        `${!dirty && checked.size === 0 ? ' title="先勾选要接入的模型"' : ''}${actionAttrs(state, ACTION.codexApply)}>应用</button>
       </div>
       ${foreign
         ? note(
@@ -203,7 +204,6 @@ function codexCard(state: AppState): string {
             ).join('')
           : `<div class="model-card-empty">没有匹配「${esc(query)}」的模型，换个关键词试试</div>`}
       </div>`}
-      <div class="wb-hint">只有 gpt- 开头的模型会出现在这里 —— Codex 桌面端只支持 GPT 系模型。勾选的模型出现在 Codex 的 /model 选择器里，取消勾选即移除，点「应用」一次生效，「恢复」放弃未应用的改动；「清空」（或取消全部勾选后「应用」）移除本应用的全部痕迹 —— provider、密钥与模型目录。应用同时写入当前地址与密钥，只动与本应用相关的条目，其余配置与 ChatGPT 登录保持原样；切换模型在 Codex 里用 /model 完成</div>
     </div>`;
 }
 

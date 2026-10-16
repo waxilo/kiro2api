@@ -168,7 +168,7 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
     let port = state.port.lock().ok().and_then(|p| *p);
     let key = current_api_key(state);
     let auth = new_auth();
-    ProxyStatus {
+    let status = ProxyStatus {
         running,
         available: is_locally_available() || running,
         port,
@@ -178,7 +178,10 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
         profile_arn: auth.get_sso_profile_arn(),
         config_dir: crate::paths::get_data_path().display().to_string(),
         debug_log_path: crate::paths::get_debug_log_path().display().to_string(),
-    }
+    };
+    // 顺手让托盘跟上真实状态：正常启停各自会同步，这里兜住代理异常退出后的图标滞后
+    crate::tray::sync_running(running, port);
+    status
 }
 
 /// 账户可用的模型 ID 缓存。
@@ -315,6 +318,7 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
     std::thread::spawn(refresh_models_and_notify);
 
     spawn_refresh_loop(state.clone());
+    crate::tray::sync_running(true, Some(actual_port));
     Ok(build_status(state))
 }
 
@@ -331,6 +335,7 @@ pub(crate) fn stop_proxy(state: &ProxyStateRef) -> Result<ProxyStatus, String> {
     }
     *state.port.lock().map_err(|_| "lock failed".to_string())? = None;
     *state.key.lock().map_err(|_| "lock failed".to_string())? = None;
+    crate::tray::sync_running(false, None);
     Ok(build_status(state))
 }
 
