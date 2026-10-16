@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 use toml_edit::{table, value, DocumentMut, Item, Table};
 use tauri::State;
 
+use crate::codex_restart::codex_app_running;
 use crate::kiro::models::ModelFamily;
 use crate::kiro::{build_access, current_api_key, KiroProxyState};
 use crate::workbuddy::origin_matches;
@@ -98,6 +99,18 @@ pub struct CodexImportSummary {
     pub catalog_written: bool,
     /// Codex 顶层默认模型被写入或撤除
     pub model_written: bool,
+    /// 写入那一刻 Codex 桌面应用在不在跑：跑着才需要重启确认
+    pub codex_running: bool,
+}
+
+/// `k2a_codex_remove` 的结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRemoveOutcome {
+    /// 是否确有移除（指向其它服务的配置一概不动）
+    pub removed: bool,
+    /// 移除那一刻 Codex 桌面应用在不在跑：跑着才需要重启确认
+    pub codex_running: bool,
 }
 
 /// Codex 的配置目录。目录不存在视为「Codex 未安装」—— 替一个不存在的应用创建
@@ -553,6 +566,7 @@ fn import_to_files(
         auth_written,
         catalog_written,
         model_written,
+        codex_running: codex_app_running(),
     })
 }
 
@@ -656,17 +670,22 @@ fn scan_files(port: Option<u16>, api_key: Option<&str>) -> CodexScan {
 }
 
 /// 从 Codex 配置里移除指向本应用的 provider（含顶层选择与 auth.json 里的密钥）。
-/// 返回是否确有移除 —— 指向其它服务的配置一概不动。
+/// 返回是否确有移除，以及移除那一刻 Codex 桌面应用在不在跑 ——
+/// 跑着才需要重启确认。指向其它服务的配置一概不动。
 #[tauri::command]
-pub async fn k2a_codex_remove(state: State<'_, KiroProxyState>) -> Result<bool, String> {
+pub async fn k2a_codex_remove(state: State<'_, KiroProxyState>) -> Result<CodexRemoveOutcome, String> {
     let port = build_access(&state)
         .port
         .ok_or_else(|| "无法确定代理端口，无法判断哪些条目指向本应用".to_string())?;
     let api_key = current_api_key(&state)
         .ok_or_else(|| "还没有代理密钥，无法识别要移除的密钥".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || remove_from_files(port, &api_key))
-        .await
-        .map_err(|e| format!("移除任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let removed = remove_from_files(port, &api_key)?;
+        let codex_running = codex_app_running();
+        Ok(CodexRemoveOutcome { removed, codex_running })
+    })
+    .await
+    .map_err(|e| format!("移除任务失败: {e}"))?
 }
 
 fn remove_from_files(port: u16, api_key: &str) -> Result<bool, String> {

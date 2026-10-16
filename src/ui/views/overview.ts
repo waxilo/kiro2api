@@ -3,7 +3,7 @@
 // 这一页是唯一允许汇总别处分区信息的地方 —— 它是入口，用户第一眼就在这里。
 // 因此刻意只放**结论**（跑了没有、接入地址、两个关键数字），细节都留在各自分区，
 // 并用可点击的指标块把跳转做出来，避免这一页长成第二个「什么都有一点」的长列表。
-import { esc, localTime, percent4, remainingUntil } from '../../core/format';
+import { esc, localTime, money2, percent4, remainingUntil } from '../../core/format';
 import { ACTION } from '../../state/actions';
 import { isPending, summarizeStatus } from '../../state/app-state';
 import { actionAttrs, note, statTile, statusPill, kvList, kv } from '../shared/render';
@@ -91,7 +91,7 @@ export const overviewView: ViewSpec = {
         ${statTile({
           label: '额度已用',
           value: usage ? `${percent4(usage.percentUsed)}%` : '—',
-          hint: usage ? `剩余 ${usage.remaining}` : '点击查询',
+          hint: usage ? `剩余 ${money2(usage.remaining)}` : '点击查询',
           goto: 'usage',
         })}
       </div>`;

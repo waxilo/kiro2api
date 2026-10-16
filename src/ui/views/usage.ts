@@ -2,7 +2,7 @@
 //
 // 只用数字说明用量时，用户必须心算 `currentUsage / usageLimit`；给一条带刻度的条，
 // 一眼就知道是不是快用完了。颜色在 75% / 90% 两档变调，对应「该留意了」与「要断了」。
-import { esc, localTime, percent4 } from '../../core/format';
+import { esc, localTime, money2, percent4 } from '../../core/format';
 import type { UsageInfo } from '../../core/types';
 import { ACTION } from '../../state/actions';
 import { isPending } from '../../state/app-state';
@@ -35,7 +35,7 @@ function renderMeter(usage: UsageInfo): string {
         <div class="meter-fill" style="width:${percent}%"></div>
       </div>
       <div class="meter-foot">
-        <span>剩余 ${esc(usage.remaining)}</span>
+        <span>剩余 ${esc(money2(usage.remaining))}</span>
         ${
           usage.nextResetAt
             ? `<span>下次重置 ${esc(localTime(usage.nextResetAt))}${

@@ -35,6 +35,22 @@ pub async fn k2a_codex_restart() -> Result<CodexRestartOutcome, String> {
         .map_err(|e| format!("重启任务失败: {e}"))?
 }
 
+/// Codex 桌面应用现在是否在跑。给「要不要弹重启确认」用：
+/// 没在跑就没有「重启才生效」的问题，下次启动自然读到新配置，不该打扰。
+/// 探测失败按「没在跑」处理 —— 重启走的也是同一条探测路，这里失败了弹窗
+/// 也只会让用户按出一颗必然报错的按钮。非 Windows 探测不了，保持旧有
+/// 「总是提示」的行为。
+pub(crate) fn codex_app_running() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        discover_app_processes().is_ok_and(|apps| !apps.is_empty())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
 fn restart_codex_app() -> Result<CodexRestartOutcome, String> {
     #[cfg(target_os = "windows")]
     {

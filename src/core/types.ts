@@ -104,6 +104,16 @@ export interface CodexImportSummary {
   catalogWritten: boolean;
   /** Codex 顶层默认模型被写入或撤除。 */
   modelWritten: boolean;
+  /** 写入那一刻 Codex 桌面应用在不在跑：跑着才需要重启确认。 */
+  codexRunning: boolean;
+}
+
+/** `k2a_codex_remove` 的结果。 */
+export interface CodexRemoveResult {
+  /** 是否确有移除（指向其它服务的配置一概不动）。 */
+  removed: boolean;
+  /** 移除那一刻 Codex 桌面应用在不在跑：跑着才需要重启确认。 */
+  codexRunning: boolean;
 }
 
 /** `k2a_codex_restart` 的结果。 */

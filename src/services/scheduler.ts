@@ -17,8 +17,11 @@ import { updater } from './updater';
 const TICK_MS = 60_000;
 /** 额度刷新周期。上游按订阅周期计算用量，几分钟内的变化没有意义。 */
 const USAGE_INTERVAL_MS = 10 * 60_000;
-/** 更新检查周期。装不装更新从来不是分钟级决策。 */
-const UPDATE_INTERVAL_MS = 4 * 3_600_000;
+/**
+ * 更新检查周期。清单侧有 5 分钟缓存（`MANIFEST_CACHE_TTL`），10 分钟一查最多命中半次缓存，
+ * 撞不上 GitHub 限流；换来的是「应用更新」红点不会迟到半天。
+ */
+const UPDATE_INTERVAL_MS = 10 * 60_000;
 /** 剩余寿命短于这个值就主动续签（含已过期）。 */
 const CREDENTIAL_LEAD_MS = 10 * 60_000;
 /** 续签尝试的冷却期。失败（refreshToken 已失效之类）不该每分钟去敲一次 OIDC。 */

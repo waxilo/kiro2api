@@ -64,6 +64,16 @@ export function formatRate(rate: number | undefined): string {
   return `×${rate}`;
 }
 
+/**
+ * 金额展示：固定 2 位小数。
+ *
+ * 「剩余」由上游的限额减已用算出，减法会带浮点尾数（`4473.3099999999995`）
+ * 直接展示没法看；与 `percent4` 同理，界面不出现没修剪过的数字。
+ */
+export function money2(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(2) : '—';
+}
+
 /** 百分比：夹到 0–100 并取整，避免进度条宽度越界。 */
 export function percent(part: number, whole: number): number {
   if (!Number.isFinite(part) || !Number.isFinite(whole) || whole <= 0) return 0;

@@ -442,17 +442,18 @@ async function reveal(path: RevealTarget): Promise<void> {
  * 清空 Codex 的接入配置：provider、密钥与模型目录一次移除（后端只动指向本应用
  * 的条目，ChatGPT 登录等原样保留）。「清空」按钮与「勾成空清单后应用」共用这个出口。
  *
- * 确有移除时顺手挂出重启确认：Codex 只在启动时读配置，正在跑的那个还捧着旧配置。
+ * 确有移除且 Codex 正在跑时挂出重启确认：Codex 只在启动时读配置，正在跑的
+ * 那个还捧着旧配置；没在跑就没有「重启才生效」的问题，下次启动自然读新配置。
  */
 async function clearCodex(): Promise<void> {
   await run(ACTION.codexRemove, async () => {
-    const removed = await backend.codexRemove();
+    const { removed, codexRunning } = await backend.codexRemove();
     store.set({ codexChecked: null });
     feedback.toast(
       removed ? '已清空 Codex 的接入配置' : '没有找到指向本应用的 Codex 配置',
       removed ? 'info' : 'error',
     );
-    if (removed) store.set({ codexRestartPrompt: 'cleared' });
+    if (removed && codexRunning) store.set({ codexRestartPrompt: 'cleared' });
   });
 }
 
@@ -673,8 +674,9 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
           summary.authWritten ? '密钥已同步' : '',
         ].filter(Boolean);
         feedback.toast(parts.length ? `已应用 Codex 变更：${parts.join('、')}` : 'Codex 已是最新配置，没有变更');
-        // 确有写入才问重启：Codex 只在启动时读一次配置，跑着的不重启就不换模型
-        if (parts.length) store.set({ codexRestartPrompt: 'applied' });
+        // 确有写入才问重启：Codex 只在启动时读一次配置，跑着的不重启就不换模型；
+        // 没在跑的不弹 —— 下次启动自然读新配置
+        if (parts.length && summary.codexRunning) store.set({ codexRestartPrompt: 'applied' });
       });
       return;
     }

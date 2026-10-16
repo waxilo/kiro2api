@@ -93,27 +93,32 @@
   color: var(--ink-muted);
 }
 
-.wc-btn:hover:not(:disabled) {
+/* components.css 顶部的通用 `button:hover:not(:disabled):not([aria-disabled='true'])`
+   特异性 (0,3,1)，压得过类选择器写法的 (0,3,0) —— 悬浮底色会被它钉成 surface-1，
+   关闭键的红底也曾因此从未生效。下面每条都照抄同样的限定把特异性抬到 (0,4,0)+，
+   与 chip 的处理同理：不靠源码顺序去赌。 */
+.wc-btn:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--wc-hover);
   border-color: transparent;
   color: var(--ink);
 }
-.wc-btn:active:not(:disabled) {
+.wc-btn:active:not(:disabled):not([aria-disabled='true']) {
   background: var(--wc-active);
   color: var(--ink);
 }
 
 /* 最大化按钮在贴靠命中区内：那块区域算非客户区，网页收不到鼠标消息，:hover 不会触发，
    高亮由窗口过程转发过来的悬停态补上（见 src-tauri/src/window/snap.rs）。 */
-.wc-btn.is-hover:not(:disabled) {
+.wc-btn.is-hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--wc-hover);
   color: var(--ink);
 }
 
-.wc-btn-close:hover:not(:disabled),
-.wc-btn-close:active:not(:disabled) {
+/* 关闭键悬浮 = Windows 惯例的红底；叉号保持墨色（明确不变白）。 */
+.wc-btn-close:hover:not(:disabled):not([aria-disabled='true']),
+.wc-btn-close:active:not(:disabled):not([aria-disabled='true']) {
   background: var(--wc-close-hover);
-  color: #fff;
+  color: var(--ink);
 }
 
 .wc-btn svg {
@@ -214,24 +219,28 @@
   white-space: nowrap;
 }
 
-/* 可用更新的提示点：绝对定位，这样导航收成纯图标时位置依旧正确 */
+/* 导航提示点：绝对定位在条目右缘、上下居中；收成纯图标时位置依旧正确。
+   红 = 有待处理的事（应用更新可用），绿 = 后台服务在正常跑（代理运行中）。 */
 .rail-badge {
   position: absolute;
-  top: 7px;
+  top: 50%;
   right: 7px;
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--warning);
+  background: var(--danger);
   opacity: 0;
-  transform: scale(0.6);
+  transform: translateY(-50%) scale(0.6);
   transition:
     opacity var(--dur) var(--ease),
     transform var(--dur) var(--ease);
 }
+.rail-badge.is-ok {
+  background: var(--success);
+}
 .rail-badge.is-on {
   opacity: 1;
-  transform: none;
+  transform: translateY(-50%);
 }
 
 /* ── 内容区 ───────────────────────────────────────────────────────── */

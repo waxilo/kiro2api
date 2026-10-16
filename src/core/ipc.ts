@@ -8,6 +8,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 import type {
   CodexImportSummary,
+  CodexRemoveResult,
   CodexRestartResult,
   CodexScan,
   CopyKind,
@@ -83,8 +84,8 @@ export const backend = {
   codexImport: (models: string[]) => invoke<CodexImportSummary>('k2a_codex_import', { models }),
   /** 扫描 Codex 配置里指向本应用（host+端口匹配）的 provider。 */
   codexList: () => invoke<CodexScan>('k2a_codex_list'),
-  /** 移除指向本应用的 Codex provider（含顶层选择与密钥），返回是否确有移除。 */
-  codexRemove: () => invoke<boolean>('k2a_codex_remove'),
+  /** 移除指向本应用的 Codex provider（含顶层选择与密钥），并回报 Codex 是否在跑。 */
+  codexRemove: () => invoke<CodexRemoveResult>('k2a_codex_remove'),
   /**
    * 强制重启 Codex 桌面应用：结束其进程树后按包装身份重新拉起。
    * Codex 只在启动时读一次配置，接入 / 清空后的变更要重启才生效。

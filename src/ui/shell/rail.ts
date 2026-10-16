@@ -44,6 +44,18 @@ const GROUPS: RailGroup[] = [
   },
 ];
 
+/**
+ * 导航提示点：哪些分区在什么状态下亮、亮什么色（ok = 绿，alert = 红）。
+ * 提示点的职责是「那个分区有事看了」，不必进分区也能知道：
+ * 代理在跑（概览 = 一切正常的入口）、有可装的更新。
+ */
+const BADGES: Partial<
+  Record<ViewId, { on: (state: AppState) => boolean; tone: 'ok' | 'alert' }>
+> = {
+  overview: { on: (state) => state.status?.running === true, tone: 'ok' },
+  updates: { on: (state) => state.update.available, tone: 'alert' },
+};
+
 function renderItem(item: RailItem): string {
   return `
     <button class="rail-item" data-nav="${item.id}" type="button">
@@ -65,7 +77,7 @@ export function renderRail(): string {
   return `<nav class="rail-nav" aria-label="分区导航">${groups}</nav>`;
 }
 
-/** 切当前项高亮，并在「应用更新」上挂一个可用更新的圆点。 */
+/** 切当前项高亮，并按状态点亮导航提示点（见 `BADGES`）。 */
 export function updateRail(state: AppState): void {
   for (const group of GROUPS) {
     for (const item of group.items) {
@@ -78,6 +90,10 @@ export function updateRail(state: AppState): void {
     }
   }
 
-  const badge = document.querySelector<HTMLElement>('.rail-badge[data-badge="updates"]');
-  if (badge) badge.classList.toggle('is-on', state.update.available);
+  for (const [id, badge] of Object.entries(BADGES)) {
+    const node = document.querySelector<HTMLElement>(`.rail-badge[data-badge="${id}"]`);
+    if (!node) continue;
+    node.classList.toggle('is-ok', badge.tone === 'ok');
+    node.classList.toggle('is-on', badge.on(state));
+  }
 }
