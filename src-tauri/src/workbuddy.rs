@@ -313,6 +313,40 @@ fn remove_entries_at(path: &Path, model: &str, port: u16) -> Result<usize, Strin
     Ok(removed)
 }
 
+/// 清空 WorkBuddy 清单里**指向本应用**的全部条目（host+端口匹配），返回移除条数。
+/// 条目本身捆绑了地址与密钥，条目清掉即端点与模型的痕迹一并消失；
+/// 指向其它服务的条目一概不动 —— 清空只清本应用自己的痕迹。
+#[tauri::command]
+pub async fn k2a_workbuddy_clear(state: State<'_, KiroProxyState>) -> Result<usize, String> {
+    let port = build_access(&state)
+        .port
+        .ok_or_else(|| "无法确定代理端口，无法判断哪些条目指向本应用".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = models_path()?;
+        clear_entries_at(&path, port)
+    })
+    .await
+    .map_err(|e| format!("清空任务失败: {e}"))?
+}
+
+fn clear_entries_at(path: &Path, port: u16) -> Result<usize, String> {
+    let mut entries = read_entries(path)?;
+    let before = entries.len();
+    // 没有 url 的条目无从判定归属，保守起见保留
+    entries.retain(|entry| {
+        entry
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|url| !origin_matches(url, port))
+            .unwrap_or(true)
+    });
+    let removed = before - entries.len();
+    if removed > 0 {
+        write_atomic(path, &entries)?;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +505,26 @@ mod tests {
         assert_eq!(remove_entries_at(&path, "other-host", 5680).unwrap(), 0);
         // 没有匹配项时不写盘，也不报错
         assert_eq!(remove_entries_at(&path, "nope", 5680).unwrap(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clear_removes_only_matching_entries() {
+        let dir = std::env::temp_dir().join(format!("k2a-wb-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("models.json");
+        scan_fixture(&path);
+
+        // m1 与 stale 指向本应用，other-host / other-port 是别家的
+        let removed = clear_entries_at(&path, 5680).unwrap();
+        assert_eq!(removed, 2);
+        let round: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let ids: Vec<&str> = round.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(ids, vec!["other-host", "other-port"]);
+
+        // 再清一次无事发生：不写盘也不报错
+        assert_eq!(clear_entries_at(&path, 5680).unwrap(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

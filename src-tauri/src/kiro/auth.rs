@@ -28,6 +28,8 @@ struct AuthCache {
     cached_available_models: Option<Vec<String>>,
     /// modelId → additionalModelRequestFieldsSchema（供 build_kiro_request 做 schema 驱动的字段净化）
     cached_model_schemas: Option<HashMap<String, Value>>,
+    /// modelId → 消耗倍率（rateMultiplier，上游计价倍数，如 1.3 = 1.3x credit）
+    cached_model_rates: Option<HashMap<String, f64>>,
 }
 
 /// Kiro 账户额度快照（来自 getUsageLimits）。
@@ -62,6 +64,33 @@ pub struct Auth {
     /// 避免单次长生成或大上下文会话被短超时切断。
     pub runtime: Client,
     cache: Mutex<AuthCache>,
+}
+
+/// ListAvailableModels 响应 → (去重后的 modelId 列表, schema 表, 倍率表)。
+///
+/// 倍率取每个模型条目的 `rateMultiplier`（上游计价倍数，1 = 基准，0 = 不计费）；
+/// 缺失或不是数字的条目不进表 —— 上层按「未知」处理，界面不显示倍率。
+fn parse_available_models(data: &Value) -> (Vec<String>, HashMap<String, Value>, HashMap<String, f64>) {
+    let mut ids: Vec<String> = Vec::new();
+    let mut schemas: HashMap<String, Value> = HashMap::new();
+    let mut rates: HashMap<String, f64> = HashMap::new();
+    if let Some(models) = data.get("models").and_then(|v| v.as_array()) {
+        for model in models {
+            let Some(id) = model.get("modelId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+            if let Some(schema) = model.get("additionalModelRequestFieldsSchema") {
+                schemas.insert(id.to_string(), schema.clone());
+            }
+            if let Some(rate) = model.get("rateMultiplier").and_then(Value::as_f64) {
+                rates.insert(id.to_string(), rate);
+            }
+        }
+    }
+    (ids, schemas, rates)
 }
 
 impl Auth {
@@ -673,26 +702,33 @@ impl Auth {
         if !status.is_success() {
             return Err(format!("ListAvailableModels failed: {status}"));
         }
-        let mut ids: Vec<String> = Vec::new();
-        let mut schemas: HashMap<String, Value> = HashMap::new();
-        if let Some(models) = data.get("models").and_then(|v| v.as_array()) {
-            for model in models {
-                if let Some(id) = model.get("modelId").and_then(|v| v.as_str()) {
-                    if !ids.iter().any(|existing| existing == id) {
-                        ids.push(id.to_string());
-                    }
-                    if let Some(schema) = model.get("additionalModelRequestFieldsSchema") {
-                        schemas.insert(id.to_string(), schema.clone());
-                    }
-                }
-            }
-        }
+        let (ids, schemas, rates) = parse_available_models(&data);
         if !ids.is_empty() {
             if let Ok(mut cache) = self.cache.lock() {
                 cache.cached_model_schemas = Some(schemas);
+                cache.cached_model_rates = Some(rates);
             }
         }
         Ok(ids)
+    }
+
+    /// modelId → 消耗倍率（rateMultiplier）整表。未枚举过模型时先触发一次
+    /// ListAvailableModels 缓存；从没拿到过倍率（旧缓存/上游没给）时返回空表。
+    pub fn model_rates(&self) -> HashMap<String, f64> {
+        if self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|c| c.cached_model_rates.clone())
+            .is_none()
+        {
+            let _ = self.list_available_models();
+        }
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|c| c.cached_model_rates.clone())
+            .unwrap_or_default()
     }
 
     /// 取指定模型（Kiro 内部 modelId）的 additionalModelRequestFieldsSchema。
@@ -974,6 +1010,48 @@ fn parse_expiry_ms(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_available_models_extracts_ids_schemas_and_rates() {
+        let data = json!({
+            "models": [
+                {
+                    "modelId": "claude-sonnet-5",
+                    "additionalModelRequestFieldsSchema": { "properties": {} },
+                    "rateMultiplier": 1,
+                    "rateUnit": "Credit",
+                    "tokenLimits": { "maxInputTokens": 200_000, "maxOutputTokens": 64_000 }
+                },
+                { "modelId": "gpt-5.6-terra", "rateMultiplier": 1.3 },
+                // 没给倍率 / 倍率不是数字：不进倍率表，但不影响 id 与 schema
+                { "modelId": "deepseek-v3", "rateMultiplier": "free" },
+                { "modelId": "mystery-model" }
+            ]
+        });
+        let (ids, schemas, rates) = parse_available_models(&data);
+        assert_eq!(ids, vec!["claude-sonnet-5", "gpt-5.6-terra", "deepseek-v3", "mystery-model"]);
+        assert_eq!(schemas.len(), 1);
+        assert!(schemas.contains_key("claude-sonnet-5"));
+        assert_eq!(rates.get("claude-sonnet-5"), Some(&1.0));
+        assert_eq!(rates.get("gpt-5.6-terra"), Some(&1.3));
+        assert!(!rates.contains_key("deepseek-v3"));
+        assert!(!rates.contains_key("mystery-model"));
+    }
+
+    #[test]
+    fn parse_available_models_tolerates_junk_and_dedups_ids() {
+        let (ids, schemas, rates) = parse_available_models(&json!({}));
+        assert!(ids.is_empty() && schemas.is_empty() && rates.is_empty());
+        let (ids, _, rates) = parse_available_models(&json!({
+            "models": [
+                { "modelId": "gpt-5", "rateMultiplier": 0 },
+                { "modelId": "gpt-5", "rateMultiplier": 9 }
+            ]
+        }));
+        // 重复 id 只留首见；倍率随最后一个同名条目覆盖（与 schema 表同口径）
+        assert_eq!(ids, vec!["gpt-5"]);
+        assert_eq!(rates.get("gpt-5"), Some(&9.0));
+    }
 
     #[test]
     fn default_model_pick_prefers_claude_and_survives_empty_list() {

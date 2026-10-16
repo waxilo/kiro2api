@@ -45,8 +45,10 @@ export const ACTION = {
   resetKey: '重置密钥',
   savePort: '保存端口',
   workbuddyApply: '应用 WorkBuddy 变更',
-  codexApply: '接入 Codex',
-  codexRemove: '移除 Codex 接入',
+  workbuddyClear: '清空 WorkBuddy 接入',
+  codexApply: '应用 Codex 变更',
+  codexRemove: '清空 Codex 接入',
+  codexRestart: '重启 Codex 应用',
 } as const;
 
 /**
@@ -140,6 +142,15 @@ function scanIds(): string[] {
 }
 
 /**
+ * Codex 目录里已接入的模型 id。目录指针被别家接管（foreign）或还没扫到时
+ * 是空集 —— 那种状态下本应用不管理目录，勾选自然也从空集起算。
+ */
+function codexCatalogIds(): string[] {
+  const scan = store.get().codexScan;
+  return scan?.catalogState === 'ours' ? scan.catalogModels : [];
+}
+
+/**
  * 「搜索词只收 ASCII」这把尺子，两个搜索框（可用模型分区、三方接入分区）共用。
  *
  * 裁掉过东西就说一句：否则用户看到自己刚贴进去的字凭空消失，只会以为是坏了。
@@ -170,6 +181,11 @@ export function setModelFilter(query: string): void {
 /** 更新「三方接入」分区的搜索词。分区不在时忽略：值没有归属地。 */
 export function setWorkbuddyFilter(query: string): void {
   store.set({ workbuddyFilter: asciiOnly(query) });
+}
+
+/** 更新 Codex 网格的搜索词。语义与 `setWorkbuddyFilter` 相同。 */
+export function setCodexFilter(query: string): void {
+  store.set({ codexFilter: asciiOnly(query) });
 }
 
 /**
@@ -423,6 +439,24 @@ async function reveal(path: RevealTarget): Promise<void> {
 }
 
 /**
+ * 清空 Codex 的接入配置：provider、密钥与模型目录一次移除（后端只动指向本应用
+ * 的条目，ChatGPT 登录等原样保留）。「清空」按钮与「勾成空清单后应用」共用这个出口。
+ *
+ * 确有移除时顺手挂出重启确认：Codex 只在启动时读配置，正在跑的那个还捧着旧配置。
+ */
+async function clearCodex(): Promise<void> {
+  await run(ACTION.codexRemove, async () => {
+    const removed = await backend.codexRemove();
+    store.set({ codexChecked: null });
+    feedback.toast(
+      removed ? '已清空 Codex 的接入配置' : '没有找到指向本应用的 Codex 配置',
+      removed ? 'info' : 'error',
+    );
+    if (removed) store.set({ codexRestartPrompt: 'cleared' });
+  });
+}
+
+/**
  * 点击事件的统一分发。
  *
  * 走 `data-action` 属性而不是给每个按钮单独挂监听：视图每次渲染都是整块换 innerHTML，
@@ -579,26 +613,92 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
       return;
     }
 
-    case 'codex-apply':
-      // 与 WorkBuddy 同理按默认 `global` 门控。接入是幂等的：已一致时后端不写盘。
-      await run(ACTION.codexApply, async () => {
-        const summary = await backend.codexImport();
-        const parts = [
-          summary.configWritten ? 'provider 已写入' : '',
-          summary.authWritten ? '密钥已同步' : '',
-        ].filter(Boolean);
-        feedback.toast(parts.length ? `已接入 Codex：${parts.join('、')}` : 'Codex 已是最新配置，没有变更');
-      });
-      return;
-
-    case 'codex-remove':
-      await run(ACTION.codexRemove, async () => {
-        const removed = await backend.codexRemove();
+    case 'workbuddy-clear':
+      // 与 workbuddy-apply 同理按默认 `global` 门控；收尾的 refresh() 会重扫清单。
+      await run(ACTION.workbuddyClear, async () => {
+        const removed = await backend.workbuddyClear();
+        store.set({ workbuddyChecked: null });
         feedback.toast(
-          removed ? '已移除 Codex 的接入配置' : '没有找到指向本应用的 Codex 配置',
+          removed ? `已清空 WorkBuddy：移除 ${removed} 个模型` : 'WorkBuddy 里没有指向本应用的条目',
           removed ? 'info' : 'error',
         );
       });
+      return;
+
+    case 'codex-toggle': {
+      const model = dataset.model ?? '';
+      if (!model) return;
+      const current = store.get().codexChecked ?? codexCatalogIds();
+      const next = current.includes(model)
+        ? current.filter((item) => item !== model)
+        : [...current, model];
+      // 拨回与目录一致时退回 null —— 语义与 workbuddy-toggle 相同
+      const imported = codexCatalogIds();
+      const same =
+        next.length === imported.length && next.every((id) => imported.includes(id));
+      store.set({ codexChecked: same ? null : next });
+      return;
+    }
+
+    case 'clear-codex-filter':
+      setCodexFilter('');
+      return;
+
+    case 'codex-reset':
+      // 恢复 = 丢掉未应用的勾选，回到目录现状。纯本地状态，不走 run()。
+      store.set({ codexChecked: null });
+      return;
+
+    case 'codex-apply': {
+      // 「应用」语义按勾选的出处分两路：
+      // * 用户**明确**勾成空清单（codexChecked 已物化为 []）= 清空 —— 移除本应用
+      //   的全部痕迹（provider、密钥与模型目录），与「清空」按钮同一出口；
+      // * 没动过勾选、只是跟着目录现状（目录恰好为空 / 坏掉时 catalogIds 为空）
+      //   走 import 修复 —— 那一下的意图是「重新接入」，顺手抹掉 provider 会吓到人。
+      const explicit = store.get().codexChecked;
+      if (explicit && explicit.length === 0) {
+        await clearCodex();
+        return;
+      }
+      const models = explicit ?? codexCatalogIds();
+      // 与 WorkBuddy 同理按默认 `global` 门控：写的是同一份配置（地址与密钥），
+      // 和改配置的动作串行才不会拿到「改到一半」的值。
+      await run(ACTION.codexApply, async () => {
+        const summary = await backend.codexImport(models);
+        store.set({ codexChecked: null });
+        const parts = [
+          summary.configWritten ? 'provider 已写入' : '',
+          summary.catalogWritten ? '模型目录已更新' : '',
+          summary.modelWritten ? '默认模型已写入' : '',
+          summary.authWritten ? '密钥已同步' : '',
+        ].filter(Boolean);
+        feedback.toast(parts.length ? `已应用 Codex 变更：${parts.join('、')}` : 'Codex 已是最新配置，没有变更');
+        // 确有写入才问重启：Codex 只在启动时读一次配置，跑着的不重启就不换模型
+        if (parts.length) store.set({ codexRestartPrompt: 'applied' });
+      });
+      return;
+    }
+
+    case 'codex-remove':
+      await clearCodex();
+      return;
+
+    case 'codex-restart-confirm':
+      // 先收弹窗再动手：无论重启成功与否都有 toast 收尾，弹窗不必等命令回来
+      store.set({ codexRestartPrompt: null });
+      await run(ACTION.codexRestart, async () => {
+        const result = await backend.codexRestart();
+        feedback.toast(
+          result.restarted
+            ? `已重启 ${result.app ?? 'Codex 应用'}，新配置在它启动时生效`
+            : 'Codex 应用没有在运行，配置将在下次启动时生效',
+        );
+      });
+      return;
+
+    case 'codex-restart-dismiss':
+      // 纯本地状态：关弹窗既没有后端命令，也不该闪一次忙碌态
+      store.set({ codexRestartPrompt: null });
       return;
 
     case 'reveal':

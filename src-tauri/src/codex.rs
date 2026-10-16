@@ -17,20 +17,41 @@
 //! `model_provider` 指到它 + 把密钥写进 auth.json。Codex 一次只有一个活跃
 //! provider，因此接入必然「占用」顶层选择 —— 移除时把指向我们的顶层键删掉，
 //! Codex 回落到内置 openai provider。
+//!
+//! ## 模型目录
+//!
+//! Codex 支持顶层 `model_catalog_json` 指向一个模型目录文件（相对路径以
+//! ~/.codex 为基准），内容是 `{ "models": [ModelInfo...] }` —— 进了目录的
+//! 模型出现在 Codex 自己的 /model 选择器里，切换由用户在 Codex 侧完成
+//! （选择会被 Codex 写回顶层 `model`）。我们把勾选的模型写成
+//! kiro2api-model-catalog.json 并接管指针；slug 一律用 Kiro 公开模型 id，
+//! 请求才能在代理侧正确解析（未知模型名会被代理归一化成默认模型）。
+//! 条目字段按 openai/codex 新旧两个 schema 世代的超集生成：serde 不拒未知
+//! 字段，多写不炸 —— 老版本忽略新键，新版本忽略旧键。
+//!
+//! 指针纪律：`model_catalog_json` 已指向别家的文件时一概不碰（接入只写
+//! provider，模型交由用户自理）；指针指向我们时，取消全部勾选 = 撤指针 +
+//! 撤顶层 model，目录文件随之删除。写盘顺序保证指针永不悬空 —— 建目录先写
+//! 文件再写配置，撤目录先写配置再删文件。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use toml_edit::{table, value, DocumentMut, Item, Table};
 use tauri::State;
 
+use crate::kiro::models::ModelFamily;
 use crate::kiro::{build_access, current_api_key, KiroProxyState};
 use crate::workbuddy::origin_matches;
 
 /// 本应用在 Codex 里的 provider id。写配置与扫描识别都用它。
 const PROVIDER_ID: &str = "kiro2api";
+
+/// 模型目录文件名（相对 ~/.codex）。指针识别按 basename 比对，用户就算把
+/// 指针写成绝对路径也认得出是我们的。
+const CATALOG_FILENAME: &str = "kiro2api-model-catalog.json";
 
 /// 一条指向本应用的 Codex provider。
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +65,16 @@ pub struct CodexEntry {
     pub key_matches: bool,
 }
 
+/// 模型目录指针的状态。Foreign = 指向别家的目录文件 —— 一概不碰。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogState {
+    #[default]
+    None,
+    Ours,
+    Foreign,
+}
+
 /// 扫描结果。读盘失败不作为命令错误抛出 —— 界面就地说明原因（与 WorkBuddy 同一取舍）。
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +82,11 @@ pub struct CodexScan {
     pub installed: bool,
     pub entries: Vec<CodexEntry>,
     pub error: Option<String>,
+    /// 模型目录指针状态；models 仅在 Ours 时有值，active_model 仅在 Ours 时上报
+    /// （那是 Codex /model 里用户当前的选择）。
+    pub catalog_state: CatalogState,
+    pub catalog_models: Vec<String>,
+    pub active_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +94,10 @@ pub struct CodexScan {
 pub struct CodexImportSummary {
     pub config_written: bool,
     pub auth_written: bool,
+    /// 模型目录文件被写入或删除
+    pub catalog_written: bool,
+    /// Codex 顶层默认模型被写入或撤除
+    pub model_written: bool,
 }
 
 /// Codex 的配置目录。目录不存在视为「Codex 未安装」—— 替一个不存在的应用创建
@@ -78,6 +118,10 @@ fn config_path(dir: &Path) -> PathBuf {
 
 fn auth_path(dir: &Path) -> PathBuf {
     dir.join("auth.json")
+}
+
+fn catalog_path(dir: &Path) -> PathBuf {
+    dir.join(CATALOG_FILENAME)
 }
 
 /// 先写临时文件再改名：Codex 读到半个文件比读到旧值糟糕得多。
@@ -117,27 +161,117 @@ fn read_auth(path: &Path) -> Result<Value, String> {
     }
 }
 
-/// 扫描的核心（纯函数）：从 config.toml 文本里找出指向本应用的 provider。
-/// `stored_key` 是 auth.json 里的 OPENAI_API_KEY；密钥一致性只对「存了 key 且
-/// 与当前代理密钥一致」的条目成立（与 WorkBuddy 的 keyMatches 同义）。
-fn scan_config_text(
-    config_text: Option<&str>,
+/// 取路径末端的文件名（/ 与 \ 都认）—— 用户把指针写成绝对路径也认得出我们。
+fn basename_of(path: &str) -> &str {
+    let trimmed = path.trim();
+    let start = trimmed.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    &trimmed[start..]
+}
+
+/// 顶层 model_catalog_json 指针的状态：缺失 = None；basename 是我们的文件名 =
+/// Ours；其余（包括指向别家或格式坏了的非字符串值）= Foreign —— 一概不碰。
+fn pointer_state_from_doc(doc: &DocumentMut) -> CatalogState {
+    match doc.get("model_catalog_json") {
+        None => CatalogState::None,
+        Some(item) => match item.as_str() {
+            Some(v) if basename_of(v) == CATALOG_FILENAME => CatalogState::Ours,
+            _ => CatalogState::Foreign,
+        },
+    }
+}
+
+/// 旧世代必需、新世代已移除的 `base_instructions`：必须是**字符串**（写 null
+/// 会被旧版 Codex 拒载，cc-switch 同款教训），取 codex 官方模板的中性身份句。
+/// 新版本不认识这个键，忽略不碍事。
+const NEUTRAL_BASE_INSTRUCTIONS: &str =
+    "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
+
+/// 一条目录条目。字段是 openai/codex 新旧两个 schema 世代的超集：两个世代
+/// 各自必需的键都写上，新世代必需的 Option 槽位显式给 null —— serde 不拒未知
+/// 字段，多写不炸。推理档位只挂 low/medium/high（默认 high）：全模型通吃，
+/// Codex 侧用户选低档时代理侧的归一化也能接住。
+fn catalog_entry(slug: &str, priority: i32) -> Value {
+    json!({
+        "slug": slug,
+        "display_name": slug,
+        "description": format!("kiro2api 本地代理 · {slug}"),
+        "base_instructions": NEUTRAL_BASE_INSTRUCTIONS,
+        "supports_reasoning_summaries": false,
+        "supports_parallel_tool_calls": false,
+        // 两个世代都必需的键
+        "supported_reasoning_levels": [
+            { "effort": "low", "description": "更快" },
+            { "effort": "medium", "description": "均衡" },
+            { "effort": "high", "description": "更深入" }
+        ],
+        "default_reasoning_level": "high",
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": priority,
+        "availability_nux": null,
+        "upgrade": null,
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "truncation_policy": { "mode": "tokens", "limit": 200000 },
+        "experimental_supported_tools": [],
+        "context_window": 200000,
+        "max_context_window": 200000,
+        "effective_context_window_percent": 95,
+        "supports_image_detail_original": false,
+        "supports_search_tool": false,
+        "input_modalities": ["text"],
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+    })
+}
+
+/// 目录文件内容：Codex 只认 `{ "models": [...] }`。priority 随位置递增，
+/// 让选择器按勾选顺序排。
+fn catalog_document(models: &[String]) -> Value {
+    json!({
+        "models": models
+            .iter()
+            .enumerate()
+            .map(|(i, slug)| catalog_entry(slug, 1000 + i as i32))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// 解析目录文件文本，取出 slug 清单。缺 slug、不是 JSON 都按错误上抛；
+/// models 为空数组在 Codex 侧等同坏文件（启动即报错），由调用方交代。
+fn parse_catalog_text(text: &str) -> Result<Vec<String>, String> {
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| format!("模型目录文件不是合法 JSON（{e}）"))?;
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "模型目录文件缺少 models 数组".to_string())?;
+    models
+        .iter()
+        .map(|m| {
+            m.get("slug")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "模型目录条目缺少 slug".to_string())
+        })
+        .collect()
+}
+
+/// entries 的 doc 级核心：scan_files 与测试共用同一次解析。
+fn entries_from_doc(
+    doc: &DocumentMut,
+    port: u16,
     stored_key: Option<&str>,
     current_key: Option<&str>,
-    port: u16,
-) -> Result<Vec<CodexEntry>, String> {
-    let Some(text) = config_text else {
-        return Ok(Vec::new());
-    };
-    let doc = text
-        .parse::<DocumentMut>()
-        .map_err(|e| format!("config.toml 不是合法 TOML（{e}），请先在编辑器里检查该文件"))?;
+) -> Vec<CodexEntry> {
     let active_provider = doc
         .get("model_provider")
         .and_then(|item| item.as_str())
         .unwrap_or("");
     let Some(providers) = doc.get("model_providers").and_then(|item| item.as_table_like()) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let key_matches = matches!(
         (stored_key, current_key),
@@ -161,13 +295,42 @@ fn scan_config_text(
             key_matches,
         });
     }
-    Ok(entries)
+    entries
 }
 
-/// 接入的核心（纯函数）：在文档上写/更新 provider 表并把顶层 model_provider
-/// 指向它。返回配置是否发生变化。只设置本应用的四个键，provider 表里用户自己
-/// 加的其余键（http_headers 等）原样保留。
-fn import_into_document(doc: &mut DocumentMut, base_url: &str) -> bool {
+/// 目录指针状态与 Codex 顶层当前模型（/model 里用户的选择会写回这里）。
+fn catalog_pointer_from_doc(doc: &DocumentMut) -> (CatalogState, Option<String>) {
+    (
+        pointer_state_from_doc(doc),
+        doc.get("model").and_then(|item| item.as_str()).map(str::to_string),
+    )
+}
+
+/// 原位覆盖顶层键：已有就沿用原来的 decor（键前的注释、行尾空白），没有才
+/// 追加。`doc[key] = …` 的整对替换会把挂在键上的用户注释一起抹掉。
+fn put_top_value(doc: &mut DocumentMut, key: &str, new: toml_edit::Value) {
+    let table = doc.as_table_mut();
+    match table.get_mut(key) {
+        Some(Item::Value(slot)) => {
+            let decor = slot.decor().clone();
+            *slot = new;
+            *slot.decor_mut() = decor;
+        }
+        Some(slot) => *slot = Item::Value(new),
+        None => {
+            table.insert(key, Item::Value(new));
+        }
+    }
+}
+
+/// 接入的核心（纯函数）：在文档上写/更新 provider 表、把顶层 model_provider
+/// 指到它，并按 `models` 维护模型目录指针与顶层默认 model。只设置本应用的
+/// 键，provider 表里用户自己加的其余键（http_headers 等）原样保留。
+///
+/// 返回「是否接管了目录」—— Foreign 指针下一律 false（目录与 model 不碰）；
+/// models 为空且指针是我们的 = 撤指针撤 model，也算接管。顶层 model 的取舍：
+/// 用户已在 Codex /model 里选了我们清单中的模型时保留其选择，否则落到第一个。
+fn import_into_document(doc: &mut DocumentMut, base_url: &str, models: &[String]) -> bool {
     if doc
         .get("model_providers")
         .and_then(Item::as_table_like)
@@ -194,7 +357,26 @@ fn import_into_document(doc: &mut DocumentMut, base_url: &str) -> bool {
     provider.insert("base_url", value(base_url));
     provider.insert("wire_api", value("responses"));
     provider.insert("requires_openai_auth", value(true));
-    doc.insert("model_provider", value(PROVIDER_ID));
+    put_top_value(doc, "model_provider", PROVIDER_ID.into());
+
+    // 指针状态此刻还是旧值（下面才动 model_catalog_json）
+    let state = pointer_state_from_doc(doc);
+    if models.is_empty() {
+        if state == CatalogState::Ours {
+            doc.as_table_mut().remove("model_catalog_json");
+            doc.as_table_mut().remove("model");
+            return true;
+        }
+        return false;
+    }
+    if state == CatalogState::Foreign {
+        return false;
+    }
+    put_top_value(doc, "model_catalog_json", CATALOG_FILENAME.into());
+    let active = doc.get("model").and_then(|item| item.as_str()).unwrap_or("");
+    if !models.iter().any(|m| m == active) {
+        put_top_value(doc, "model", models[0].as_str().into());
+    }
     true
 }
 
@@ -220,13 +402,15 @@ fn merge_auth_key(auth: &mut Value, api_key: &str) -> bool {
 
 /// 移除的核心（纯函数）：删掉指向本应用的 provider 表与指向它的顶层选择，
 /// 并从 auth 对象里删掉与我们当前密钥一致的 OPENAI_API_KEY（用户自己的密钥不动）。
-/// 返回 (配置是否变化, 密钥是否变化)。
+/// 模型目录指针是我们的时，连同指针与顶层 model 一起撤（目录文件由调用方在
+/// 配置落盘后删除）；指向别家的一概不动。返回 (配置是否变化, 密钥是否变化,
+/// 目录指针是否被撤)。
 fn remove_from_parts(
     doc: &mut DocumentMut,
     auth: &mut Value,
     port: u16,
     api_key: &str,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let mut config_changed = false;
 
     let ours = doc
@@ -249,6 +433,16 @@ fn remove_from_parts(
         config_changed = true;
     }
 
+    // 目录指针是我们的才撤：顶层 model 是我们写入或用户在我们目录里选的，
+    // 一并归还；指向别家的目录与 model 原样保留
+    let mut catalog_removed = false;
+    if pointer_state_from_doc(doc) == CatalogState::Ours {
+        doc.as_table_mut().remove("model_catalog_json");
+        doc.as_table_mut().remove("model");
+        config_changed = true;
+        catalog_removed = true;
+    }
+
     let mut auth_changed = false;
     if let Some(obj) = auth.as_object_mut() {
         let ours_key = obj
@@ -261,13 +455,33 @@ fn remove_from_parts(
             auth_changed = true;
         }
     }
-    (config_changed, auth_changed)
+    (config_changed, auth_changed, catalog_removed)
 }
 
-/// 接入 Codex：写 provider 表、激活它、把密钥写进 auth.json。
-/// 地址与密钥都取自后端当前配置 —— 密钥不经过前端，与「复制」同一条纪律。
+/// 前端来的模型清单：去首尾空白、丢空项、去重（保序），只留 GPT 系 ——
+/// Codex 桌面端只认 gpt- 开头的模型，目录里混进 claude/deepseek 会让用户在
+/// /model 里选到后请求失败。旧目录里的非 GPT 条目借「应用」自然清出。
+fn clean_models(models: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    models
+        .into_iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| {
+            !m.is_empty()
+                && ModelFamily::classify(m) == ModelFamily::Gpt
+                && seen.insert(m.clone())
+        })
+        .collect()
+}
+
+/// 接入 Codex：写 provider 表、激活它、把密钥写进 auth.json，并按勾选的
+/// 模型维护目录文件与顶层默认 model。地址与密钥都取自后端当前配置 ——
+/// 密钥不经过前端，与「复制」同一条纪律。
 #[tauri::command]
-pub async fn k2a_codex_import(state: State<'_, KiroProxyState>) -> Result<CodexImportSummary, String> {
+pub async fn k2a_codex_import(
+    state: State<'_, KiroProxyState>,
+    models: Vec<String>,
+) -> Result<CodexImportSummary, String> {
     let access = build_access(&state);
     let api_key = current_api_key(&state)
         .ok_or_else(|| "还没有代理密钥，请先启动一次代理生成密钥".to_string())?;
@@ -277,20 +491,55 @@ pub async fn k2a_codex_import(state: State<'_, KiroProxyState>) -> Result<CodexI
         return Err("无法确定代理端口，无法构造接入地址".to_string());
     }
     let base_url = access.openai_base_url;
-    tauri::async_runtime::spawn_blocking(move || import_to_files(&base_url, &api_key))
+    let models = clean_models(models);
+    tauri::async_runtime::spawn_blocking(move || import_to_files(&base_url, &api_key, &models))
         .await
         .map_err(|e| format!("接入任务失败: {e}"))?
 }
 
-fn import_to_files(base_url: &str, api_key: &str) -> Result<CodexImportSummary, String> {
+fn import_to_files(
+    base_url: &str,
+    api_key: &str,
+    models: &[String],
+) -> Result<CodexImportSummary, String> {
     let dir = codex_dir()?;
     let config_file = config_path(&dir);
     let mut doc = read_config(&config_file)?;
+    let model_before = doc
+        .get("model")
+        .and_then(|item| item.as_str())
+        .map(str::to_string);
     let before = doc.to_string();
-    import_into_document(&mut doc, base_url);
+    let catalog_managed = import_into_document(&mut doc, base_url, models);
     let config_written = doc.to_string() != before;
+    let model_written = doc
+        .get("model")
+        .and_then(|item| item.as_str())
+        .map(str::to_string)
+        != model_before;
+
+    let catalog_file = catalog_path(&dir);
+    let catalog_written = if catalog_managed && !models.is_empty() {
+        // 先写目录文件再写配置：指针落地时文件必已就位，中断也只会多出一个
+        // 没被引用的文件，不会让 Codex 拿到悬空指针
+        let desired = serde_json::to_string_pretty(&catalog_document(models))
+            .map_err(|e| format!("序列化模型目录失败: {e}"))?;
+        let differs =
+            fs::read_to_string(&catalog_file).ok().as_deref() != Some(desired.as_str());
+        if differs {
+            write_atomic(&catalog_file, &desired)?;
+        }
+        differs
+    } else {
+        false
+    };
     if config_written {
         write_atomic(&config_file, &doc.to_string())?;
+    }
+    if catalog_managed && models.is_empty() {
+        // 撤目录：配置里的指针已先消失，此时删文件不会造成悬空引用；
+        // 删不掉只是留个孤儿文件，不值得报错
+        let _ = fs::remove_file(&catalog_file);
     }
 
     let auth_file = auth_path(&dir);
@@ -302,6 +551,8 @@ fn import_to_files(base_url: &str, api_key: &str) -> Result<CodexImportSummary, 
     Ok(CodexImportSummary {
         config_written,
         auth_written,
+        catalog_written,
+        model_written,
     })
 }
 
@@ -343,18 +594,65 @@ fn scan_files(port: Option<u16>, api_key: Option<&str>) -> CodexScan {
     let auth_key = read_auth(&auth_path(&dir))
         .ok()
         .and_then(|auth| auth.get("OPENAI_API_KEY").and_then(Value::as_str).map(str::to_string));
-    match scan_config_text(config_text.as_deref(), auth_key.as_deref(), api_key, port) {
-        Ok(entries) => CodexScan {
-            installed: true,
-            entries,
-            error: None,
+
+    let parsed = match config_text
+        .as_deref()
+        .unwrap_or("")
+        .parse::<DocumentMut>()
+    {
+        Ok(doc) => doc,
+        Err(e) => {
+            return CodexScan {
+                installed: true,
+                error: Some(format!(
+                    "config.toml 不是合法 TOML（{e}），请先在编辑器里检查该文件"
+                )),
+                ..CodexScan::default()
+            };
+        }
+    };
+    let entries = entries_from_doc(&parsed, port, auth_key.as_deref(), api_key);
+    let (catalog_state, active_model) = catalog_pointer_from_doc(&parsed);
+    let mut scan = CodexScan {
+        installed: true,
+        entries,
+        error: None,
+        catalog_state,
+        catalog_models: Vec::new(),
+        active_model: if catalog_state == CatalogState::Ours {
+            active_model
+        } else {
+            None
         },
-        Err(error) => CodexScan {
-            installed: true,
-            error: Some(error),
-            ..CodexScan::default()
-        },
+    };
+
+    // 指针指向我们但文件缺失/坏掉会卡死 Codex 启动 —— 必须就地交代，光报
+    // 「没模型」用户会以为只是没接入
+    if catalog_state == CatalogState::Ours {
+        match fs::read_to_string(catalog_path(&dir)) {
+            Ok(text) => match parse_catalog_text(&text) {
+                Ok(models) if !models.is_empty() => scan.catalog_models = models,
+                Ok(_) => {
+                    scan.error = Some(
+                        "模型目录文件里没有模型，Codex 将无法启动；请重新接入或移除后重试"
+                            .to_string(),
+                    )
+                }
+                Err(e) => {
+                    scan.error =
+                        Some(format!("{e}，Codex 将无法启动；请重新接入或移除后重试"))
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                scan.error = Some(
+                    "配置指向模型目录文件（kiro2api-model-catalog.json）但文件已不存在，Codex 将无法启动；请重新接入或移除后重试"
+                        .to_string(),
+                )
+            }
+            Err(err) => scan.error = Some(format!("读取模型目录文件失败: {err}")),
+        }
     }
+    scan
 }
 
 /// 从 Codex 配置里移除指向本应用的 provider（含顶层选择与 auth.json 里的密钥）。
@@ -377,7 +675,9 @@ fn remove_from_files(port: u16, api_key: &str) -> Result<bool, String> {
     let mut doc = read_config(&config_file)?;
     let auth_file = auth_path(&dir);
     let mut auth = read_auth(&auth_file)?;
-    let (config_changed, auth_changed) = remove_from_parts(&mut doc, &mut auth, port, api_key);
+    let (config_changed, auth_changed, catalog_removed) =
+        remove_from_parts(&mut doc, &mut auth, port, api_key);
+    // 指针先随配置消失，再删目录文件 —— 中断也只会留下无害的孤儿文件
     if config_changed {
         write_atomic(&config_file, &doc.to_string())?;
     }
@@ -387,7 +687,10 @@ fn remove_from_files(port: u16, api_key: &str) -> Result<bool, String> {
             &serde_json::to_string(&auth).map_err(|e| format!("序列化失败: {e}"))?,
         )?;
     }
-    Ok(config_changed || auth_changed)
+    if catalog_removed {
+        let _ = fs::remove_file(catalog_path(&dir));
+    }
+    Ok(config_changed || auth_changed || catalog_removed)
 }
 
 #[cfg(test)]
@@ -401,7 +704,11 @@ mod tests {
     #[test]
     fn import_creates_provider_and_activates_on_fresh_config() {
         let mut doc = "".parse::<DocumentMut>().unwrap();
-        assert!(import_into_document(&mut doc, BASE_URL));
+        assert!(import_into_document(
+            &mut doc,
+            BASE_URL,
+            &["gpt-5.2-codex".to_string()],
+        ));
         let text = doc.to_string();
         let parsed: DocumentMut = text.parse().unwrap();
         let provider = &parsed["model_providers"][PROVIDER_ID];
@@ -409,6 +716,10 @@ mod tests {
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
         assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
         assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
+        // 勾选了模型：接管目录指针，默认模型落到第一个
+        assert_eq!(parsed["model_catalog_json"].as_str(), Some(CATALOG_FILENAME));
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2-codex"));
+        assert_eq!(pointer_state_from_doc(&parsed), CatalogState::Ours);
     }
 
     #[test]
@@ -425,7 +736,11 @@ wire_api = "responses"
 # 上面是别家中转，别动
 "#;
         let mut doc = input.parse::<DocumentMut>().unwrap();
-        assert!(import_into_document(&mut doc, BASE_URL));
+        assert!(import_into_document(
+            &mut doc,
+            BASE_URL,
+            &["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
+        ));
         let text = doc.to_string();
         assert!(text.contains("# 我的 Codex 配置"));
         assert!(text.contains("# 上面是别家中转，别动"));
@@ -433,6 +748,8 @@ wire_api = "responses"
         assert!(text.contains("https://relay.example/v1"));
         let parsed: DocumentMut = text.parse().unwrap();
         assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
+        assert_eq!(parsed["model_catalog_json"].as_str(), Some(CATALOG_FILENAME));
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
     }
 
     #[test]
@@ -447,13 +764,264 @@ requires_openai_auth = true
 X-Custom = "keep-me"
 "#;
         let mut doc = input.parse::<DocumentMut>().unwrap();
-        import_into_document(&mut doc, BASE_URL);
+        import_into_document(&mut doc, BASE_URL, &[]);
         let text = doc.to_string();
         assert!(text.contains("127.0.0.1:5680"));
         assert!(!text.contains("127.0.0.1:1111"));
         assert!(text.contains("keep-me"), "用户自己的键必须保留");
         let parsed: DocumentMut = text.parse().unwrap();
         assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
+        // 从没写过目录 + 空清单：不该冒出指针
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(parsed.get("model").is_none());
+    }
+
+    #[test]
+    fn import_respects_foreign_catalog_pointer() {
+        let input = r#"model_catalog_json = "cc-switch-model-catalog.json"
+model = "their-pick"
+"#;
+        let mut doc = input.parse::<DocumentMut>().unwrap();
+        let models = vec!["gpt-5.2".to_string()];
+        // 目录归别家管：目录与 model 不碰，provider 照常接管
+        assert!(!import_into_document(&mut doc, BASE_URL, &models));
+        let parsed: DocumentMut = doc.to_string().parse().unwrap();
+        assert_eq!(
+            parsed["model_catalog_json"].as_str(),
+            Some("cc-switch-model-catalog.json")
+        );
+        assert_eq!(parsed["model"].as_str(), Some("their-pick"));
+        assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
+    }
+
+    #[test]
+    fn import_keeps_codex_model_choice_when_it_is_ours() {
+        let input = format!(
+            "model_catalog_json = \"{CATALOG_FILENAME}\"\nmodel = \"gpt-5.2-codex\"\n"
+        );
+        let mut doc = input.parse::<DocumentMut>().unwrap();
+        let models = vec!["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()];
+        assert!(import_into_document(&mut doc, BASE_URL, &models));
+        let parsed: DocumentMut = doc.to_string().parse().unwrap();
+        // 用户在 Codex /model 里选的还在清单里：保留，不重置成第一个
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2-codex"));
+    }
+
+    #[test]
+    fn import_overwrite_keeps_comments_on_replaced_keys() {
+        let input = "# 选型说明\nmodel = \"gpt-5.3\"\n\n# 用这个中转\nmodel_provider = \"relay\"\n";
+        let mut doc = input.parse::<DocumentMut>().unwrap();
+        import_into_document(&mut doc, BASE_URL, &["gpt-5.2".to_string()]);
+        let text = doc.to_string();
+        assert!(text.contains("# 选型说明"), "被覆盖键上的注释必须保留");
+        assert!(text.contains("# 用这个中转"), "被覆盖键上的注释必须保留");
+        let parsed: DocumentMut = text.parse().unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
+        assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
+    }
+
+    #[test]
+    fn import_with_no_models_clears_ours_and_leaves_foreign() {
+        let ours = format!("model_catalog_json = \"{CATALOG_FILENAME}\"\nmodel = \"gpt-5.2\"\n");
+        let mut doc = ours.parse::<DocumentMut>().unwrap();
+        assert!(import_into_document(&mut doc, BASE_URL, &[]));
+        let parsed: DocumentMut = doc.to_string().parse().unwrap();
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(parsed.get("model").is_none());
+        assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
+
+        let foreign = "model_catalog_json = \"other.json\"\nmodel = \"their-model\"\n";
+        let mut doc = foreign.parse::<DocumentMut>().unwrap();
+        assert!(!import_into_document(&mut doc, BASE_URL, &[]));
+        let parsed: DocumentMut = doc.to_string().parse().unwrap();
+        assert_eq!(parsed["model_catalog_json"].as_str(), Some("other.json"));
+        assert_eq!(parsed["model"].as_str(), Some("their-model"));
+    }
+
+    #[test]
+    fn pointer_state_recognizes_ours_by_basename() {
+        let none = "".parse::<DocumentMut>().unwrap();
+        assert_eq!(pointer_state_from_doc(&none), CatalogState::None);
+        let ours = format!("model_catalog_json = \"{CATALOG_FILENAME}\"")
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(pointer_state_from_doc(&ours), CatalogState::Ours);
+        // 绝对路径按 basename 认（TOML 单引号字面串，反斜杠不经转义）
+        let absolute = r"model_catalog_json = 'C:\Users\me\.codex\kiro2api-model-catalog.json'"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(pointer_state_from_doc(&absolute), CatalogState::Ours);
+        let foreign =
+            r#"model_catalog_json = "/home/me/.codex/cc-switch-model-catalog.json""#
+                .parse::<DocumentMut>()
+                .unwrap();
+        assert_eq!(pointer_state_from_doc(&foreign), CatalogState::Foreign);
+        assert_eq!(basename_of("C:\\a\\b\\k.json"), "k.json");
+        assert_eq!(basename_of("/a/b/k.json"), "k.json");
+        assert_eq!(basename_of("k.json"), "k.json");
+    }
+
+    #[test]
+    fn catalog_entry_covers_both_schema_generations() {
+        let entry = catalog_entry("m1", 1000);
+        assert_eq!(entry["slug"], "m1");
+        assert_eq!(entry["display_name"], "m1");
+        assert_eq!(entry["visibility"], "list");
+        assert_eq!(entry["shell_type"], "shell_command");
+        assert_eq!(entry["supported_in_api"], true);
+        assert_eq!(entry["priority"], 1000);
+        assert_eq!(entry["default_reasoning_level"], "high");
+        assert_eq!(entry["truncation_policy"]["mode"], "tokens");
+        let levels = entry["supported_reasoning_levels"].as_array().unwrap();
+        assert_eq!(levels.len(), 3);
+        // 旧世代必需的键在位（新版本会忽略）；base_instructions 必须是字符串
+        assert_eq!(entry["base_instructions"].as_str(), Some(NEUTRAL_BASE_INSTRUCTIONS));
+        assert_eq!(entry["supports_reasoning_summaries"], false);
+        assert_eq!(entry["supports_parallel_tool_calls"], false);
+        // 新世代必需的键在位（老版本会忽略）
+        assert!(entry.get("availability_nux").is_some());
+        assert!(entry.get("upgrade").is_some());
+        assert!(entry.get("experimental_supported_tools").is_some());
+    }
+
+    /// Codex `ModelInfo` 的「必需键」镜像：只抄对应世代里没有 serde default 的
+    /// 字段（Option 字段无 default 时同样必填），不写 deny_unknown_fields ——
+    /// 与 Codex 的解析语义等价。目录文件反序列化失败 = 我们漏了必需键。
+    mod schema_mirror {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        pub struct Preset {
+            #[allow(dead_code)]
+            pub effort: String,
+            #[allow(dead_code)]
+            pub description: String,
+        }
+
+        #[derive(Deserialize)]
+        pub struct Truncation {
+            #[allow(dead_code)]
+            pub mode: String,
+            #[allow(dead_code)]
+            pub limit: i64,
+        }
+
+        #[derive(Deserialize)]
+        pub struct Models<T> {
+            #[allow(dead_code)]
+            pub models: Vec<T>,
+        }
+
+        /// openai/codex 当前 main 的必需键（2026-02 逐字段核对过源码）
+        #[derive(Deserialize)]
+        pub struct Current {
+            #[allow(dead_code)]
+            pub slug: String,
+            #[allow(dead_code)]
+            pub display_name: String,
+            #[allow(dead_code)]
+            pub description: Option<String>,
+            #[allow(dead_code)]
+            pub supported_reasoning_levels: Vec<Preset>,
+            #[allow(dead_code)]
+            pub shell_type: String,
+            #[allow(dead_code)]
+            pub visibility: String,
+            #[allow(dead_code)]
+            pub supported_in_api: bool,
+            #[allow(dead_code)]
+            pub priority: i32,
+            #[allow(dead_code)]
+            pub availability_nux: Option<serde_json::Value>,
+            #[allow(dead_code)]
+            pub upgrade: Option<serde_json::Value>,
+            #[allow(dead_code)]
+            pub support_verbosity: bool,
+            #[allow(dead_code)]
+            pub default_verbosity: Option<String>,
+            #[allow(dead_code)]
+            pub apply_patch_tool_type: Option<String>,
+            #[allow(dead_code)]
+            pub truncation_policy: Truncation,
+            #[allow(dead_code)]
+            pub experimental_supported_tools: Vec<String>,
+        }
+
+        /// cc-switch 0.148 世代的必需键（模板形状 + #6661）
+        #[derive(Deserialize)]
+        pub struct Legacy {
+            #[allow(dead_code)]
+            pub slug: String,
+            #[allow(dead_code)]
+            pub display_name: String,
+            #[allow(dead_code)]
+            pub description: Option<String>,
+            #[allow(dead_code)]
+            pub base_instructions: String,
+            #[allow(dead_code)]
+            pub supports_reasoning_summaries: bool,
+            #[allow(dead_code)]
+            pub supports_parallel_tool_calls: bool,
+            #[allow(dead_code)]
+            pub supported_reasoning_levels: Vec<Preset>,
+            #[allow(dead_code)]
+            pub shell_type: String,
+            #[allow(dead_code)]
+            pub visibility: String,
+            #[allow(dead_code)]
+            pub supported_in_api: bool,
+            #[allow(dead_code)]
+            pub priority: i32,
+            #[allow(dead_code)]
+            pub support_verbosity: bool,
+            #[allow(dead_code)]
+            pub truncation_policy: Truncation,
+        }
+
+        pub fn parse<T: for<'de> Deserialize<'de>>(text: &str) -> Result<usize, String> {
+            let parsed: Models<T> = serde_json::from_str(text)
+                .map_err(|e| format!("目录文件按 Codex 的 schema 解析失败: {e}"))?;
+            Ok(parsed.models.len())
+        }
+    }
+
+    #[test]
+    fn catalog_document_parses_as_both_codex_generations() {
+        let text = serde_json::to_string(&catalog_document(&[
+            "gpt-5.2".to_string(),
+            "gpt-5.2-codex".to_string(),
+        ]))
+        .unwrap();
+        let current = schema_mirror::parse::<schema_mirror::Current>(&text).unwrap();
+        assert_eq!(current, 2);
+        let legacy = schema_mirror::parse::<schema_mirror::Legacy>(&text).unwrap();
+        assert_eq!(legacy, 2);
+    }
+
+    #[test]
+    fn parse_catalog_text_reads_slugs_and_rejects_junk() {
+        let text = serde_json::to_string(&catalog_document(&["m1".to_string(), "m2".to_string()]))
+            .unwrap();
+        assert_eq!(parse_catalog_text(&text).unwrap(), vec!["m1", "m2"]);
+        assert!(parse_catalog_text("{}").is_err());
+        assert!(parse_catalog_text(r#"{"models": []}"#).is_ok_and(|m| m.is_empty()));
+        assert!(parse_catalog_text(r#"{"models": [{"display_name": "x"}]}"#).is_err());
+        assert!(parse_catalog_text("not json").is_err());
+    }
+
+    #[test]
+    fn clean_models_trims_dedups_and_keeps_gpt_only() {
+        assert_eq!(
+            clean_models(vec![
+                " gpt-5.2 ".to_string(),
+                String::new(),
+                "gpt-5.2".to_string(),
+                "claude-sonnet-5".to_string(),
+                "deepseek-v3".to_string(),
+                "gpt-5.6-terra".to_string(),
+            ]),
+            vec!["gpt-5.2".to_string(), "gpt-5.6-terra".to_string()]
+        );
     }
 
     #[test]
@@ -477,19 +1045,24 @@ base_url = "http://127.0.0.1:9999/openai/v1"
 wire_api = "responses"
 "#
         );
-        let entries = scan_config_text(Some(&config), Some("k2a-1"), Some("k2a-1"), PORT).unwrap();
+        let entries_from = |stored: Option<&str>, current: Option<&str>| {
+            let doc = config.parse::<DocumentMut>().unwrap();
+            entries_from_doc(&doc, PORT, stored, current)
+        };
+        let entries = entries_from(Some("k2a-1"), Some("k2a-1"));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, PROVIDER_ID);
         assert!(entries[0].active);
         assert!(entries[0].key_matches);
 
-        let inactive = scan_config_text(Some(&config), Some("k2a-2"), Some("k2a-1"), PORT).unwrap();
+        let inactive = entries_from(Some("k2a-2"), Some("k2a-1"));
         assert!(!inactive[0].key_matches);
 
-        // 没配过：文件不存在
-        assert!(scan_config_text(None, None, None, PORT).unwrap().is_empty());
-        // 坏 TOML 上抛为错误（界面就地呈现）
-        assert!(scan_config_text(Some("not toml [[["), None, None, PORT).is_err());
+        // 没配过（config.toml 不存在按空文档算）：空清单
+        let empty = "".parse::<DocumentMut>().unwrap();
+        assert!(entries_from_doc(&empty, PORT, None, None).is_empty());
+        // 坏 TOML 解析不成文档 —— scan_files 会把它就地放进 error 而不是抛命令错误
+        assert!("not toml [[[".parse::<DocumentMut>().is_err());
     }
 
     #[test]
@@ -509,6 +1082,8 @@ wire_api = "responses"
     fn remove_touches_only_ours() {
         let config = format!(
             r#"model_provider = "{PROVIDER_ID}"
+model_catalog_json = "{CATALOG_FILENAME}"
+model = "gpt-5.2"
 
 [model_providers.{PROVIDER_ID}]
 base_url = "{BASE_URL}"
@@ -520,33 +1095,40 @@ base_url = "https://relay.example/v1"
         );
         let mut doc = config.parse::<DocumentMut>().unwrap();
         let mut auth = json!({ "OPENAI_API_KEY": "k2a-1", "tokens": { "a": 1 } });
-        let (config_changed, auth_changed) =
+        let (config_changed, auth_changed, catalog_removed) =
             remove_from_parts(&mut doc, &mut auth, PORT, "k2a-1");
-        assert!(config_changed && auth_changed);
+        assert!(config_changed && auth_changed && catalog_removed);
         let text = doc.to_string();
         assert!(!text.contains("[model_providers.kiro2api]"));
         assert!(text.contains("[model_providers.other]"));
         // 顶层选择一并归还（model_providers 表头仍会含这个词，按解析结果断言）
         let parsed: DocumentMut = text.parse().unwrap();
         assert!(parsed.get("model_provider").is_none());
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(parsed.get("model").is_none());
         assert!(auth.get("OPENAI_API_KEY").is_none());
         assert_eq!(auth["tokens"]["a"], 1);
     }
 
     #[test]
     fn remove_ignores_foreign_base_url_and_foreign_key() {
-        // 表存在但 base_url 已被用户改成别的服务：不删表，也不动密钥
+        // 表存在但 base_url 已被用户改成别的服务：不删表，也不动密钥；
+        // 目录指针指向别家时同样原样保留（model 也别家在用）
         let config = format!(
-            r#"[model_providers.{PROVIDER_ID}]
+            r#"model_catalog_json = "cc-switch-model-catalog.json"
+model = "their-pick"
+
+[model_providers.{PROVIDER_ID}]
 base_url = "https://elsewhere.example/v1"
 "#
         );
         let mut doc = config.parse::<DocumentMut>().unwrap();
         let mut auth = json!({ "OPENAI_API_KEY": "user-own-key" });
-        let (config_changed, auth_changed) =
+        let (config_changed, auth_changed, catalog_removed) =
             remove_from_parts(&mut doc, &mut auth, PORT, "k2a-1");
-        assert!(!config_changed && !auth_changed);
+        assert!(!config_changed && !auth_changed && !catalog_removed);
         assert!(doc.to_string().contains("elsewhere.example"));
+        assert!(doc.to_string().contains("cc-switch-model-catalog.json"));
         assert_eq!(auth["OPENAI_API_KEY"], "user-own-key");
     }
 
@@ -557,9 +1139,26 @@ base_url = "https://elsewhere.example/v1"
             .parse::<DocumentMut>()
             .unwrap();
         let mut auth = Value::Object(Default::default());
-        let (config_changed, _) = remove_from_parts(&mut doc, &mut auth, PORT, "k2a-1");
+        let (config_changed, _, catalog_removed) =
+            remove_from_parts(&mut doc, &mut auth, PORT, "k2a-1");
         assert!(config_changed);
+        assert!(!catalog_removed);
         assert!(!doc.to_string().contains("model_provider"));
+    }
+
+    #[test]
+    fn remove_clears_catalog_pointer_even_without_provider_table() {
+        // 指针与顶层 model 还在但 provider 表已没了（用户手删）：一并清掉，
+        // 否则 Codex 起不来
+        let config = format!("model_catalog_json = \"{CATALOG_FILENAME}\"\nmodel = \"gpt-5.2\"\n");
+        let mut doc = config.parse::<DocumentMut>().unwrap();
+        let mut auth = Value::Object(Default::default());
+        let (config_changed, _, catalog_removed) =
+            remove_from_parts(&mut doc, &mut auth, PORT, "k2a-1");
+        assert!(config_changed && catalog_removed);
+        let parsed: DocumentMut = doc.to_string().parse().unwrap();
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(parsed.get("model").is_none());
     }
 
     #[test]

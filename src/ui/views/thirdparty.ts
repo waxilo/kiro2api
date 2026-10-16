@@ -7,14 +7,15 @@
 // tab 条按浏览器页签的形制设计（在上的横条、激活项与内容区相连），
 // 每个客户端一个页签，加新客户端只多一个 tab，不动布局。
 //
-// 模型区是一张可多选的卡片网格，勾选状态直接表达「在不在 WorkBuddy 里」：
-// 勾选 = 写入（用当前地址与密钥），取消勾选 = 移除。勾选不立即写盘 —— 攒到
-// 点「应用」一次性落地：批量操作少等多次写盘，误点也可以「恢复」反悔。
+// 模型区是一张可多选的卡片网格，勾选状态直接表达「在不在客户端里」：
+// WorkBuddy 勾的是自定义模型清单，Codex 勾的是 /model 选择器的目录文件
+// （kiro2api-model-catalog.json）。勾选都不立即写盘 —— 攒到点「应用」
+// 一次性落地：批量操作少等多次写盘，误点也可以「恢复」反悔。
 import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
 import { type AppState, type ThirdPartyTab } from '../../state/app-state';
 import { renderEnglishField } from '../shared/english-field';
-import { actionAttrs, emptyState, kv, kvList, mono, note, statusPill, tonePill } from '../shared/render';
+import { actionAttrs, emptyState, note, rateLabel, statusPill, tonePill } from '../shared/render';
 import type { ViewSpec } from './types';
 
 interface TabSpec {
@@ -26,6 +27,9 @@ const TABS: TabSpec[] = [
   { id: 'workbuddy', label: 'WorkBuddy' },
   { id: 'codex', label: 'Codex' },
 ];
+
+/** Codex 桌面端只认 GPT 系模型，网格与目录都只留 gpt- 开头的（与 Rust 侧 ModelFamily::classify 同一规则）。 */
+const isGptModel = (id: string) => id.trim().startsWith('gpt-');
 
 export const thirdpartyView: ViewSpec = {
   id: 'thirdparty',
@@ -68,12 +72,13 @@ function workbuddyPanel(state: AppState): string {
 }
 
 /**
- * Codex 面板：一键接入卡。
+ * Codex 面板：与 WorkBuddy 同一张卡形 —— 卡头（标题 · 计数 · 恢复 · 清空 ·
+ * 应用），下面依次是搜索框、网格、说明行。
  *
- * Codex 是单供应商 —— 配置就是一对文件（config.toml 的 provider + auth.json 的密钥），
- * 没有 WorkBuddy 那种模型清单可挑，所以不做成网格，而是一张状态卡：
- * 徽标说清现状（未接入 / 已接入 / 密钥不一致 / 已配置未激活），
- * 「接入」一次写齐并激活，「移除」只清掉指向本应用的痕迹。
+ * 差异只在语义：WorkBuddy 勾的是自定义模型清单，Codex 勾的是 /model 选择器的
+ * 目录文件（kiro2api-model-catalog.json）。provider 的异常状态（密钥不一致、
+ * 已配置未激活）不进卡头 —— 用与扫描错误同款的警示条就地说明，健康态不占地方；
+ * 目录指针被别家接管时网格退化成一句说明 —— 本应用不碰别家的目录。
  */
 function codexPanel(state: AppState): string {
   const scan = state.codexScan;
@@ -82,47 +87,140 @@ function codexPanel(state: AppState): string {
   }
   if (!scan.installed) {
     return note(
-      '未找到 Codex（<code>~/.codex</code> 不存在）。请确认 Codex CLI 已安装并运行过一次，再回到这里接入。',
+      '未找到 Codex（<code>~/.codex</code> 不存在）。请确认 Codex CLI 已安装并运行过一次，再回到这里管理。',
     );
   }
   const scanError = scan.error ? note(esc(scan.error), 'warn') : '';
-  return `${scanError}${codexCard(state)}`;
+  return `${scanError}${codexStateNote(state)}${codexCard(state)}`;
+}
+
+/** provider 的两种异常状态：与扫描错误同一条警示条通道，健康态不占地方。 */
+function codexStateNote(state: AppState): string {
+  const scan = state.codexScan;
+  if (!scan || !scan.entries.length) return '';
+  if (!scan.entries.every((entry) => entry.keyMatches)) {
+    return note(
+      'auth.json 里的密钥与当前代理密钥不一致，Codex 的请求会被 401 拒绝；点「应用」用当前密钥覆盖。',
+      'warn',
+    );
+  }
+  if (!scan.entries.some((entry) => entry.active)) {
+    return note(
+      'provider 已写入但 Codex 没在用它（顶层 model_provider 指向别家）；点「应用」切到本应用。',
+      'warn',
+    );
+  }
+  return '';
 }
 
 function codexCard(state: AppState): string {
-  const entries = state.codexScan?.entries ?? [];
+  const scan = state.codexScan;
+  if (!scan) return '';
+  const entries = scan.entries;
   const imported = entries.length > 0;
   // 单供应商正常只有一条；多条按最坏情况算密钥状态，与 WorkBuddy 面板同一口径
   const keyOk = entries.every((entry) => entry.keyMatches);
   const active = imported && entries.some((entry) => entry.active);
+  const foreign = scan.catalogState === 'foreign';
+  const catalogIds = scan.catalogState === 'ours' ? scan.catalogModels : [];
+  const catalogSet = new Set(catalogIds);
+  const rates = state.models?.rates ?? {};
 
-  const pill = !imported
-    ? statusPill({ tone: 'off', label: '未接入', detail: '' })
-    : !keyOk
-      ? statusPill({ tone: 'warn', label: '密钥不一致', detail: '' })
-      : active
-        ? statusPill({ tone: 'ok', label: '已接入', detail: '' })
-        : statusPill({ tone: 'warn', label: '已配置未激活', detail: '' });
+  // GPT 系之外不上网格（Codex 桌面端只认 gpt- 开头的模型）；目录里已有的
+  // 非 GPT 条目仍占一张卡（标「Codex 不支持」）—— 看得见才删得掉
+  const available = (state.models?.models ?? []).filter(isGptModel);
+  const availableSet = new Set(available);
+  const universe = [...new Set([...available, ...catalogIds])];
+  const raw = state.codexFilter;
+  const query = raw.trim();
+  const needle = query.toLowerCase();
+  const shown = needle ? universe.filter((id) => id.toLowerCase().includes(needle)) : universe;
+  const checked = new Set(state.codexChecked ?? catalogIds);
+  const dirty =
+    [...checked].some((id) => !catalogSet.has(id)) || catalogIds.some((id) => !checked.has(id));
+  // Codex /model 里用户当前的选择（目录是我们的才上报），并入计数一行
+  const current = scan.catalogState === 'ours' ? scan.activeModel : null;
+
+  // 还没有模型清单：与 WorkBuddy 同款 —— 只有标题的卡头 + 引导去同步；
+  // 清单里有模型但全是非 GPT 系时，说明是过滤后为空而不是没同步过
+  if (!universe.length) {
+    const hasModels = (state.models?.models ?? []).length > 0;
+    return `
+      <div class="card">
+        <div class="card-head"><span class="card-title">Codex 模型</span></div>
+        ${emptyState(
+          hasModels ? '清单里没有 GPT 系模型' : '还没有可用模型清单',
+          hasModels ? 'Codex 桌面端只支持 gpt- 开头的模型' : '先到「可用模型」分区从上游同步',
+        )}
+      </div>`;
+  }
+
+  const clear = raw
+    ? `<button class="filter-clear" type="button" data-action="clear-codex-filter"` +
+      ` data-refocus="codex-filter" aria-label="清空搜索" title="清空搜索">×</button>`
+    : '';
 
   return `
     <div class="card">
       <div class="card-head">
-        <span class="card-title">Codex CLI</span>
+        <span class="card-title">Codex 模型</span>
         <span class="card-head-spacer"></span>
-        ${pill}
+        <span class="card-sub">${countLabel(universe.length, shown.length, query, catalogIds.length, current)}</span>
+        <button class="small" type="button" data-action="codex-reset"` +
+        `${dirty ? '' : ' disabled'} title="放弃未应用的勾选，恢复当前配置">恢复</button>
         ${imported
           ? `<button class="small" type="button" data-action="codex-remove"` +
-            `${actionAttrs(state, ACTION.codexRemove)}>移除</button>`
+            `${actionAttrs(state, ACTION.codexRemove)}>清空</button>`
           : ''}
         <button class="small primary" type="button" data-action="codex-apply"` +
-        `${imported && keyOk && active ? ' disabled' : ''}${actionAttrs(state, ACTION.codexApply)}>接入</button>
+        `${imported && keyOk && active && !dirty ? ' disabled' : ''}${actionAttrs(state, ACTION.codexApply)}>应用</button>
       </div>
-      ${kvList([
-        kv('接口地址', mono(state.access?.openaiBaseUrl)),
-        kv('写入位置', mono('~/.codex/config.toml · auth.json')),
-      ])}
-      <div class="wb-hint">「接入」把指向本应用的 provider 写入 config.toml 并设为当前，同时把密钥同步进 auth.json；只动与本应用相关的条目，其余配置与 ChatGPT 登录保持原样。模型在 Codex 里用 /model 切换</div>
+      ${foreign
+        ? note(
+            '模型目录由其他工具接管（<code>model_catalog_json</code> 指向别的文件），本应用不会改动它；如需在这里挑选模型，先在 Codex 配置里移除那条指针。',
+            'warn',
+          )
+        : `
+      <div class="filter-bar">
+        ${renderEnglishField({
+          id: 'codex-filter',
+          value: raw,
+          placeholder: '搜索模型名',
+          className: 'filter-input',
+        })}
+        ${clear}
+      </div>
+      <div class="model-card-list">
+        ${shown.length
+          ? shown.map((model) =>
+              codexModelCard(
+                model,
+                checked.has(model),
+                availableSet.has(model),
+                isGptModel(model),
+                rates[model],
+              ),
+            ).join('')
+          : `<div class="model-card-empty">没有匹配「${esc(query)}」的模型，换个关键词试试</div>`}
+      </div>`}
+      <div class="wb-hint">只有 gpt- 开头的模型会出现在这里 —— Codex 桌面端只支持 GPT 系模型。勾选的模型出现在 Codex 的 /model 选择器里，取消勾选即移除，点「应用」一次生效，「恢复」放弃未应用的改动；「清空」（或取消全部勾选后「应用」）移除本应用的全部痕迹 —— provider、密钥与模型目录。应用同时写入当前地址与密钥，只动与本应用相关的条目，其余配置与 ChatGPT 登录保持原样；切换模型在 Codex 里用 /model 完成</div>
     </div>`;
+}
+
+/** 一张模型卡：整卡一颗按钮，选中就是整卡的主色描边 + 底色（与 WorkBuddy 同款）。
+ *  非 GPT 的目录残留单独说明 —— 不是清单里没有，而是 Codex 不支持。 */
+function codexModelCard(model: string, checked: boolean, known: boolean, gpt: boolean, rate: number | undefined): string {
+  // 目录里有、网格可选清单里没有：多半是模型从清单移除后的残留，看得见才删得掉
+  const pill = checked && !known ? tonePill('off', gpt ? '不在模型列表' : 'Codex 不支持') : '';
+  return (
+    `<button class="model-card${checked ? ' is-checked' : ''}" type="button"` +
+    ` data-action="codex-toggle" data-model="${esc(model)}"` +
+    ` aria-pressed="${checked}">` +
+    `<span class="model-card-name" title="${esc(model)}">${esc(model)}</span>` +
+    rateLabel(rate) +
+    pill +
+    `</button>`
+  );
 }
 
 /**
@@ -174,6 +272,10 @@ function modelsCard(state: AppState): string {
         <span class="card-sub">${countLabel(universe.length, shown.length, query, importedIds.length)}</span>
         <button class="small" type="button" data-action="workbuddy-reset"` +
         `${dirty ? '' : ' disabled'} title="放弃未应用的勾选，恢复当前配置">恢复</button>
+        ${importedIds.length
+          ? `<button class="small" type="button" data-action="workbuddy-clear"` +
+            `${actionAttrs(state, ACTION.workbuddyClear)}>清空</button>`
+          : ''}
         <button class="small primary" type="button" data-action="workbuddy-apply"` +
         `${dirty ? '' : ' disabled'}${actionAttrs(state, ACTION.workbuddyApply)}>应用</button>
       </div>
@@ -187,9 +289,9 @@ function modelsCard(state: AppState): string {
         ${clear}
       </div>
       <div class="model-card-list">
-        ${cardGrid(shown, checked, keyOk, availableSet, query)}
+        ${cardGrid(shown, checked, keyOk, availableSet, query, state.models?.rates ?? {})}
       </div>
-      <div class="wb-hint">勾选写入、取消勾选移除，点「应用」一次生效，「恢复」放弃未应用的改动。写入使用当前代理地址与密钥，WorkBuddy 侧已有条目只更新密钥，其余设置不动</div>
+      <div class="wb-hint">勾选写入、取消勾选移除，点「应用」一次生效；「清空」一次移除全部指向本应用的条目，取消全部勾选再「应用」效果相同；「恢复」放弃未应用的改动。写入使用当前代理地址与密钥，WorkBuddy 侧已有条目只更新密钥，其余设置不动</div>
     </div>`;
 }
 
@@ -199,19 +301,20 @@ function cardGrid(
   keyOk: Map<string, boolean>,
   availableSet: Set<string>,
   query: string,
+  rates: Record<string, number>,
 ): string {
   if (!shown.length) {
     return `<div class="model-card-empty">没有匹配「${esc(query)}」的模型，换个关键词试试</div>`;
   }
   return shown
     .map((model) =>
-      modelCard(model, checked.has(model), keyOk.get(model) ?? true, availableSet.has(model)),
+      modelCard(model, checked.has(model), keyOk.get(model) ?? true, availableSet.has(model), rates[model]),
     )
     .join('');
 }
 
 /** 一张模型卡：整卡一颗按钮，选中就是整卡的主色描边 + 底色，不再画勾选框。 */
-function modelCard(model: string, checked: boolean, keyOk: boolean, known: boolean): string {
+function modelCard(model: string, checked: boolean, keyOk: boolean, known: boolean, rate: number | undefined): string {
   // 徽标只挑最要紧的一件事说：密钥不一致是接线错误，优先于「不在模型列表」的提醒
   const pill = !checked
     ? ''
@@ -225,13 +328,48 @@ function modelCard(model: string, checked: boolean, keyOk: boolean, known: boole
     ` data-action="workbuddy-toggle" data-model="${esc(model)}"` +
     ` aria-pressed="${checked}">` +
     `<span class="model-card-name" title="${esc(model)}">${esc(model)}</span>` +
+    rateLabel(rate) +
     pill +
     `</button>`
   );
 }
 
-/** 卡头的计数：没搜索时是总数，搜索时是「命中 / 总数」；两种都带上已接入数。 */
-function countLabel(total: number, matched: number, query: string, imported: number): string {
+/**
+ * 卡头的计数：没搜索时是总数，搜索时是「命中 / 总数」；两种都带上已接入数。
+ * Codex 的目录是我们的才带上 Codex 当前选中的模型（与 WorkBuddy 共用，多传这一个参数）。
+ */
+function countLabel(
+  total: number,
+  matched: number,
+  query: string,
+  imported: number,
+  current?: string | null,
+): string {
   const base = query ? `${matched} / ${total}` : `共 ${total} 个`;
-  return `${base} · 已接入 ${imported}`;
+  const withImported = `${base} · 已接入 ${imported}`;
+  return current ? `${withImported} · 当前 ${current}` : withImported;
+}
+
+/**
+ * Codex 重启确认弹窗。Codex 只在启动时读一次配置，应用 / 清空后的变更要重启
+ * 才生效 —— 弹窗只问「现在重启吗」，按变更类型（写入 / 清空）区分说明。
+ * 「稍后」只是关掉弹窗，配置不回退；点遮罩不关（只认按钮），避免误触丢掉提醒。
+ */
+export function codexRestartModal(state: AppState): string {
+  if (!state.codexRestartPrompt) return '';
+  const text =
+    state.codexRestartPrompt === 'applied'
+      ? 'Codex 的模型配置已更新，它只在启动时读取配置。强制重启会直接结束 ChatGPT（Codex）的进程并重新拉起，未保存的会话会丢失。'
+      : '本应用的 Codex 配置已移除，它只在启动时读取配置。强制重启会直接结束 ChatGPT（Codex）的进程并重新拉起，让它回到默认模型；未保存的会话会丢失。';
+  return `
+    <div class="modal-backdrop">
+      <div class="modal-card" role="alertdialog" aria-modal="true" aria-label="重启 Codex 应用">
+        <div class="modal-title">重启 Codex 应用</div>
+        <p class="modal-text">${text}</p>
+        <div class="modal-actions">
+          <button class="small" type="button" data-action="codex-restart-dismiss">稍后</button>
+          <button class="small primary" type="button" data-action="codex-restart-confirm">重启</button>
+        </div>
+      </div>
+    </div>`;
 }

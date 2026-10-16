@@ -2,12 +2,11 @@
 //
 // 这里刻意**没有**模型选择器。本应用是代理服务，具体用哪个模型由客户端在每次请求里决定，
 // 应用不替用户挑，也不该让人以为存在一个全局的「当前模型」。
-// 所以 chip 上的动作是**复制**而不是选中 —— 用户拿到名字之后要做的下一件事，
+// 所以卡上的动作是**复制**而不是选中 —— 用户拿到名字之后要做的下一件事，
 // 正是把它填进客户端的配置里；而「选中」在这里根本没有对应的语义。
 //
-// 清单用 chip 而不是表格：模型名长度不齐，表格会逼出一堆留白；
-// chip 自动换行，天然适合「一堆等价的候选项」这种形状。
-// 多了搜索之后这一点更重要：模型有几十个时靠眼睛找不如直接打字。
+// 卡形与三方接入同款（.model-card 网格）：一张卡一个模型，整卡可点，
+// 名字后面带上游消耗倍率（随同步给出，缺失就整体省略）。
 //
 // 同步走上游控制面，**不需要代理在运行** —— 只是「看看有哪些模型」而已，
 // 为它先启动一个监听端口、替用户向上游发请求，代价和收益完全不成比例。
@@ -15,7 +14,7 @@ import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
 import { isPending } from '../../state/app-state';
 import { renderEnglishField } from '../shared/english-field';
-import { actionAttrs, emptyState, note } from '../shared/render';
+import { actionAttrs, emptyState, note, rateLabel } from '../shared/render';
 import type { ViewSpec } from './types';
 
 export const modelsView: ViewSpec = {
@@ -44,7 +43,7 @@ export const modelsView: ViewSpec = {
           <span class="card-sub">${countLabel(all.length, shown.length, query)}</span>
         </div>
         ${all.length ? filterBar(raw) : ''}
-        ${inventoryBody(shown, all.length, query)}
+        ${inventoryBody(shown, all.length, query, state.models?.rates ?? {})}
       </div>`;
 
     return `
@@ -96,7 +95,7 @@ function filterBar(value: string): string {
     </div>`;
 }
 
-function inventoryBody(shown: string[], total: number, query: string): string {
+function inventoryBody(shown: string[], total: number, query: string, rates: Record<string, number>): string {
   if (!total) {
     return emptyState('还没有模型清单', '点击右上角「从上游同步」向 Kiro 账户读取');
   }
@@ -104,13 +103,18 @@ function inventoryBody(shown: string[], total: number, query: string): string {
     return emptyState(`没有匹配「${query}」的模型`, '换个关键词，或点右侧「×」清空搜索');
   }
   return `
-    <div class="chips">
-      ${shown
-        .map(
-          (id) =>
-            `<button class="chip" type="button" data-action="copy-model"` +
-            ` data-model="${esc(id)}" title="点击复制「${esc(id)}」">${esc(id)}</button>`,
-        )
-        .join('')}
+    <div class="model-card-list">
+      ${shown.map((id) => modelCard(id, rates[id])).join('')}
     </div>`;
+}
+
+/** 一张模型卡：与三方接入同款卡形 —— 整卡一颗按钮，这里是「点了复制名字」。 */
+function modelCard(model: string, rate: number | undefined): string {
+  return (
+    `<button class="model-card" type="button" data-action="copy-model"` +
+    ` data-model="${esc(model)}" title="点击复制「${esc(model)}」">` +
+    `<span class="model-card-name" title="${esc(model)}">${esc(model)}</span>` +
+    rateLabel(rate) +
+    `</button>`
+  );
 }

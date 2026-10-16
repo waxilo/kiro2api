@@ -9,6 +9,7 @@
 //! 唯一例外是 WorkBuddy 快捷导入（`crate::workbuddy`）：用户显式发起、只写它自己的
 //! 模型清单且从不删除条目，该原则对其余客户端仍然成立。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,8 +21,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::kiro::models::kiro_model_to_public_model_id;
 use crate::paths::kiro_sso_cache_dir;
 use crate::prefs::{
-    cached_models, cached_usage, ensure_api_key, generate_api_key, load_config, mask_api_key,
-    ms_to_iso, store_models, store_usage, update_config,
+    cached_model_rates, cached_models, cached_usage, ensure_api_key, generate_api_key, load_config,
+    mask_api_key, ms_to_iso, store_models, store_usage, update_config,
 };
 
 pub(crate) const KIRO_RUNTIME_URL: &str = "https://runtime.us-east-1.kiro.dev/";
@@ -189,6 +190,9 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ModelsState {
     pub models: Vec<String>,
+    /// 公共模型 id → 消耗倍率（rateMultiplier）。空表 = 上游没给过或还没同步过。
+    #[serde(default)]
+    pub rates: HashMap<String, f64>,
 }
 
 /// 双协议接入信息。明文密钥不经过前端：这里只回传脱敏串，
@@ -501,15 +505,17 @@ pub(crate) fn spawn_refresh_loop(state: ProxyStateRef) {
 
 // ── 模型列表 ────────────────────────────────────────────────────────────
 
-/// 从上游控制面拉取账户可用模型，映射成公共 ID、落盘并返回。
+/// 从上游控制面拉取账户可用模型，映射成公共 ID、落盘并返回（连同倍率表）。
 ///
 /// 刻意**不**走本地反代 `/v1/models`：那条路要求代理已经在跑，于是「看看有哪些模型」
 /// 这件只读的事被绑定成「先启动代理」。改成直接问上游之后，模型分区在没有代理时也能看、
 /// 也能同步；顺带让启动时的后台刷新不依赖代理是否被自动拉起。
 ///
 /// 唯一的前置条件是本机有 Kiro 凭据 —— 那是「能不能问上游」的前提，不是「代理有没有跑」。
-pub(crate) fn sync_models_from_upstream() -> Result<Vec<String>, String> {
-    let ids = new_auth().list_available_models()?;
+pub(crate) fn sync_models_from_upstream() -> Result<(Vec<String>, HashMap<String, f64>), String> {
+    let auth = new_auth();
+    let ids = auth.list_available_models()?;
+    let upstream_rates = auth.model_rates();
     let mut models: Vec<String> = ids
         .iter()
         .map(|id| kiro_model_to_public_model_id(id))
@@ -519,16 +525,27 @@ pub(crate) fn sync_models_from_upstream() -> Result<Vec<String>, String> {
     if models.is_empty() {
         return Err("上游没有返回任何可用模型".to_string());
     }
-    store_models(&models)?;
-    Ok(models)
+    // 倍率表跟着换算成公共 id：多个内部 id 折到同一公共 id 时保留先到的倍率，
+    // 且只留清单里真的有的模型（上游可能给了倍率但模型已被去重/淘汰）
+    let mut rates: HashMap<String, f64> = HashMap::new();
+    for id in &ids {
+        if let Some(rate) = upstream_rates.get(id) {
+            rates
+                .entry(kiro_model_to_public_model_id(id))
+                .or_insert(*rate);
+        }
+    }
+    rates.retain(|public, _| models.contains(public));
+    store_models(&models, &rates)?;
+    Ok((models, rates))
 }
 
 /// 同步模型并通知前端；失败只记日志（供后台刷新与代理启动后调用）。
 pub(crate) fn refresh_models_and_notify() {
     match sync_models_from_upstream() {
-        Ok(models) => {
+        Ok((models, rates)) => {
             eprintln!("[proxy] 模型列表已同步: {} 个", models.len());
-            notify("proxy://models-updated", ModelsState { models });
+            notify("proxy://models-updated", ModelsState { models, rates });
         }
         Err(error) => eprintln!("[proxy] 同步模型列表失败: {error}"),
     }
@@ -657,6 +674,7 @@ pub fn k2a_status(state: State<'_, ProxyStateRef>) -> ProxyStatus {
 pub fn k2a_models() -> ModelsState {
     ModelsState {
         models: cached_models(),
+        rates: cached_model_rates(),
     }
 }
 
@@ -703,9 +721,11 @@ pub async fn k2a_stop(state: State<'_, ProxyStateRef>) -> Result<ProxyStatus, St
 /// 就要占端口、就要替用户向上游发请求，代价远大于收益。现在直接问上游控制面。
 #[tauri::command]
 pub async fn k2a_sync_models() -> Result<ModelsState, String> {
-    tauri::async_runtime::spawn_blocking(|| sync_models_from_upstream().map(|models| ModelsState { models }))
-        .await
-        .map_err(|e| format!("同步任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(|| {
+        sync_models_from_upstream().map(|(models, rates)| ModelsState { models, rates })
+    })
+    .await
+    .map_err(|e| format!("同步任务失败: {e}"))?
 }
 
 /// 读取缓存的账户额度（纯本地读取，不发网络请求）。

@@ -15,6 +15,7 @@ mod updater_accel;
 mod window;
 mod workbuddy;
 mod codex;
+mod codex_restart;
 
 mod kiro;
 
@@ -124,9 +125,11 @@ pub fn run() {
             workbuddy::k2a_workbuddy_import,
             workbuddy::k2a_workbuddy_list,
             workbuddy::k2a_workbuddy_remove,
+            workbuddy::k2a_workbuddy_clear,
             codex::k2a_codex_import,
             codex::k2a_codex_list,
             codex::k2a_codex_remove,
+            codex_restart::k2a_codex_restart,
             updater_accel::k2a_update_source_get,
             updater_accel::k2a_update_source_set,
             window::k2a_snap_rect,

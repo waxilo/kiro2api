@@ -97,11 +97,26 @@ export interface AppState {
   /**
    * 「三方接入」分区的 Codex 扫描结果；null 表示还没扫过（进分区时拉取）。
    *
-   * 与 WorkBuddy 不同构：Codex 是单 provider 模型（`model_providers` 表 +
-   * 顶层 `model_provider` 选择），没有可多选的模型清单，交互是「一键接入 /
-   * 移除」。只含指向本应用的条目，其余 provider 看不见也就动不到。
+   * 含两类事实：provider（`model_providers` 表 + 顶层 `model_provider` 选择，
+   * 单供应商模型）与模型目录（顶层 `model_catalog_json` 指针 + 目录文件内容）。
+   * 只含指向本应用的条目与文件，其余 provider / 别家的目录看不见也就动不到。
    */
   codexScan: CodexScan | null;
+  /**
+   * Codex 模型网格的勾选状态（模型 id 集合）。勾选即语义：在集合里 = 该模型
+   * 应写进 Codex 的 /model 模型目录，不在 = 应从目录移除（全部取消 = 连目录
+   * 指针一起撤）。null = 用户还没动过，勾选跟随扫描结果 —— 语义与
+   * `workbuddyChecked` 完全一致，包括「物化后不被焦点刷新覆盖」。
+   */
+  codexChecked: string[] | null;
+  /** 「三方接入」分区 Codex 网格的搜索词。语义与 `workbuddyFilter` 相同。 */
+  codexFilter: string;
+  /**
+   * Codex 配置变更后待确认的重启。Codex（现名 ChatGPT）只在启动时读一次配置，
+   * 接入 / 清空之后不重启不生效 —— 弹窗只问「现在重启吗」，值记录这次变更是
+   * 「写入」还是「清空」，文案据此区分；null = 没有待确认的重启。
+   */
+  codexRestartPrompt: 'applied' | 'cleared' | null;
   /**
    * 刚复制成功的复制类型；对应的复制按钮把文案短暂换成「已复制」。
    *
@@ -162,6 +177,9 @@ export const store = createStore<AppState>({
   workbuddyFilter: '',
   workbuddyChecked: null,
   codexScan: null,
+  codexChecked: null,
+  codexFilter: '',
+  codexRestartPrompt: null,
   copiedKind: null,
 });
 

@@ -5,7 +5,7 @@
 //
 // 约定：所有接收「值」的地方都接收**已经转义过或受控**的 HTML 片段 ——
 // 本模块只负责结构，不负责转义，调用方用 `core/format` 里的 `esc` / `text` 处理数据。
-import { esc } from '../../core/format';
+import { esc, formatRate } from '../../core/format';
 import { actionScope } from '../../state/actions';
 import { isBlocking, isPending, type AppState, type StatusSummary, type Tone, type ViewId } from '../../state/app-state';
 import { ICON } from './icons';
@@ -44,6 +44,12 @@ export function statusPill(summary: StatusSummary): string {
 /** 语义色调标签（更新可用、已是最新…）。 */
 export function tonePill(tone: Tone, label: string): string {
   return `<span class="pill ${tone}"><span class="pill-dot"></span>${esc(label)}</span>`;
+}
+
+/** 模型卡上的上游消耗倍率标注：已知才显示，未知整体省略（0 显示「免费」）。 */
+export function rateLabel(rate: number | undefined): string {
+  const label = formatRate(rate);
+  return label ? `<span class="model-card-rate">${esc(label)}</span>` : '';
 }
 
 /** 一行键值。`value` 需为已转义或受控的 HTML。 */

@@ -411,44 +411,6 @@ select:focus {
   cursor: pointer;
 }
 
-/* ── 模型 chip ──────────────────────────────────────────────────────
-   一堆等价的候选项：没有「选中」这个状态 —— 模型由客户端在请求里指定，
-   清单只回答「有哪些」。所以这里不存在高亮样式。
-
-   chip 现在是**按钮**：点一下复制模型名（用户拿到名字之后要做的下一件事，
-   正是把它填进客户端配置）。所以它有 hover / active 反馈，但那份反馈只表达
-   「这里可以点」，绝不表达「点过就选中了」—— 底色往白走（层级抬高）而不是往
-   主色走，边框也只到 tertiary 一档；`--primary` 留给真正的当前态与焦点环。 */
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.chip {
-  padding: 3px 9px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--hairline);
-  background: var(--surface-2);
-  color: var(--ink-muted);
-  font-family: var(--font-mono);
-  font-size: var(--t-caption);
-}
-
-/* 特异性要压过本文件顶部那条 `button:hover:not(:disabled):not([aria-disabled='true'])`
-   （0,3,1）—— 那条会把 chip 的底色钉在 surface-2、边框改成 tertiary，direction 正好相反。
-   所以这里把同样的三个限定照抄一遍（0,4,1），而不是靠源码顺序去赌。 */
-button.chip:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--surface-1);
-  border-color: var(--hairline-tertiary);
-  color: var(--ink);
-}
-
-button.chip:active:not(:disabled):not([aria-disabled='true']) {
-  background: var(--surface-2);
-  border-color: var(--hairline-tertiary);
-}
-
 /* ── 进度条 ───────────────────────────────────────────────────────── */
 .progress {
   height: 5px;
@@ -569,4 +531,69 @@ button.chip:active:not(:disabled):not([aria-disabled='true']) {
 
 .toast.err {
   background: var(--danger);
+}
+
+/* ── 确认弹窗 ──────────────────────────────────────────────────────────
+   只用于「需要用户拍板」的场合（重启确认这类）；进度与结果一律走 toast 与
+   按钮原地状态，不进弹窗。层级压在 toast 之下：弹窗开着时如果又出了错误
+   提示，提示不该被遮住。 */
+.modal-host {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 22, 27, 0.32);
+  pointer-events: auto;
+  animation: modal-fade var(--dur) var(--ease);
+}
+
+.modal-card {
+  width: min(400px, calc(100vw - 48px));
+  padding: var(--s-md) var(--s-md) var(--s-sm);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop);
+  animation: modal-in var(--dur) var(--ease);
+}
+
+.modal-title {
+  font-size: var(--t-title);
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: var(--s-xs);
+}
+
+.modal-text {
+  font-size: var(--t-body);
+  line-height: 1.6;
+  color: var(--ink-muted);
+  margin: 0 0 var(--s-sm);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--s-xs);
+}
+
+@keyframes modal-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
 }

@@ -54,6 +54,16 @@ export function megabytes(bytes: number): string {
   return (bytes / 1048576).toFixed(1);
 }
 
+/**
+ * 上游消耗倍率展示：0 是不计费（免费档），其余 `×N`（1 显示 ×1，1.3 显示 ×1.3）。
+ * 未知（undefined）返回空串 —— 调用方据此整体省略，不留一个孤零零的占位符。
+ */
+export function formatRate(rate: number | undefined): string {
+  if (rate === undefined || !Number.isFinite(rate)) return '';
+  if (rate === 0) return '免费';
+  return `×${rate}`;
+}
+
 /** 百分比：夹到 0–100 并取整，避免进度条宽度越界。 */
 export function percent(part: number, whole: number): number {
   if (!Number.isFinite(part) || !Number.isFinite(whole) || whole <= 0) return 0;

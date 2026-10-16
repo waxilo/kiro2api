@@ -8,6 +8,7 @@
 //! 让应用一打开就有东西可显示（启动时的后台刷新随后静默替换成最新值）。
 //! 真正的模型选择不在这里 —— 客户端在每次请求里自己指定模型。
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,11 @@ pub(crate) struct AppConfig {
     /// `alias` 保留旧键名 `displayModels`，让升级前写下的缓存不白丢。
     #[serde(alias = "displayModels")]
     pub(crate) models: Vec<String>,
+    /// 上一次同步到的模型消耗倍率（公共模型 id → rateMultiplier，1 = 基准，0 = 不计费）。
+    ///
+    /// 与 `models` 同一次同步落盘（见 `store_models`），保证两份数据出自同一时刻；
+    /// 空表 = 上游没给过或还没同步过，界面不显示倍率。
+    pub(crate) model_rates: HashMap<String, f64>,
     /// 上一次查询到的账户额度快照。
     pub(crate) usage_cache: Option<UsageCache>,
     /// 应用内更新的下载源。
@@ -59,6 +65,7 @@ impl Default for AppConfig {
             port: DEFAULT_PORT,
             proxy_api_key: None,
             models: Vec::new(),
+            model_rates: HashMap::new(),
             usage_cache: None,
             update_source: None,
         }
@@ -156,10 +163,16 @@ pub(crate) fn cached_models() -> Vec<String> {
     load_config().models
 }
 
-/// 写入模型缓存。
-pub(crate) fn store_models(models: &[String]) -> Result<(), String> {
+/// 读取缓存的模型倍率（纯本地读取，不发网络请求）。
+pub(crate) fn cached_model_rates() -> HashMap<String, f64> {
+    load_config().model_rates
+}
+
+/// 写入模型缓存：清单与倍率同一次落盘，保证两份数据出自同一次同步。
+pub(crate) fn store_models(models: &[String], rates: &HashMap<String, f64>) -> Result<(), String> {
     update_config(|config| {
         config.models = models.to_vec();
+        config.model_rates = rates.clone();
         Ok(())
     })
 }

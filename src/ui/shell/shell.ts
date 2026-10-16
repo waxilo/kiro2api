@@ -19,6 +19,7 @@ import {
   navigate,
   refresh,
   savePort,
+  setCodexFilter,
   setModelFilter,
   setWorkbuddyFilter,
   useFeedback,
@@ -30,11 +31,13 @@ import { captureFocus, restoreFocus } from '../shared/focus';
 import { ScrollArea } from '../shared/scroll-area';
 import { toast } from '../shared/toast';
 import { VIEWS, type ViewSpec } from '../views';
+import { codexRestartModal } from '../views/thirdparty';
 import { renderRail, updateRail } from './rail';
 import { bindTitlebar, renderTitlebar, reportShellReady, updateTitlebar } from './titlebar';
 
 let headEl: HTMLElement;
 let bodyEl: HTMLElement;
+let modalEl: HTMLElement;
 let scrollArea: ScrollArea | null = null;
 
 // ── 组装 ────────────────────────────────────────────────────────────────
@@ -55,13 +58,18 @@ export function mountApp(container: HTMLElement): void {
         </div>
       </main>
     </div>
+    <div class="modal-host" id="modal-host"></div>
   `;
 
   const head = document.getElementById('view-head');
   const body = document.getElementById('view-body');
-  if (!head || !body) throw new Error('外壳结构不完整：缺少 #view-head 或 #view-body');
+  const modal = document.getElementById('modal-host');
+  if (!head || !body || !modal) {
+    throw new Error('外壳结构不完整：缺少 #view-head 或 #view-body 或 #modal-host');
+  }
   headEl = head;
   bodyEl = body;
+  modalEl = modal;
 
   bindTitlebar();
   useFeedback({ toast });
@@ -113,6 +121,10 @@ function render(state: AppState, previous?: AppState): void {
     playEnter(bodyEl);
   }
   scrollArea?.refresh();
+
+  // 弹窗宿主在视图之外（fixed 定位不随内容滚动），但同走这一个渲染入口：
+  // store 一变它就必然跟上，与「重画只有一个入口」的约束保持一致。
+  modalEl.innerHTML = codexRestartModal(state);
 
   // 放在最后：页面已经是正确的样子了，提示只是叠上去的一层，不参与布局。
   announceError(state, previous);
@@ -198,9 +210,10 @@ function bindEvents(container: HTMLElement): void {
     }
   });
 
-  // 两个搜索框（可用模型分区、三方接入分区）按 id 分流，各自的值归各自的动作。
+  // 三个搜索框（可用模型分区、三方接入分区的两张网格）按 id 分流，各自的值归各自的动作。
   bindEnglishFields(container, (id, next) => {
     if (id === 'workbuddy-filter') setWorkbuddyFilter(next);
+    else if (id === 'codex-filter') setCodexFilter(next);
     else setModelFilter(next);
   });
 
@@ -211,6 +224,9 @@ function bindEvents(container: HTMLElement): void {
     if (target.id === 'model-filter' && store.get().modelFilter) setModelFilter('');
     if (target.id === 'workbuddy-filter' && store.get().workbuddyFilter) {
       setWorkbuddyFilter('');
+    }
+    if (target.id === 'codex-filter' && store.get().codexFilter) {
+      setCodexFilter('');
     }
   });
 

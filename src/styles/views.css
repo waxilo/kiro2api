@@ -565,6 +565,13 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
   white-space: nowrap;
 }
 
+/* 模型卡上的上游消耗倍率：跟在名字后，退一档颜色缩一档字号，不被名字的省略号挤没 */
+.model-card-rate {
+  flex: none;
+  color: var(--ink-subtle);
+  font-size: var(--t-caption);
+}
+
 .model-card .pill {
   flex: none;
 }
@@ -584,6 +591,7 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
   font-size: var(--t-caption);
   color: var(--ink-tertiary);
 }
+
 
 /* 页面级布局：三方接入页整页不滚动，模型多时只在卡片网格里滚。
    .view-body 平时是普通滚动容器（见 shell.css）；这里只对含卡片网格的页面

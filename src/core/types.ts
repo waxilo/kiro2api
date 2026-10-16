@@ -25,6 +25,8 @@ export interface ModelsState {
    * 每次请求里决定，应用不替用户挑。
    */
   models: string[];
+  /** 公共模型 id → 上游消耗倍率（rateMultiplier，1 = 基准，0 = 不计费）。空表 = 没同步过。 */
+  rates: Record<string, number>;
 }
 
 /** `k2a_access` 的返回。 */
@@ -64,12 +66,21 @@ export interface WorkbuddyScan {
 /** 一条指向本应用的 Codex provider（`~/.codex/config.toml` 的 model_providers 条目）。 */
 export interface CodexEntry {
   id: string;
-  base_url: string;
+  baseUrl: string;
   /** 顶层 `model_provider` 是否指向它 —— 即 Codex 当前是否正在用它。 */
   active: boolean;
   /** auth.json 里的密钥与当前代理密钥是否一致；false 时界面提示重置密钥已让它过期。 */
   keyMatches: boolean;
 }
+
+/** Codex 顶层 `model_catalog_json` 指针的状态。 */
+export type CodexCatalogState =
+  /** 没有指针 —— 从没接过模型目录。 */
+  | 'none'
+  /** 指向本应用的目录文件，勾选的模型就写在里面。 */
+  | 'ours'
+  /** 指向其他工具的目录文件 —— 本应用一概不碰。 */
+  | 'foreign';
 
 /** `k2a_codex_list` 的返回。读盘失败不作为命令错误，就地放在 error 里。 */
 export interface CodexScan {
@@ -77,12 +88,32 @@ export interface CodexScan {
   installed: boolean;
   entries: CodexEntry[];
   error: string | null;
+  /** 模型目录指针状态。 */
+  catalogState: CodexCatalogState;
+  /** 目录里的模型（仅 ours 时有值）；Codex 的 /model 选择器从这里取。 */
+  catalogModels: string[];
+  /** Codex 顶层 `model` —— 用户在 /model 里的当前选择（仅 ours 时上报）。 */
+  activeModel: string | null;
 }
 
-/** `k2a_codex_import` 的返回：接入 Codex 后哪些文件真的写了。 */
+/** `k2a_codex_import` 的返回：接入 Codex 后哪些东西真的写了。 */
 export interface CodexImportSummary {
   configWritten: boolean;
   authWritten: boolean;
+  /** 模型目录文件被写入或删除。 */
+  catalogWritten: boolean;
+  /** Codex 顶层默认模型被写入或撤除。 */
+  modelWritten: boolean;
+}
+
+/** `k2a_codex_restart` 的结果。 */
+export interface CodexRestartResult {
+  /** 动手之前应用是否正在运行（不在运行时无需重启）。 */
+  running: boolean;
+  /** 是否完成了「结束进程 + 重新拉起」。 */
+  restarted: boolean;
+  /** 主进程名（ChatGPT / Codex），提示语里点名重启的是哪个应用。 */
+  app: string | null;
 }
 
 /** `k2a_usage` 的返回。 */
