@@ -171,7 +171,6 @@ fn write_secret_file(path: &Path, payload: &Value) -> Result<(), String> {
         let mut file = fs::File::create(&tmp).map_err(|e| format!("创建 {:?} 失败：{e}", tmp))?;
         #[cfg(unix)]
         {
-            use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
             let mut perms = file
                 .metadata()
