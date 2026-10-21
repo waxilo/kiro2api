@@ -18,6 +18,22 @@
 //! provider，因此接入必然「占用」顶层选择 —— 移除时把指向我们的顶层键删掉，
 //! Codex 回落到内置 openai provider。
 //!
+//! ## 取消接管 = 还原，不是删除
+//!
+//! 「把我们写进去的键删掉」和「还原成接管前的样子」不是一回事：用户原本可能
+//! 指着自己的中转（`model_provider = "relay"` + 自己的 `model`），只删顶层键
+//! 会让 Codex 回落到内置 openai，看起来就是「取消了但配置没还原」。
+//!
+//! 所以接管前把 `config.toml` **整份**快照到应用数据目录（`Kiro2API/codex-backup/`），
+//! 取消接管时整份放回去。快照只在还没有快照时做一次 —— 重复点「应用」时配置里
+//! 已经是我们写的内容，再快照一次就把还原点覆盖成「接管后」了。
+//!
+//! auth.json 不做整份还原：里面的 ChatGPT token 会被 Codex 不停刷新，回滚整份
+//! 等于让用户掉登录。只把接管前那一个 `OPENAI_API_KEY` 放回去（接管前没有就删掉
+//! 我们自己写进去的那个，用户后来自己加的别动）。
+//!
+//! 缺快照（本次改动之前就接管过的）时退回旧行为：逐键删除，至少不留指向本应用的悬空配置。
+//!
 //! ## 模型目录
 //!
 //! Codex 支持顶层 `model_catalog_json` 指向一个模型目录文件（相对路径以
@@ -107,8 +123,10 @@ pub struct CodexImportSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRemoveOutcome {
-    /// 是否确有移除（指向其它服务的配置一概不动）
+    /// 是否确有改动（指向其它服务的配置一概不动）
     pub removed: bool,
+    /// 是否走了「整份还原接管前配置」这条路（没有快照时是逐键删除，为 false）
+    pub restored: bool,
     /// 移除那一刻 Codex 桌面应用在不在跑：跑着才需要重启确认
     pub codex_running: bool,
 }
@@ -135,6 +153,155 @@ fn auth_path(dir: &Path) -> PathBuf {
 
 fn catalog_path(dir: &Path) -> PathBuf {
     dir.join(CATALOG_FILENAME)
+}
+
+/// 接管前快照的存放目录：应用数据目录下的 `codex-backup/`。
+///
+/// 放应用数据目录而不是 `~/.codex` 里：那是 Codex 自己的地盘，我们不该往里
+/// 留不属于它的文件；用户真要手工还原，路径也写在界面的错误提示里。
+fn backup_root() -> PathBuf {
+    crate::paths::get_data_path().join("codex-backup")
+}
+
+fn backup_config_path(root: &Path) -> PathBuf {
+    root.join("config.toml")
+}
+
+fn backup_meta_path(root: &Path) -> PathBuf {
+    root.join("meta.json")
+}
+
+/// 接管前的现场。
+#[derive(Debug, Clone, serde::Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TakeoverMeta {
+    /// 接管那一刻 `config.toml` 是否存在。不存在说明这文件是我们从无到有写的，
+    /// 取消接管时该把它删掉，而不是还原成一份空文件。
+    had_config: bool,
+    /// 接管那一刻 `auth.json` 是否存在（同上：不存在就别留个空对象在那儿）。
+    had_auth: bool,
+    /// 接管那一刻 auth.json 里用户自己的 `OPENAI_API_KEY`（没有则为 None）。
+    auth_key: Option<String>,
+}
+
+/// 接管前快照。已存在快照时返回 false 并原样保留 —— 见模块注释里的「只快照一次」。
+///
+/// 快照写不下去就直接失败：没有还原点的接管是个陷阱，用户点「清空」时会发现
+/// 原来的配置回不来。
+fn snapshot_before_takeover(root: &Path, dir: &Path) -> Result<bool, String> {
+    if backup_meta_path(root).is_file() {
+        return Ok(false);
+    }
+    let config_file = config_path(dir);
+    let (had_config, text) = match fs::read_to_string(&config_file) {
+        Ok(text) => (true, text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, String::new()),
+        Err(err) => return Err(format!("读取 config.toml 失败，无法备份接管前的配置: {err}")),
+    };
+    fs::create_dir_all(root).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    if had_config {
+        write_atomic(&backup_config_path(root), &text)?;
+    }
+    let auth_file = auth_path(dir);
+    let had_auth = auth_file.is_file();
+    let auth_key = read_auth(&auth_file)
+        .ok()
+        .and_then(|auth| {
+            auth.get("OPENAI_API_KEY")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|key| !key.trim().is_empty());
+    let meta = TakeoverMeta {
+        had_config,
+        had_auth,
+        auth_key,
+    };
+    let body = serde_json::to_string_pretty(&meta).map_err(|e| format!("序列化备份摘要失败: {e}"))?;
+    write_atomic(&backup_meta_path(root), &body)?;
+    Ok(true)
+}
+
+/// 取消接管：把接管前的 `config.toml` 整份放回去，auth.json 只归位密钥那一个键。
+///
+/// 返回是否真的还原了（没有快照时为 false，由调用方退回逐键删除）。
+fn restore_from_backup(root: &Path, dir: &Path, api_key: &str) -> Result<bool, String> {
+    let meta_file = backup_meta_path(root);
+    let Ok(raw) = fs::read_to_string(&meta_file) else {
+        return Ok(false);
+    };
+    let meta: TakeoverMeta = serde_json::from_str(&raw)
+        .map_err(|e| format!("接管前的备份已损坏（{e}），无法还原；请手动检查 {meta_file:?}"))?;
+
+    // 快照残了（文件被删或读不动）：退回逐键删除，别把用户堵在「取消不了」上。
+    // 顺带丢掉这份残档 —— 留着它会让下一次接管跳过快照，永远没有还原点。
+    let backup_text = if meta.had_config {
+        match fs::read_to_string(backup_config_path(root)) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                crate::diag::log(&format!(
+                    "[codex] 接管前的 config.toml 快照不可读（{err}），退回逐键删除"
+                ));
+                let _ = fs::remove_dir_all(root);
+                return Ok(false);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 先读盘再动手：auth.json 坏了要在写 config.toml 之前就失败，
+    // 免得「配置已还原但命令报错」这种半截状态
+    let auth_file = auth_path(dir);
+    let mut auth = read_auth(&auth_file)?;
+
+    let config_file = config_path(dir);
+    if let Some(text) = backup_text {
+        write_atomic(&config_file, &text)?;
+    } else if config_file.exists() {
+        // 接管前根本没有这份文件：还回「不存在」，而不是留一份空文件
+        fs::remove_file(&config_file)
+            .map_err(|e| format!("删除接管时新建的 config.toml 失败: {e}"))?;
+    }
+
+    let mut auth_changed = false;
+    if let Some(obj) = auth.as_object_mut() {
+        let current = obj
+            .get("OPENAI_API_KEY")
+            .and_then(Value::as_str)
+            .map(str::trim);
+        match meta.auth_key.as_deref().map(str::trim) {
+            // 接管前有自己的密钥：放回去（已经被改回同一个值就不写盘）
+            Some(original) if current != Some(original) => {
+                obj.insert("OPENAI_API_KEY".to_string(), Value::String(original.to_string()));
+                auth_changed = true;
+            }
+            // 接管前没有：只删我们自己写进去的那个，用户后来自己加的别动
+            None if current == Some(api_key.trim()) => {
+                obj.remove("OPENAI_API_KEY");
+                auth_changed = true;
+            }
+            _ => {}
+        }
+    }
+    if auth_changed {
+        // 接管前根本没有 auth.json，而还原后它只剩一个空对象：连文件一起还回「不存在」
+        if !meta.had_auth && auth.as_object().is_some_and(|obj| obj.is_empty()) {
+            let _ = fs::remove_file(&auth_file);
+        } else {
+            write_atomic(
+                &auth_file,
+                &serde_json::to_string(&auth).map_err(|e| format!("序列化失败: {e}"))?,
+            )?;
+        }
+    }
+
+    // 目录文件是本应用建的，指针已随快照还原 —— 留着就是孤儿文件
+    let _ = fs::remove_file(catalog_path(dir));
+    // 快照用完即弃。删不掉也不影响正确性：它此刻与磁盘上的配置一模一样，
+    // 下次接管即便沿用它，还原出来的还是同一份 —— 而报错会把「已经还原好了」说成失败
+    let _ = fs::remove_dir_all(root);
+    Ok(true)
 }
 
 /// 先写临时文件再改名：Codex 读到半个文件比读到旧值糟糕得多。
@@ -516,8 +683,21 @@ fn import_to_files(
     models: &[String],
 ) -> Result<CodexImportSummary, String> {
     let dir = codex_dir()?;
-    let config_file = config_path(&dir);
+    import_to_dir(&dir, &backup_root(), base_url, api_key, models)
+}
+
+fn import_to_dir(
+    dir: &Path,
+    backup: &Path,
+    base_url: &str,
+    api_key: &str,
+    models: &[String],
+) -> Result<CodexImportSummary, String> {
+    let config_file = config_path(dir);
     let mut doc = read_config(&config_file)?;
+    // 先拍接管前的快照再动文件：这一步失败就中止接管 —— 没有还原点的接管
+    // 会让「清空」变不回原样，宁可现在就报错
+    snapshot_before_takeover(backup, dir)?;
     let model_before = doc
         .get("model")
         .and_then(|item| item.as_str())
@@ -531,7 +711,7 @@ fn import_to_files(
         .map(str::to_string)
         != model_before;
 
-    let catalog_file = catalog_path(&dir);
+    let catalog_file = catalog_path(dir);
     let catalog_written = if catalog_managed && !models.is_empty() {
         // 先写目录文件再写配置：指针落地时文件必已就位，中断也只会多出一个
         // 没被引用的文件，不会让 Codex 拿到悬空指针
@@ -555,7 +735,7 @@ fn import_to_files(
         let _ = fs::remove_file(&catalog_file);
     }
 
-    let auth_file = auth_path(&dir);
+    let auth_file = auth_path(dir);
     let mut auth = read_auth(&auth_file)?;
     let auth_written = merge_auth_key(&mut auth, api_key);
     if auth_written {
@@ -670,7 +850,8 @@ fn scan_files(port: Option<u16>, api_key: Option<&str>) -> CodexScan {
 }
 
 /// 从 Codex 配置里移除指向本应用的 provider（含顶层选择与 auth.json 里的密钥）。
-/// 返回是否确有移除，以及移除那一刻 Codex 桌面应用在不在跑 ——
+/// 有接管前的快照时**整份还原**（见模块注释），没有则逐键删除。
+/// 返回是否确有改动、是否走了「还原」，以及那一刻 Codex 桌面应用在不在跑 ——
 /// 跑着才需要重启确认。指向其它服务的配置一概不动。
 #[tauri::command]
 pub async fn k2a_codex_remove(state: State<'_, KiroProxyState>) -> Result<CodexRemoveOutcome, String> {
@@ -680,19 +861,39 @@ pub async fn k2a_codex_remove(state: State<'_, KiroProxyState>) -> Result<CodexR
     let api_key = current_api_key(&state)
         .ok_or_else(|| "还没有代理密钥，无法识别要移除的密钥".to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
-        let removed = remove_from_files(port, &api_key)?;
+        let (removed, restored) = remove_from_files(port, &api_key)?;
         let codex_running = codex_app_running();
-        Ok(CodexRemoveOutcome { removed, codex_running })
+        Ok(CodexRemoveOutcome {
+            removed,
+            restored,
+            codex_running,
+        })
     })
     .await
     .map_err(|e| format!("移除任务失败: {e}"))?
 }
 
-fn remove_from_files(port: u16, api_key: &str) -> Result<bool, String> {
+fn remove_from_files(port: u16, api_key: &str) -> Result<(bool, bool), String> {
     let dir = codex_dir()?;
-    let config_file = config_path(&dir);
+    remove_from_dir(&dir, &backup_root(), port, api_key)
+}
+
+fn remove_from_dir(
+    dir: &Path,
+    backup: &Path,
+    port: u16,
+    api_key: &str,
+) -> Result<(bool, bool), String> {
+    // 接管前的快照还在：整份放回去。「删掉我们的键」只够让 Codex 回落到内置
+    // openai，够不上用户点「取消接管」时想要的那个「还原」
+    if restore_from_backup(backup, dir, api_key)? {
+        return Ok((true, true));
+    }
+
+    // 没有快照（本次改动之前就接管过的）：退回逐键删除，至少不留悬空配置
+    let config_file = config_path(dir);
     let mut doc = read_config(&config_file)?;
-    let auth_file = auth_path(&dir);
+    let auth_file = auth_path(dir);
     let mut auth = read_auth(&auth_file)?;
     let (config_changed, auth_changed, catalog_removed) =
         remove_from_parts(&mut doc, &mut auth, port, api_key);
@@ -707,9 +908,9 @@ fn remove_from_files(port: u16, api_key: &str) -> Result<bool, String> {
         )?;
     }
     if catalog_removed {
-        let _ = fs::remove_file(catalog_path(&dir));
+        let _ = fs::remove_file(catalog_path(dir));
     }
-    Ok(config_changed || auth_changed || catalog_removed)
+    Ok((config_changed || auth_changed || catalog_removed, false))
 }
 
 #[cfg(test)]
@@ -1180,9 +1381,173 @@ base_url = "https://elsewhere.example/v1"
         assert!(parsed.get("model").is_none());
     }
 
+    /// 一次接管的临时现场：(Codex 配置目录, 快照目录)。
+    fn takeover_dirs(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("k2a-codex-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let codex = base.join("codex");
+        fs::create_dir_all(&codex).unwrap();
+        (codex, base.join("backup"))
+    }
+
+    /// 用户接管前就存在的一份配置：别的中转 + 注释 + 自己的选型。
+    const ORIGINAL_CONFIG: &str = r#"# 我的 Codex 配置
+model = "gpt-5.3"
+model_provider = "relay"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+"#;
+
     #[test]
-    fn atomic_write_round_trip() {
-        let dir = std::env::temp_dir().join(format!("k2a-codex-test-{}", std::process::id()));
+    fn clear_restores_the_whole_config_from_before_takeover() {
+        let (dir, backup) = takeover_dirs("restore");
+        fs::write(config_path(&dir), ORIGINAL_CONFIG).unwrap();
+        fs::write(
+            auth_path(&dir),
+            json!({ "tokens": { "access_token": "chatgpt" } }).to_string(),
+        )
+        .unwrap();
+
+        import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
+        let taken = fs::read_to_string(config_path(&dir)).unwrap();
+        assert!(taken.contains(&format!("[model_providers.{PROVIDER_ID}]")));
+        assert!(taken.contains("k2a-1") || taken.contains(CATALOG_FILENAME));
+
+        let (removed, restored) = remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
+        assert!(removed && restored);
+        // 整份一致：顶层选型、别家中转、注释都在
+        assert_eq!(fs::read_to_string(config_path(&dir)).unwrap(), ORIGINAL_CONFIG);
+        // 密钥：接管前没有 → 把我们写进去的删掉，ChatGPT token 原样留着
+        let auth: Value =
+            serde_json::from_str(&fs::read_to_string(auth_path(&dir)).unwrap()).unwrap();
+        assert!(auth.get("OPENAI_API_KEY").is_none());
+        assert_eq!(auth["tokens"]["access_token"], "chatgpt");
+        // 我们写的目录文件不该留下孤儿
+        assert!(!catalog_path(&dir).exists());
+        // 快照用完即弃
+        assert!(!backup_meta_path(&backup).exists());
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn clear_restores_user_own_api_key() {
+        let (dir, backup) = takeover_dirs("authkey");
+        fs::write(config_path(&dir), ORIGINAL_CONFIG).unwrap();
+        fs::write(
+            auth_path(&dir),
+            json!({ "OPENAI_API_KEY": "sk-user-own", "tokens": { "a": 1 } }).to_string(),
+        )
+        .unwrap();
+
+        import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
+        let taken: Value =
+            serde_json::from_str(&fs::read_to_string(auth_path(&dir)).unwrap()).unwrap();
+        assert_eq!(taken["OPENAI_API_KEY"], "k2a-1");
+
+        remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(auth_path(&dir)).unwrap()).unwrap();
+        // 用户自己的密钥必须还回来（不能因为我们清空就把它删了）
+        assert_eq!(after["OPENAI_API_KEY"], "sk-user-own");
+        assert_eq!(after["tokens"]["a"], 1);
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn reapplying_takeover_keeps_the_original_snapshot() {
+        let (dir, backup) = takeover_dirs("reapply");
+        fs::write(config_path(&dir), ORIGINAL_CONFIG).unwrap();
+        import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
+        // 第二次点「应用」：配置里已经是我们的内容，快照不能被它覆盖
+        import_to_dir(
+            &dir,
+            &backup,
+            BASE_URL,
+            "k2a-1",
+            &["gpt-5.2".to_string(), "gpt-5.3-codex".to_string()],
+        )
+        .unwrap();
+        remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
+        assert_eq!(fs::read_to_string(config_path(&dir)).unwrap(), ORIGINAL_CONFIG);
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn clear_removes_config_and_auth_we_created_from_nothing() {
+        let (dir, backup) = takeover_dirs("fresh");
+        // 接管前：没有 config.toml，也没有 auth.json
+        import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
+        assert!(config_path(&dir).is_file());
+        assert!(auth_path(&dir).is_file());
+
+        let (removed, restored) = remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
+        assert!(removed && restored);
+        // 还回「不存在」，而不是留两份空文件
+        assert!(!config_path(&dir).exists());
+        assert!(!auth_path(&dir).exists());
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn clear_without_snapshot_falls_back_to_key_removal() {
+        // 本次改动之前就接管过的用户：没有快照，退回逐键删除（至少不留悬空配置）
+        let (dir, backup) = takeover_dirs("nosnapshot");
+        let mut doc: DocumentMut = ORIGINAL_CONFIG.parse().unwrap();
+        import_into_document(&mut doc, BASE_URL, &["gpt-5.2".to_string()]);
+        fs::write(config_path(&dir), doc.to_string()).unwrap();
+        fs::write(auth_path(&dir), json!({ "OPENAI_API_KEY": "k2a-1" }).to_string()).unwrap();
+
+        let (removed, restored) = remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
+        assert!(removed);
+        assert!(!restored, "没有快照时不能说成「已还原」");
+        let parsed: DocumentMut =
+            fs::read_to_string(config_path(&dir)).unwrap().parse().unwrap();
+        assert!(parsed.get("model_provider").is_none());
+        assert!(parsed["model_providers"].get(PROVIDER_ID).is_none());
+        // 但没快照就没有旧值可放回：顶层 model 是删掉而不是还原成 gpt-5.3
+        assert!(parsed.get("model").is_none());
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn broken_snapshot_falls_back_to_key_removal() {
+        let (dir, backup) = takeover_dirs("brokensnap");
+        fs::write(config_path(&dir), ORIGINAL_CONFIG).unwrap();
+        import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
+        // 快照里的 config.toml 丢了（磁盘问题、被清理工具删掉…）
+        fs::remove_file(backup_config_path(&backup)).unwrap();
+
+        let (removed, restored) = remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
+        assert!(removed);
+        assert!(!restored);
+        let parsed: DocumentMut =
+            fs::read_to_string(config_path(&dir)).unwrap().parse().unwrap();
+        assert!(parsed.get("model_provider").is_none());
+        // 残档必须丢掉：留着它会让下一次接管跳过快照，永远没有还原点
+        assert!(!backup_meta_path(&backup).exists());
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn snapshot_skips_when_backup_dir_already_has_meta() {
+        let (dir, backup) = takeover_dirs("snaponce");
+        fs::write(config_path(&dir), ORIGINAL_CONFIG).unwrap();
+        assert!(snapshot_before_takeover(&backup, &dir).unwrap());
+        // 中间用户改了配置，再拍一次不该覆盖第一份
+        fs::write(config_path(&dir), "model = \"changed\"\n").unwrap();
+        assert!(!snapshot_before_takeover(&backup, &dir).unwrap());
+        assert_eq!(
+            fs::read_to_string(backup_config_path(&backup)).unwrap(),
+            ORIGINAL_CONFIG
+        );
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn atomic_write_round_trip() {        let dir = std::env::temp_dir().join(format!("k2a-codex-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         write_atomic(&path, "a = 1\n").unwrap();
