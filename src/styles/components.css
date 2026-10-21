@@ -1,45 +1,57 @@
 /* 组件层：按钮、卡片、徽标、键值行、表单、提示条、空态、浮层提示。
    只放「在多个分区里重复出现」的东西；只服务某一个分区的（.proto / .meter / .dir-tile）
-   放在 views.css，免得组件层变成一个什么都往里塞的杂物间。 */
+   放在 views.css，免得组件层变成一个什么都往里塞的杂物间。
+
+   ⚠️ 改这里的 hover / active 规则前先看一眼文件顶部那条通用按钮规则的特异性：
+   `button:hover:not(:disabled):not([aria-disabled='true'])` 是 (0,3,1)。
+   任何写在别处、特异性低于它的类选择器写法（`.xxx:hover`，0,2,0）都会被它压掉，
+   表现是「样式写了但没生效」。要覆盖就照抄同样的限定把特异性抬到 (0,4,0) 以上。 */
 
 /* ── 按钮 ─────────────────────────────────────────────────────────────
-   主 CTA 保持 8px 圆角（工业感来自克制的圆角），胶囊只留给徽标 / chip / 开关这类次级控件。 */
+   32px 高（5 + 20 + 5 + 2）、10px 圆角、白底 + 一档极淡投影：默认状态下按钮
+   「微微浮在纸面上」，按压时投影收掉、底色下沉，给出物理感。
+   主 CTA 不用更大的圆角 —— 圆角在这里是控件尺寸的语言，不是装饰。 */
 button {
   cursor: pointer;
   border-radius: var(--r-md);
   border: 1px solid var(--hairline-strong);
   background: var(--surface-1);
   color: var(--ink);
-  padding: 5px 12px;
+  padding: 5px 13px;
   font-size: var(--t-body);
+  box-shadow: var(--shadow-xs);
   transition:
     background var(--dur) var(--ease),
     border-color var(--dur) var(--ease),
     color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease),
     opacity var(--dur) var(--ease);
 }
 
 /* 两种「不可用」要分开表达：
 
    * `:disabled` —— 这颗按钮自己现在没有可做的事（没地址可复制、代理没在运行），
-     或者它自己正在跑。
-     连 click 都不派发，静默即可，因为原因就写在同一个卡片里 / 它自己的文案上。
+     或者它自己正在跑。连 click 都不派发，静默即可，因为原因就写在同一个卡片里 /
+     它自己的文案上。
    * `[aria-disabled='true']` —— 因为别处正在忙而暂时不能做。它**必须**接得住点击，
      好让状态层回一句「正在 X，请稍候」（见 ui/shared/render.ts 的 actionAttrs）。
      观感与真禁用一致，但不给任何 hover / active 反馈，免得看着像能点。 */
 button:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--surface-2);
+  background: var(--surface-hover);
   border-color: var(--hairline-tertiary);
+  box-shadow: var(--shadow-sm);
 }
 
 button:active:not(:disabled):not([aria-disabled='true']) {
   background: var(--surface-3);
+  box-shadow: none;
 }
 
 button:disabled,
 button[aria-disabled='true'] {
-  opacity: 0.45;
+  opacity: 0.42;
   cursor: not-allowed;
+  box-shadow: none;
 }
 
 button.primary {
@@ -47,38 +59,45 @@ button.primary {
   border-color: var(--primary);
   color: #fff;
   font-weight: 550;
+  box-shadow: var(--shadow-primary);
 }
 button.primary:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--primary-hover);
   border-color: var(--primary-hover);
+  box-shadow: var(--shadow-primary);
 }
 button.primary:active:not(:disabled):not([aria-disabled='true']) {
   background: var(--primary-active);
   border-color: var(--primary-active);
+  box-shadow: none;
 }
 
 button.danger {
   color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 38%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 34%, transparent);
 }
 button.danger:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--danger-soft);
-  border-color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 60%, transparent);
+  color: var(--danger);
 }
 
 button.small {
-  padding: 3px 9px;
+  padding: 3px 10px;
   font-size: var(--t-small);
+  border-radius: var(--r-sm);
 }
 
 button.ghost {
   border-color: transparent;
   background: transparent;
   color: var(--ink-muted);
+  box-shadow: none;
 }
 button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--surface-2);
-  border-color: var(--hairline);
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .btn-row {
@@ -86,6 +105,31 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
   align-items: center;
   flex-wrap: wrap;
   gap: var(--s-xs);
+}
+
+/* 会换文案的按钮内容（「启动代理」↔「启动中…」、「复制」↔「已复制」）。
+ *
+ * 两段文字叠在同一个网格单元里，只让当前那份可见 —— 按钮宽度恒等于较宽的一份，
+ * 换文案时不会让整排按钮左右挪动。不写死像素：字号、缩放、系统字体变了都还成立。
+ * 藏起来的那份是 `visibility: hidden`（不是 `display: none`），它照样参与宽度计算。
+ *
+ * ⚠️ 网格容器是**按钮自己**，不是按钮内部的某个 wrapper。
+ * 内部套一个 `inline-grid` 时，它的行内基线会把按钮撑高 1.7px（27.4 → 29.1），
+ * 于是「会换文案的按钮」比同一排其它按钮高出一圈 —— 抖动只是换了个地方。
+ * 让按钮成为网格，高度仍由 `padding + 一行文本` 决定，与普通按钮完全一致。 */
+button:has(> .swap-alt) {
+  display: inline-grid;
+  place-items: center;
+}
+
+button > .swap-label,
+button > .swap-alt {
+  grid-area: 1 / 1;
+  white-space: nowrap;
+}
+
+.swap-alt {
+  visibility: hidden;
 }
 
 /* 同一行里的间隔符：把「间距靠 gap」这件事表达清楚，不靠给某个按钮加 margin */
@@ -105,23 +149,30 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
 }
 
 /* ── 卡片 ─────────────────────────────────────────────────────────────
-   卡片自身是 flex 列 + 统一 gap：内部各块之间的间距只在一个地方定义，
-   免得每个视图各写一遍「这个 note 加 10px、那个加 14px」。
-   层级完全靠 surface + 发丝边框表达，不加投影。 */
+   白底 + 18px 圆角 + 一档柔和投影，坐在灰画布上。卡片内部是 flex 列 + 统一 gap：
+   内部各块之间的间距只在这一个地方定义，免得每个视图各写一遍「这个 note 加 10px」。
+   边框留着但极淡 —— 它只在阴影落到和画布同色的边缘上时兜一下轮廓。 */
 .card {
   display: flex;
   flex-direction: column;
-  gap: var(--s-sm);
+  gap: 14px;
   background: var(--surface-1);
   border: 1px solid var(--hairline);
-  border-radius: var(--r-lg);
-  padding: var(--s-md);
+  border-radius: var(--r-xl);
+  padding: 20px;
+  box-shadow: var(--shadow-card);
+  /* 卡片宽度随栅格走（两列时约 350px、整宽时 700px 以上），kv 该用几列取决于它
+     而不是取决于窗口 —— 所以这里开一个 inline-size 容器，让下面的 @container 有依据。
+     只隔离宽度，不影响高度：卡片的高度仍然由内容决定。 */
+  container-type: inline-size;
 }
 
+/* 卡头给一个最小高度：只有标题的卡头与带按钮的卡头高度一致，两列并排时标题对得齐 */
 .card-head {
   display: flex;
   align-items: center;
-  gap: var(--s-xs);
+  gap: 10px;
+  min-height: 26px;
 }
 
 .card-title {
@@ -143,12 +194,13 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
 
 /* 动作行：用一条发丝线把它和上面的信息分开，形成「读 → 做」的两段 */
 .card-actions {
-  padding-top: var(--s-sm);
+  padding-top: var(--s-md);
   border-top: 1px solid var(--hairline);
 }
 
+/* 危险分区：边框染一点红，阴影保持中性（彩色阴影在浅色底上会显脏） */
 .card-danger {
-  border-color: color-mix(in srgb, var(--danger) 24%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 22%, transparent);
 }
 
 /* ── 状态徽标 ─────────────────────────────────────────────────────── */
@@ -174,7 +226,7 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
 .pill.ok {
   color: var(--success);
   background: var(--success-soft);
-  border-color: color-mix(in srgb, var(--success) 26%, transparent);
+  border-color: color-mix(in srgb, var(--success) 18%, transparent);
 }
 .pill.off {
   color: var(--ink-muted);
@@ -184,37 +236,48 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
 .pill.warn {
   color: var(--warning);
   background: var(--warning-soft);
-  border-color: color-mix(in srgb, var(--warning) 26%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 18%, transparent);
 }
 .pill.err {
   color: var(--danger);
   background: var(--danger-soft);
-  border-color: color-mix(in srgb, var(--danger) 26%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 18%, transparent);
 }
 
-/* ── 提示条 ───────────────────────────────────────────────────────── */
+/* ── 提示条 ─────────────────────────────────────────────────────────
+   浅灰底 + 14px 圆角，不用左侧色条 —— 那是另一种设计语言，和圆角卡片放在一起
+   会显得像两个系统的拼盘。语义只靠底色与文字色表达。
+
+   页面级（直接挂在 .view-stack 下）的那几条坐在灰画布上，浅灰底会「消失」，
+   所以换成白底 + 一档投影 —— 它在页面里是一块独立的说明，不是某个卡片的注脚。 */
 .note {
-  padding: 9px 12px;
-  border-radius: var(--r-md);
+  padding: 11px 14px;
+  border-radius: var(--r-lg);
   border: 1px solid var(--hairline);
   background: var(--surface-2);
   color: var(--ink-muted);
   font-size: var(--t-small);
+  line-height: 1.6;
+}
+
+.view-stack > .note:not(.warn):not(.err):not(.ok) {
+  background: var(--surface-1);
+  box-shadow: var(--shadow-xs);
 }
 
 .note.warn {
   background: var(--warning-soft);
-  border-color: color-mix(in srgb, var(--warning) 28%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 22%, transparent);
   color: var(--warning);
 }
 .note.err {
   background: var(--danger-soft);
-  border-color: color-mix(in srgb, var(--danger) 28%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 22%, transparent);
   color: var(--danger);
 }
 .note.ok {
   background: var(--success-soft);
-  border-color: color-mix(in srgb, var(--success) 28%, transparent);
+  border-color: color-mix(in srgb, var(--success) 22%, transparent);
   color: var(--success);
 }
 
@@ -225,8 +288,10 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
 /* ── 键值信息行 ───────────────────────────────────────────────────── */
 .kv {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1fr);
-  gap: 6px var(--s-sm);
+  /* 84px：够放「当前版本 / 到期」这类四字标签，又不至于把两列的卡片挤成
+     「标签一栏、值一栏」—— 值那一侧常常是长地址或长日期，多给 12px 就少换一行。 */
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 9px var(--s-md);
   font-size: var(--t-body);
 }
 
@@ -245,11 +310,35 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
   word-break: break-all;
 }
 
+/* 窄卡片里的键值行改成「标签在上、值在下」。
+ *
+ * 两列并排时留给值的宽度只有 200 出头，日期后面跟一句「（剩余 59 分钟）」就会
+ * 断在「分 / 钟）」这种位置 —— 换一行看起来比挤成两行更难受。上下排之后值独占整宽，
+ * 一行放得下，标签也不再需要那个固定列宽。
+ *
+ * 阈值取 380px：概览页两列栅格下卡片约 353px，协议接入 / 应用更新那种整宽卡片
+ * 有 700px 以上，两种都落在预期的一侧。 */
+@container (max-width: 380px) {
+  .kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px 0;
+  }
+
+  .kv dt {
+    font-size: var(--t-caption);
+  }
+
+  /* 上下排时每组之间要拉开，否则四行读起来像一张表 */
+  .kv dd + dt {
+    margin-top: 6px;
+  }
+}
+
 /* ── 表单 ─────────────────────────────────────────────────────────── */
 .field {
   display: flex;
   flex-direction: column;
-  gap: var(--s-xxs);
+  gap: 6px;
   font-size: var(--t-caption);
   color: var(--ink-subtle);
 }
@@ -272,16 +361,21 @@ button.ghost:hover:not(:disabled):not([aria-disabled='true']) {
   gap: var(--s-md);
 }
 
+/* 输入框与自绘框共用一套尺寸，逐个数值核对过：
+   line-height 16 + 上下内边距 7×2 + 描边 1×2 = 32px 高。
+   改任何一项都要把这三处一起改（这里、`.ef-box`、以及 search 框的最小高度）。 */
 input[type='text'],
 input[type='number'],
 select {
-  padding: 5px 9px;
+  padding: 7px 11px;
   border-radius: var(--r-md);
   border: 1px solid var(--hairline-strong);
   background: var(--surface-1);
   color: var(--ink);
   font-family: var(--font-mono);
   font-size: var(--t-small);
+  line-height: 16px;
+  box-shadow: var(--shadow-xs);
   transition:
     border-color var(--dur) var(--ease),
     box-shadow var(--dur) var(--ease);
@@ -312,25 +406,26 @@ select:focus {
    `ui/shared/english-field.ts`，做法参考 market-monitor 桌面端的 EnglishField。
 
    皮肤刻意与 `input[type='text']` 逐项对齐（内边距、圆角、描边、底色、等宽字体、
-   字号、过渡、focus 环）：自绘的是行为，不该顺带换一副长相。行高与最小高度必须钉死 ——
-   空框里一个字都没有，不钉的话它会缩成两条内边距那么高。 */
+   字号、行高、投影、focus 环）：自绘的是行为，不该顺带换一副长相。行高与最小高度必须
+   钉死 —— 空框里一个字都没有，不钉的话它会缩成两条内边距那么高。 */
 .ef-box {
   display: block;
   position: relative;
-  padding: 5px 9px;
+  padding: 7px 11px;
   border-radius: var(--r-md);
   border: 1px solid var(--hairline-strong);
   background: var(--surface-1);
   color: var(--ink);
   font-family: var(--font-mono);
   font-size: var(--t-small);
-  line-height: 15px;
-  min-height: 27px; /* 15 + 5×2 + 1×2：与同字号的 input 同高 */
+  line-height: 16px;
+  min-height: 32px; /* 16 + 7×2 + 1×2：与同字号的 input 同高 */
   white-space: pre;
   overflow: hidden;
   cursor: text;
   user-select: none;
   -webkit-user-select: none;
+  box-shadow: var(--shadow-xs);
   transition:
     border-color var(--dur) var(--ease),
     box-shadow var(--dur) var(--ease);
@@ -352,7 +447,7 @@ select:focus {
 .ef-caret {
   display: none;
   width: 1px;
-  height: 14px;
+  height: 15px;
   vertical-align: text-bottom;
   background: currentColor; /* 跟随场景文字色 */
   pointer-events: none;
@@ -405,15 +500,15 @@ select:focus {
 }
 
 .switch input {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   accent-color: var(--primary);
   cursor: pointer;
 }
 
 /* ── 进度条 ───────────────────────────────────────────────────────── */
 .progress {
-  height: 5px;
+  height: 6px;
   border-radius: var(--r-pill);
   background: var(--surface-3);
   overflow: hidden;
@@ -422,21 +517,30 @@ select:focus {
 .progress-bar {
   height: 100%;
   width: 0;
+  border-radius: var(--r-pill);
   background: var(--primary);
   transition: width 0.2s var(--ease);
 }
 
-/* ── 发布说明（Markdown 轻量渲染） ────────────────────────────────── */
+/* ── 发布说明（Markdown 轻量渲染） ──────────────────────────────────
+   说明来自 GitHub Release，长度完全不可控（一条 hotfix 三行、一次大版本三十行）。
+   限高内滚：它坐在定高的更新卡片里，撑高一次就把版本号与按钮行推走一次。 */
 .notes {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
+  padding: 14px 16px;
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
   font-size: var(--t-small);
   color: var(--ink-muted);
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .notes-heading {
-  margin-top: 6px;
+  margin-top: 8px;
   font-weight: 620;
   color: var(--ink);
 }
@@ -446,7 +550,7 @@ select:focus {
 
 .notes-item {
   position: relative;
-  padding-left: 13px;
+  padding-left: 14px;
 }
 .notes-item::before {
   content: '·';
@@ -461,9 +565,9 @@ select:focus {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  padding: var(--s-lg) var(--s-md);
-  border-radius: var(--r-md);
+  gap: 8px;
+  padding: 26px var(--s-md);
+  border-radius: var(--r-lg);
   border: 1px dashed var(--hairline-strong);
   background: var(--surface-2);
   text-align: center;
@@ -472,16 +576,18 @@ select:focus {
 .empty-icon {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
+  width: 34px;
+  height: 34px;
+  margin-bottom: 2px;
   border-radius: var(--r-md);
   border: 1px solid var(--hairline);
   background: var(--surface-1);
   color: var(--ink-tertiary);
+  box-shadow: var(--shadow-xs);
 }
 .empty-icon .icon {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
 }
 
 .empty-title {
@@ -500,7 +606,7 @@ select:focus {
 #toast-host {
   position: fixed;
   left: 50%;
-  bottom: 42px;
+  bottom: 40px;
   transform: translateX(-50%);
   display: flex;
   flex-direction: column;
@@ -511,14 +617,14 @@ select:focus {
 }
 
 .toast {
-  padding: 7px 15px;
-  border-radius: var(--r-pill);
-  background: var(--ink);
+  padding: 9px 16px;
+  border-radius: 12px;
+  background: #1b1e27;
   color: #fff;
   font-size: var(--t-small);
   box-shadow: var(--shadow-pop);
   opacity: 0;
-  transform: translateY(6px);
+  transform: translateY(8px) scale(0.98);
   transition:
     opacity 0.18s var(--ease),
     transform 0.18s var(--ease);
@@ -533,10 +639,12 @@ select:focus {
   background: var(--danger);
 }
 
-/* ── 确认弹窗 ──────────────────────────────────────────────────────────
-   只用于「需要用户拍板」的场合（重启确认这类）；进度与结果一律走 toast 与
-   按钮原地状态，不进弹窗。层级压在 toast 之下：弹窗开着时如果又出了错误
-   提示，提示不该被遮住。 */
+/* ── 弹窗 ──────────────────────────────────────────────────────────────
+   两种用途，共用一层遮罩与同一副外形：
+   ① 确认弹窗（重启确认这类「需要用户拍板」的场合）；
+   ② 概览弹窗（可用模型 / 账户额度，见下方 `.modal-card.is-wide`）。
+   进度与结果一律走 toast 与按钮原地状态，不进弹窗。层级压在 toast 之下：
+   弹窗开着时如果又出了错误提示，提示不该被遮住。 */
 .modal-host {
   position: fixed;
   inset: 0;
@@ -550,39 +658,255 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(20, 22, 27, 0.32);
+  background: rgba(16, 24, 40, 0.34);
+  backdrop-filter: blur(3px);
   pointer-events: auto;
   animation: modal-fade var(--dur) var(--ease);
 }
 
 .modal-card {
-  width: min(400px, calc(100vw - 48px));
-  padding: var(--s-md) var(--s-md) var(--s-sm);
+  width: min(420px, calc(100vw - 48px));
+  padding: 22px 22px var(--s-md);
   background: var(--surface-1);
   border: 1px solid var(--hairline);
-  border-radius: var(--r-lg);
+  border-radius: var(--r-xl);
   box-shadow: var(--shadow-pop);
   animation: modal-in var(--dur) var(--ease);
 }
 
+/* 确认弹窗（目前只有「重启 Codex」）的文案有两种：写入后重启、清空后重启。
+   两句话字数接近但不相等，靠内容撑高会让同一块弹窗换个情形就矮一行。
+   给一个下限 + 把按钮行压到底，短的那句也落在同样的框里（空白在正文与按钮之间，
+   而不是按钮下面吊着一条）。 */
+.modal-card:not(.is-wide) {
+  display: flex;
+  flex-direction: column;
+  min-height: 200px;
+}
+
+.modal-card:not(.is-wide) .modal-actions {
+  margin-top: auto;
+}
+
 .modal-title {
-  font-size: var(--t-title);
-  font-weight: 600;
+  font-size: 15px;
+  font-weight: 620;
   color: var(--ink);
   margin-bottom: var(--s-xs);
 }
 
 .modal-text {
   font-size: var(--t-body);
-  line-height: 1.6;
+  line-height: 1.65;
   color: var(--ink-muted);
-  margin: 0 0 var(--s-sm);
+  margin: 0 0 var(--s-md);
 }
 
 .modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: var(--s-xs);
+}
+
+/* ── 概览弹窗（可用模型 / 账户额度）────────────────────────────────────
+   与确认弹窗共用 `.modal-card` 的外形（白底、18px 圆角、一档浮起阴影），
+   只是更宽、内容自己滚。三条结构约定：
+   ① 头部一行：图标 + 标题/说明 + 动作按钮 + 关闭。关闭按钮永远在最右，
+      **由外壳渲染**，弹窗自己不加 —— 位置与形状才不会各说各话。
+   ② 主体 `.modal-body` 是滚动容器；清单类弹窗（`.is-list`）改成「工具栏钉着、
+      只有清单滚」，否则搜索框会跟着模型一起滚出去。
+   ③ 宽度跟窗口走、高度封顶：模型多的时候在弹窗里滚，窗口本身不动。 */
+.modal-card.is-wide {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-md);
+  width: min(720px, calc(100vw - 64px));
+  /* 定高，而不是「封顶」。
+   *
+   * 这两个弹窗的内容都会因为用户操作整体换掉：搜索过滤（清单变短）、搜到空结果
+   * （换成空态）、同步完成（清单换新）、查询额度（空态 ↔ 用量条）。写 max-height 时
+   * 卡片跟着内容一起收缩 —— 在搜索框里敲一个字，整块弹窗就矮 47px，眼睛很难忽略。
+   * 高度定住之后，内容的涨落全部发生在卡内滚动区里。
+   *
+   * 460px 的取法：8 个模型是三行（134），加上工具栏、说明与脚注正好落在 400 上下，
+   * 再留一点余白；模型多时能显示约七行，再多的在卡内滚动。min() 兜住 520px 高的
+   * 最小窗口（78vh = 405），min-height 再兜一层极端情况。 */
+  height: min(78vh, 460px);
+  max-height: calc(100vh - 40px);
+  min-height: 300px;
+  padding: 20px 22px;
+}
+
+/* 「只有一块结论」的弹窗（账户额度）：矮一档，内容照样定高。
+   分档是为了不让用量条下面挂着大半屏空白 —— 定高不等于「一律很高」。 */
+.modal-card.is-wide.is-compact {
+  height: min(78vh, 380px);
+}
+
+/* 弹窗是程序化聚焦的容器（`tabindex="-1"`），不该在整块卡片外面画一圈 focus 环 */
+.modal-card:focus-visible {
+  outline: none;
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-sm);
+}
+
+/* 标题左侧的图标块：浅灰底 + 退一档的墨色。它只是定位用的锚点，
+   不表达状态，所以不用主色（主色在这套界面里专属于「选中」）。 */
+.modal-badge {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  color: var(--ink-subtle);
+}
+
+.modal-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* 弹窗比页面低一层：标题用 16px（视图标题是 24px），说明与卡片副标题同档 */
+.modal-card.is-wide .modal-title {
+  margin-bottom: 0;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.modal-desc {
+  margin: 0;
+  font-size: var(--t-small);
+  line-height: 1.6;
+  color: var(--ink-muted);
+}
+
+.modal-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  flex: none;
+}
+
+/* 关闭按钮：32px 见方，与头部那颗动作按钮同高；常态无底无边，悬停才浮出一档灰。
+   特异性 (0,4,1)：压过 components.css 顶部那条通用按钮 hover 规则。 */
+button.modal-close {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink-subtle);
+  box-shadow: none;
+}
+
+button.modal-close:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-2);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.modal-close .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-md);
+  /* 卡片定高后，主体吃掉标题与脚注之外的全部高度：内容少时留白落在主体里，
+     而不是让卡片自己缩回去。`min-height: 0` 是滚动容器能收缩的前提。 */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* 空态（还没有清单 / 还没查询过）在定高的主体里垂直居中。
+ *
+ * 不能给 `.modal-body` 写 `justify-content: center`：脚注有 `margin-top: auto`，
+ * auto margin 会先吃掉全部剩余空间，居中就失效了（实测空态仍然贴顶）。
+ * 改成让空态自己撑满剩余高度、在自己的框里居中 —— 工具栏贴顶、脚注贴底、
+ * 空态落在两者之间，正是想要的分层。 */
+.modal-body > .empty {
+  flex: 1 1 auto;
+  justify-content: center;
+  /* 撑满中间区之后就别再画那块虚线灰框了 —— 一块 300px 高的虚线框会把
+     「这里暂时没有内容」说成「这里坏了一个区块」。 */
+  border: 0;
+  background: transparent;
+}
+
+/* 清单类弹窗：工具栏与脚注钉住，只有模型网格滚（网格自带 overflow） */
+.modal-body.is-list {
+  overflow: hidden;
+}
+
+.modal-body.is-list > .model-card-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.modal-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+}
+
+/* 搜索框吃掉整行剩余宽度（`.filter-bar` 自己也是 flex 容器，撑开的是**它**，
+   不是里面那个框 —— 直接给 `.ef-box` 写 flex 在这里不管用）。计数因此被顶到右端。 */
+.modal-toolbar .filter-bar {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-count {
+  flex: none;
+  /* 固定宽度：计数文案在「共 26 个」与「3 / 26」之间切换，宽度差 12px，
+     会把左边的搜索框一起拉宽拉窄。定宽 + 右对齐之后，数字变了位置不动。
+     68px 够放「共 999 个」与「999 / 999」。 */
+  width: 68px;
+  text-align: right;
+  font-size: var(--t-caption);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-subtle);
+  white-space: nowrap;
+}
+
+/* 弹窗底部的脚注：一句「这些数字是怎么来的 / 点一下会怎样」。
+   用一条发丝线跟上面的正文分开，而不是套一个灰色的提示框 —— 框会跟卡片抢注意力。
+   `margin-top: auto` 把它压到卡片底部：卡片定高之后，内容少的弹窗（比如还没查询过额度）
+   否则会把脚注顶在中间，下面是空的。 */
+.modal-foot {
+  margin-top: auto;
+  padding-top: var(--s-sm);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--t-caption);
+  line-height: 1.7;
+  color: var(--ink-tertiary);
+}
+
+/* 已经出场过的弹窗：后续重绘不再播入场动画。
+ *
+ * 弹窗是每帧整块换 innerHTML 渲染的，节点一重建 CSS 动画就会重播 —— 在搜索框里敲一个字
+ * 都会让整块卡片从 `scale(0.98)` 重新长一次。由外壳在「同一弹窗的重绘」上加这个类，
+ * 只有真正打开的那一帧才播。 */
+.modal-backdrop.is-settled,
+.modal-card.is-settled {
+  animation: none;
 }
 
 @keyframes modal-fade {
@@ -594,6 +918,6 @@ select:focus {
 @keyframes modal-in {
   from {
     opacity: 0;
-    transform: translateY(6px) scale(0.98);
+    transform: translateY(10px) scale(0.98);
   }
 }

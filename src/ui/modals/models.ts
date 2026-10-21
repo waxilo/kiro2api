@@ -1,12 +1,12 @@
-// 可用模型：一份只读的清单，回答「这个账户能用哪些模型」，并支持搜索与点击复制。
+// 可用模型（概览弹窗）：一份只读的清单，回答「这个账户能用哪些模型」。
 //
 // 这里刻意**没有**模型选择器。本应用是代理服务，具体用哪个模型由客户端在每次请求里决定，
 // 应用不替用户挑，也不该让人以为存在一个全局的「当前模型」。
 // 所以卡上的动作是**复制**而不是选中 —— 用户拿到名字之后要做的下一件事，
 // 正是把它填进客户端的配置里；而「选中」在这里根本没有对应的语义。
 //
-// 卡形与三方接入同款（.model-card 网格）：一张卡一个模型，整卡可点，
-// 名字后面带上游消耗倍率（随同步给出，缺失就整体省略）。
+// 它现在是概览页「可用模型」那块指标卡点开的弹窗，不再是独立分区：这份清单是只读的数字，
+// 看一眼就关，为它单开一页会让用户看完还得自己点回概览。
 //
 // 同步走上游控制面，**不需要代理在运行** —— 只是「看看有哪些模型」而已，
 // 为它先启动一个监听端口、替用户向上游发请求，代价和收益完全不成比例。
@@ -14,18 +14,25 @@ import { esc } from '../../core/format';
 import { ACTION } from '../../state/actions';
 import { isPending } from '../../state/app-state';
 import { renderEnglishField } from '../shared/english-field';
-import { actionAttrs, emptyState, note, rateLabel } from '../shared/render';
-import type { ViewSpec } from './types';
+import { ICON } from '../shared/icons';
+import { actionAttrs, emptyState, rateLabel, swapLabel } from '../shared/render';
+import type { ModalSpec } from './types';
 
-export const modelsView: ViewSpec = {
+export const modelsModal: ModalSpec = {
   id: 'models',
-  label: '可用模型',
   title: '可用模型',
   desc: '当前 Kiro 账户可用的模型清单；具体用哪个由客户端在请求里指定，本应用不做选择',
+  icon: ICON.models,
+  variant: 'list',
 
   head: (state) => {
-    const label = isPending(state, ACTION.syncModels) ? '同步中…' : '从上游同步';
-    return `<button class="small" data-action="sync-models"${actionAttrs(state, ACTION.syncModels)}>${label}</button>`;
+    const pending = isPending(state, ACTION.syncModels);
+    // 「从上游同步」五字 ↔「同步中…」四字：宽度差 12px，而它紧挨着关闭按钮，
+    // 换文案会让右上角两个控件一起挪位。锁宽见 `swapLabel`。
+    return `<button class="small" type="button" data-action="sync-models"${actionAttrs(state, ACTION.syncModels)}>${swapLabel(
+      pending ? '同步中…' : '从上游同步',
+      pending ? '从上游同步' : '同步中…',
+    )}</button>`;
   },
 
   body: (state) => {
@@ -35,24 +42,25 @@ export const modelsView: ViewSpec = {
     const needle = query.toLowerCase();
     const shown = needle ? all.filter((id) => id.toLowerCase().includes(needle)) : all;
 
-    const inventory = `
-      <div class="card">
-        <div class="card-head">
-          <span class="card-title">可用模型</span>
-          <span class="card-head-spacer"></span>
-          <span class="card-sub">${countLabel(all.length, shown.length, query)}</span>
-        </div>
-        ${all.length ? filterBar(raw) : ''}
-        ${inventoryBody(shown, all.length, query, state.models?.rates ?? {})}
-      </div>`;
+    // 清单为空时不渲染工具栏：下面没有东西可筛，摆一个搜了也没用的输入框
+    // 只会让人怀疑是不是自己搜错了。空态自己会说下一步该做什么。
+    const toolbar = all.length
+      ? `
+        <div class="modal-toolbar">
+          ${filterBar(raw)}
+          <span class="modal-count">${countLabel(all.length, shown.length, query)}</span>
+        </div>`
+      : '';
 
-    return `
-      ${inventory}
-      ${note(
-        '点一下模型名即可复制，再把它填在客户端的配置里（例如 Claude Code 的 ' +
-          '<code>ANTHROPIC_MODEL</code>）；不填则由上游按账户情况自行选择。' +
-          '清单以套餐为准，套餐变化后重新同步即可。',
-      )}`;
+    const foot = all.length
+      ? `<div class="modal-foot">
+           点一下模型名即可复制，再把它填在客户端的配置里（例如 Claude Code 的
+           <code>ANTHROPIC_MODEL</code>）；不填则由上游按账户情况自行选择。
+           清单以套餐为准，套餐变化后重新同步即可。
+         </div>`
+      : '';
+
+    return `${toolbar}${inventoryBody(shown, all.length, query, state.models?.rates ?? {})}${foot}`;
   },
 };
 
@@ -64,9 +72,6 @@ function countLabel(total: number, matched: number, query: string): string {
 
 /**
  * 搜索框 + 清空按钮。
- *
- * 只在「真有清单」时才渲染 —— 空清单下面没有东西可筛，摆一个搜了也没用的输入框
- * 只会让人怀疑是不是自己搜错了。
  *
  * 框体是**自绘**的（`ui/shared/english-field.ts`）：不是 `<input>`，而是不可编辑的
  * `div[role="textbox"]`。为什么要这样折腾 —— 候选词框是操作系统输入法画的，只要焦点落在
@@ -108,7 +113,7 @@ function inventoryBody(shown: string[], total: number, query: string, rates: Rec
     </div>`;
 }
 
-/** 一张模型卡：与三方接入同款卡形 —— 整卡一颗按钮，这里是「点了复制名字」。 */
+/** 一张模型卡：整卡一颗按钮，这里是「点了复制名字」。 */
 function modelCard(model: string, rate: number | undefined): string {
   return (
     `<button class="model-card" type="button" data-action="copy-model"` +

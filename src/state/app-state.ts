@@ -20,25 +20,43 @@ export const VIEW_IDS = [
   'overview',
   'endpoints',
   'thirdparty',
-  'models',
-  'usage',
   'updates',
   'maintenance',
 ] as const;
 
 export type ViewId = (typeof VIEW_IDS)[number];
 
+/**
+ * 概览页弹窗的标识。
+ *
+ * 「可用模型」与「账户额度」曾经是两个独立分区，现在是概览页上两块指标卡点开的弹窗。
+ * 理由：它们是同一类东西 —— **只读的数字**，既不改配置也不产生动作分支，用户看它们
+ * 只为了回答「账上有什么、还剩多少」，看完就回去。为这类内容单开一个页面，等于把
+ * 「一眼就能看完的东西」摊成一屏，还要用户自己点回概览。放进弹窗之后，上下文（本地服务
+ * 跑没跑、接入地址是什么）仍然在旁边，看完关掉就回到了原来那一屏。
+ */
+export const MODAL_IDS = ['models', 'usage'] as const;
+
+export type ModalId = (typeof MODAL_IDS)[number];
+
 export interface AppState {
   /** 当前分区。 */
   view: ViewId;
+  /**
+   * 当前打开的概览弹窗；null = 没有弹窗。
+   *
+   * 弹窗状态进 store 而不是留在视图里，理由与 `modelFilter` 相同：视图是纯函数，
+   * 而且它必须能被「点一下打开」这个动作驱动（视图自己不接事件）。
+   */
+  modal: ModalId | null;
   status: ProxyStatus | null;
   access: ProxyAccess | null;
   models: ModelsState | null;
   /**
-   * 「可用模型」分区的搜索词。
+   * 「可用模型」弹窗的搜索词。
    *
    * 放在全局状态而不是视图内部，是因为视图是「状态进、HTML 出」的纯函数 —— 它没地方存东西。
-   * 写进 store 还有两个好处：后台推来新的模型清单时会连带重绘整个分区，过滤条件不会因此
+   * 写进 store 还有两个好处：后台推来新的模型清单时会连带重绘弹窗，过滤条件不会因此
    * 被悄悄清掉；以及它天然可以被测试当作一个普通状态来断言。
    *
    * 只是界面状态，不落盘：重开应用应该回到「看到全部模型」。
@@ -164,6 +182,7 @@ const INITIAL_UPDATE: UpdateState = {
 
 export const store = createStore<AppState>({
   view: 'overview',
+  modal: null,
   status: null,
   access: null,
   models: null,

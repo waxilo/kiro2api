@@ -189,7 +189,9 @@ export const updater = {
       if (inFlight) return inFlight;
     }
 
-    patch({ phase: 'checking', statusText: '正在检查更新…', error: null });
+    // 不带 statusText：卡头的 pill 在 checking 期间已经写着「检查中」，
+    // 区内再补一条「正在检查更新…」是同一句话说两遍。
+    patch({ phase: 'checking', statusText: null, error: null });
 
     inFlight = (async () => {
       try {

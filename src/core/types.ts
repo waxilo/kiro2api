@@ -110,8 +110,13 @@ export interface CodexImportSummary {
 
 /** `k2a_codex_remove` 的结果。 */
 export interface CodexRemoveResult {
-  /** 是否确有移除（指向其它服务的配置一概不动）。 */
+  /** 是否确有改动（指向其它服务的配置一概不动）。 */
   removed: boolean;
+  /**
+   * 是否走了「整份还原接管前配置」这条路。
+   * false = 没有接管时的快照（改动之前就接入过的），退回逐键删除。
+   */
+  restored: boolean;
   /** 移除那一刻 Codex 桌面应用在不在跑：跑着才需要重启确认。 */
   codexRunning: boolean;
 }

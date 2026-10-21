@@ -52,6 +52,9 @@ export const ICON = {
   /** 层级跳转：向右的尖角。 */
   chevron: svg('<path d="m6.4 3.8 4.2 4.2-4.2 4.2"/>'),
 
+  /** 关闭：弹窗右上角的叉。 */
+  close: svg('<path d="m4.4 4.4 7.2 7.2"/><path d="M11.6 4.4 4.4 11.6"/>'),
+
   /** 外链 / 打开。 */
   open: svg(`
     <path d="M9.4 2.8h3.8v3.8"/>
@@ -81,11 +84,5 @@ export const ICON = {
   openai: svg(
     '<path d="M8 1.9l5.3 3v6.2l-5.3 3-5.3-3V4.9z"/>' +
       '<circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none"/>',
-  ),
-
-  /** 终端 / 接入端点（地址展示行的左侧图标）。 */
-  terminal: svg(
-    '<rect x="2.4" y="3.2" width="11.2" height="9.6" rx="1.4"/>' +
-      '<path d="m4.8 6.4 2 1.8-2 1.8"/><path d="M8.4 10.4h3"/>',
   ),
 };

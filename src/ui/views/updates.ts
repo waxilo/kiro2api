@@ -11,6 +11,9 @@ import type { ViewSpec } from './types';
 function summary(state: AppState): { tone: Tone; label: string } {
   const update = state.update;
   if (update.phase === 'checking') return { tone: 'off', label: '检查中' };
+  // 检查失败不能报「已是最新」：那是「问过了、没有问题」，而这里根本没问成。
+  // 区块里那两条同义提示已经移除，这颗 pill 现在是唯一的状态出口，必须说准。
+  if (update.phase === 'error') return { tone: 'err', label: '检查失败' };
   if (update.available) return { tone: 'warn', label: '有新版本' };
   return { tone: 'ok', label: '已是最新' };
 }
@@ -106,11 +109,15 @@ export const updatesView: ViewSpec = {
     const downloading = update.phase === 'downloading';
     const busy = update.phase === 'checking' || downloading;
 
-    const upToDate =
-      !update.available && update.currentVersion && update.latestVersion && !update.error
-        ? note('已是最新版本。', 'ok')
+    // 结果区只放「pill 说不了的事」：进度、错误、发布说明。
+    // 「正在检查」「已是最新」这两个结论卡头那颗 pill 已经写了，区内再来一条
+    // 同义提示是同一句话说两遍 —— 用户读到的是噪音，不是信息。
+    const statusNote = update.statusText ? note(esc(update.statusText)) : '';
+    const errorNote = update.error ? note(esc(update.error), 'err') : '';
+    const notesBlock =
+      update.available && update.notes
+        ? `<div class="notes">${renderNotes(update.notes)}</div>`
         : '';
-
     const progressBlock = downloading
       ? `
         <div class="progress"><div class="progress-bar" style="width:${progress}%"></div></div>
@@ -121,6 +128,12 @@ export const updatesView: ViewSpec = {
               : ''
           }
         </div>`
+      : '';
+    // 无话可说时整块不渲染：定高区留着就是一片没有解释的空白（卡头已经说明了状态）。
+    // 一旦有内容，区仍按 128px 定高 —— 下载中 / 安装中 / 结果之间互相切换依旧不跳。
+    const stageItems = [statusNote, progressBlock, errorNote, notesBlock];
+    const stage = stageItems.some(Boolean)
+      ? `<div class="update-stage">${stageItems.join('')}</div>`
       : '';
 
     return `
@@ -134,22 +147,11 @@ export const updatesView: ViewSpec = {
           kv('当前版本', `<code>${esc(update.currentVersion || '—')}</code>`),
           kv('最新版本', `<code>${esc(update.latestVersion || '—')}</code>`),
         ])}
-        ${update.statusText ? note(esc(update.statusText)) : ''}
-        ${progressBlock}
-        ${upToDate}
-        ${update.error ? note(esc(update.error), 'err') : ''}
-        ${
-          update.available && update.notes
-            ? `<div class="notes">${renderNotes(update.notes)}</div>`
-            : ''
-        }
+        ${stage}
         <div class="btn-row card-actions">
           <button data-action="update-check" ${busy ? 'disabled' : ''}>重新检查</button>
-          ${
-            update.available && !downloading
-              ? '<button class="primary" data-action="update-install">下载并安装</button>'
-              : ''
-          }
+          <button class="primary" data-action="update-install"
+                  ${update.available && !downloading ? '' : ' disabled'}>下载并安装</button>
         </div>
       </div>
       ${sourceCard(state, busy)}`;

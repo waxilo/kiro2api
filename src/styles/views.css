@@ -1,12 +1,25 @@
 /* 分区视图专属样式：只服务某一个分区的结构放在这里（指标块 / 协议面板 / 用量条 / 目录块）。
    判断标准：只在「概览」「协议接入」「三方接入」「账户额度」「维护」其中一处出现的，就归这里；
-   在两处以上出现的（卡片、按钮、徽标、键值行）统一在 components.css。 */
+   在两处以上出现的（卡片、按钮、徽标、键值行）统一在 components.css。
+
+   视觉语言只有一句：**外层是白卡片，卡片里的子块是浅灰内嵌块**。
+   子块悬停时翻成白底 + 一档投影（「浮起来」），正好是白卡片的语言，层次不会打架。
+
+   ⚠️ 这里的 hover 规则同样受 components.css 顶部那条通用按钮规则 (0,3,1) 的压制，
+   凡是带 `button` 的块都把特异性抬到 (0,4,0) 以上（见每条规则的注释）。 */
 
 /* ── 通用：两列栅格（概览用） ─────────────────────────────────────── */
 .grid-2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--s-sm);
+  gap: var(--s-md);
+}
+
+/* 这一行的两张卡默认 stretch 等高，行高由较高的一张决定 —— 而「Kiro 凭据」有
+   两种态：可用时是两行键值，不可用时要写清「先登录、再重新检测」三步，两者差 60px。
+   凭据一恢复，下面那一行卡片就整体往上一跳。给一个下限，让两态都不低于它。 */
+.grid-2 > .card {
+  min-height: 190px;
 }
 
 /* ── 概览：指标块 ─────────────────────────────────────────────────── */
@@ -14,25 +27,40 @@
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--s-sm);
+  gap: var(--s-md);
 }
 
+/* 与 .card 同款的白底 / 圆角 / 投影 —— 指标块是「小卡片」，不是卡片里的子块 */
 .stat {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 1px;
-  padding: var(--s-sm) var(--s-md);
+  gap: 2px;
+  padding: 14px 18px;
   border: 1px solid var(--hairline);
-  border-radius: var(--r-lg);
+  border-radius: var(--r-xl);
   background: var(--surface-1);
+  box-shadow: var(--shadow-card);
   text-align: left;
+  transition:
+    background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease),
+    transform var(--dur) var(--ease);
 }
 
-/* 可点的指标块整块是按钮：鼠标悬停给出「这里能进去」的信号，箭头才浮出来 */
-.stat.is-link:hover:not(:disabled) {
-  background: var(--surface-hover);
+/* 可点的指标块整块是按钮：悬停时抬 1px + 阴影加深，箭头才浮出来。
+   特异性 (0,4,0)，刻意压过通用按钮规则。 */
+.stat.is-link:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-1);
   border-color: var(--hairline-tertiary);
+  box-shadow: var(--shadow-raise);
+  transform: translateY(-1px);
+}
+
+.stat.is-link:active:not(:disabled):not([aria-disabled='true']) {
+  transform: none;
+  box-shadow: var(--shadow-card);
 }
 
 .stat-label {
@@ -50,7 +78,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   /* 值都是短 token（数量 / 百分比），收紧一点更紧凑；这一格不会出现中文长句 */
-  letter-spacing: -0.2px;
+  letter-spacing: -0.3px;
 }
 
 .stat-hint {
@@ -61,7 +89,7 @@
 .stat-arrow {
   position: absolute;
   top: 50%;
-  right: 10px;
+  right: 14px;
   display: grid;
   place-items: center;
   color: var(--ink-tertiary);
@@ -85,7 +113,7 @@
 .endpoint-list {
   display: flex;
   flex-direction: column;
-  gap: var(--s-xs);
+  gap: 10px;
 }
 
 .endpoint-row {
@@ -97,16 +125,17 @@
 
 .endpoint-name {
   flex: none;
-  width: 72px;
+  width: 76px;
   font-size: var(--t-caption);
   color: var(--ink-subtle);
 }
 
+/* 内嵌的只读地址条：浅灰底、圆角、等宽 —— 不做成输入框的样子，它不能改 */
 .endpoint-url {
   flex: 1;
   min-width: 0;
-  padding: 4px 8px;
-  border: 1px solid var(--hairline);
+  padding: 6px 10px;
+  border: 1px solid transparent;
   border-radius: var(--r-sm);
   background: var(--surface-2);
   font-size: var(--t-small);
@@ -120,55 +149,57 @@
   color: var(--ink-tertiary);
 }
 
-/* ── 协议接入：协议模块 ─────────────────────────────────────────────
-   标题 + 低饱和度计数标签 + 一句说明，下面是两张独立的白色协议卡片。
-   卡内五段（标题行 / 地址 / 客户端标签 / 操作行）间距统一走 4px 栅格，
-   两张卡靠 grid-auto-rows: 1fr 强制同高，各段严格对齐。 */
-.proto-count {
-  padding: 2px 8px;
-  border-radius: var(--r-pill);
-  background: var(--surface-2);
-  font-size: var(--t-caption);
-  color: var(--ink-subtle);
+/* 窄卡片里换一种排法：协议名独占一行，地址拿到整宽。
+ *
+ * 两列栅格下这几条地址原本只剩 200 出头，`http://127.0.0.1:5680/anthropic` 会被
+ * 截成 `http://127.0.0.1:56…` —— 一个看不了全貌的地址等于没有。上下排之后地址
+ * 一行放得下，复制按钮也还贴在手边。（容器是 .card，见 components.css） */
+@container (max-width: 380px) {
+  .endpoint-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px var(--s-xs);
+    align-items: center;
+  }
+
+  .endpoint-name {
+    grid-column: 1 / -1;
+    width: auto;
+  }
 }
 
-.proto-intro {
-  margin-top: -6px;
-  font-size: var(--t-small);
-  color: var(--ink-muted);
-}
-
+/* ── 协议接入：协议块 ───────────────────────────────────────────────
+   一张白卡里放两块浅灰协议面板，每块只有两段：身份（图标 + 名称 / 路由）与
+   「地址条 + 复制地址」。这块显乱从来不是间距不够，而是盒子太多 —— 灰面板里套白底
+   地址条、地址条里再套图标、一排描边胶囊、三颗白底描边按钮。现在只剩两层。 */
 .proto-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-auto-rows: 1fr;
-  gap: var(--s-sm);
+  gap: var(--s-md);
 }
 
-/* 协议卡片：白底 + 发丝边框（层级靠 surface + 边框表达，不加投影）。
-   主题色只落在 36px 图标底和「运行中」徽标上，卡片本体保持中性。 */
+/* 协议面板：白卡里的一块浅灰底，无描边。
+   刻意不做整块 hover 反馈：这块本身不可点，能点的只有里面的按钮。整块跟着鼠标
+   翻白会让「哪里能点」失真，鼠标扫过时两张这么大的面板轮流闪一下也就是噪音。 */
 .proto {
   display: flex;
   flex-direction: column;
   gap: var(--s-sm);
   padding: var(--s-md);
-  border: 1px solid var(--hairline);
   border-radius: var(--r-lg);
-  background: var(--surface-1);
-  transition: border-color var(--dur) var(--ease);
+  background: var(--surface-2);
 }
 
-.proto:hover {
-  border-color: var(--hairline-strong);
-}
-
+/* 身份行：图标底 + 两行文字（名称 / 路由）。竖排而不是挤在一行 ——
+   `/openai/v1` 挨着名称排会读成名称的一部分，而它其实是「客户端该打哪个路径」。 */
 .proto-head {
   display: flex;
   align-items: center;
-  gap: var(--s-xs);
+  gap: 10px;
 }
 
-/* 36px 圆角方形图标底：两张卡片最快的视觉锚点 */
+/* 36px 圆角方形图标底：两张块最快的视觉锚点，也是唯一的主题色落点 */
 .proto-badge {
   display: grid;
   place-items: center;
@@ -176,25 +207,34 @@
   width: 36px;
   height: 36px;
   border-radius: var(--r-md);
-  background: color-mix(in srgb, var(--proto-color) 10%, transparent);
+  background: color-mix(in srgb, var(--proto-color) 11%, transparent);
   color: var(--proto-color);
 }
 
 .proto-badge .icon {
-  width: 19px;
-  height: 19px;
+  width: 18px;
+  height: 18px;
+}
+
+.proto-id {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
 }
 
 .proto-name {
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
-  color: var(--ink);
+  line-height: 1.35;
   letter-spacing: -0.1px;
+  color: var(--ink);
 }
 
 .proto-type {
   font-family: var(--font-mono);
   font-size: var(--t-caption);
+  line-height: 1.3;
   color: var(--ink-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -206,34 +246,34 @@
   margin-left: auto;
 }
 
-/* 地址展示区：不是输入框 —— 只读、浅灰底、等宽字体，长地址就地换行 */
+/* 地址与复制按钮同一行、同为 32px：把「要复制的值」和「复制它」放在一处，
+   省掉一整行按钮。宽度只给按钮，地址条吃掉剩余空间 —— 按钮换文案时宽度不变，
+   地址条也就不会被挤动。窄窗口整行换行，按钮落下一行。 */
+.proto-endpoint {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-xs);
+}
+
+/* 地址条：块里唯一一块白底，无描边 —— 底色差已经把它托起来了，再加一条线就是多余的边。
+   不放左侧图标：终端图标在「一个以 http 开头、等宽字体的字符串」旁边没有增加任何信息。 */
 .proto-url {
   display: flex;
   align-items: center;
-  gap: var(--s-xs);
-  min-height: 36px;
-  padding: 8px 10px;
-  border-radius: var(--r-md);
-  background: var(--surface-2);
-}
-
-.proto-url-icon {
-  display: grid;
-  place-items: center;
-  flex: none;
-  color: var(--ink-tertiary);
-}
-
-.proto-url-icon .icon {
-  width: 14px;
-  height: 14px;
+  flex: 1 1 200px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
 }
 
 .proto-url-text {
   min-width: 0;
   font-family: var(--font-mono);
   font-size: var(--t-small);
-  color: var(--ink-muted);
+  color: var(--ink);
   word-break: break-all;
 }
 
@@ -242,45 +282,31 @@
   color: var(--ink-tertiary);
 }
 
-/* 适用客户端：浅灰小胶囊，允许换行 */
-.proto-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-xxs);
-}
-
-.proto-tag {
-  padding: 2px 8px;
-  border-radius: var(--r-pill);
-  background: var(--surface-2);
-  font-size: var(--t-caption);
-  color: var(--ink-subtle);
-}
-
-/* 操作行：32px 控件高度、8px 间距，窄窗口自然换行 */
 .proto-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-xs);
+  flex: none;
 }
 
 .proto-actions button {
   height: 32px;
-  padding: 0 12px;
+  padding: 0 14px;
 }
 
-/* 「已复制」短暂替换文案：绿色描边告诉用户这次点成了，1.6s 后由状态层清掉 */
-.proto-actions button.is-copied {
-  border-color: color-mix(in srgb, var(--success) 38%, transparent);
+/* 「已复制」短暂替换文案：绿色告诉用户这次点成了，1.6s 后由状态层清掉。
+   带上 :hover 那一档，否则鼠标停在刚复制的按钮上时，悬停紫会把绿色盖回去。 */
+.proto-actions button.is-copied,
+.proto-actions button.is-copied:hover:not(:disabled):not([aria-disabled='true']) {
+  border-color: color-mix(in srgb, var(--success) 34%, transparent);
   background: var(--success-soft);
   color: var(--success);
+  box-shadow: none;
 }
 
 /* ── 账户额度：用量条 ─────────────────────────────────────────────── */
 .meter {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 9px;
 }
 
 .meter-head {
@@ -304,7 +330,7 @@
 }
 
 .meter-track {
-  height: 6px;
+  height: 8px;
   border-radius: var(--r-pill);
   background: var(--surface-3);
   overflow: hidden;
@@ -347,9 +373,9 @@
 }
 
 /* ── 可用模型：搜索过滤 ─────────────────────────────────────────────
-   输入框的基本外观（尺寸、发丝边框、等宽字体、focus 环）直接复用 components.css 里
-   `input[type='text']` 那条通用规则，这里只补两件它不知道的事：撑满卡片宽度、
-   给右端的清空按钮留出位置。 */
+   输入框的基本外观（尺寸、描边、等宽字体、投影、focus 环）直接复用 components.css 里
+   `input[type='text']` / `.ef-box` 那条通用规则，这里只补两件它不知道的事：
+   撑满卡片宽度、给右端的清空按钮留出位置。 */
 .filter-bar {
   position: relative;
   display: flex;
@@ -358,21 +384,19 @@
 /* 选择器带上 `.ef-box`：皮肤那半边在 components.css 里（同特异性、先加载），
    靠加载顺序压过去太脆，写实一点。 */
 .ef-box.filter-input {
-  /* 搜索框本体是自绘的 `.ef-box`（皮肤在 components.css，与同字号的 input 共用一套），
-     这里只补它在这块布局里该有的宽度。清空按钮压在右端，所以要留出它的宽度再加半个间隙 ——
+  /* 清空按钮压在右端，所以要留出它的宽度再加半个间隙 ——
      模型名很长，不留位置的话结尾几个字符会跑到按钮底下。 */
   flex: 1;
   min-width: 0;
-  padding-right: 28px;
+  padding-right: 32px;
 }
 
 /* 位置与尺寸写在基础规则里，**不**挂在 `:not(:disabled)` 上 ——
-   禁用态该只影响观感，不该把布局一起抽掉。压过通用 `button` 规则靠类选择器就够了
-   （0,1,1 > 0,0,1），需要再高一档的只有下面的 hover。 */
+   禁用态该只影响观感，不该把布局一起抽掉。压过通用 `button` 规则靠类选择器就够了。 */
 button.filter-clear {
   position: absolute;
   top: 50%;
-  right: 4px;
+  right: 6px;
   transform: translateY(-50%);
   display: flex;
   align-items: center;
@@ -386,37 +410,47 @@ button.filter-clear {
   color: var(--ink-subtle);
   font-size: 15px;
   line-height: 1;
+  box-shadow: none;
 }
 
 button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--surface-3);
   border-color: transparent;
   color: var(--ink);
+  box-shadow: none;
 }
 
 /* ── 维护：目录入口 ───────────────────────────────────────────────── */
 .dir-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--s-xs);
+  gap: 10px;
 }
 
+/* 卡片里的可点子块：浅灰底 → 悬停翻白 + 细边框 + 一档投影 */
 .dir-tile {
   display: flex;
   align-items: center;
-  gap: var(--s-xs);
+  gap: 10px;
   min-width: 0;
-  padding: 10px var(--s-sm);
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-md);
-  background: var(--surface-1);
+  padding: 11px 13px;
+  border: 1px solid transparent;
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
   color: var(--ink-muted);
   text-align: left;
+  box-shadow: none;
+  transition:
+    background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
 }
 
-.dir-tile:hover:not(:disabled) {
-  background: var(--surface-2);
-  border-color: var(--hairline-tertiary);
+/* 特异性 (0,4,0)：压过通用按钮规则 */
+.dir-grid .dir-tile:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-1);
+  border-color: var(--hairline-strong);
+  box-shadow: var(--shadow-xs);
 }
 
 .dir-icon {
@@ -468,90 +502,121 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
   opacity: 1;
 }
 
-/* ── 三方接入：页签 ─────────────────────────────────────────────────
-   浏览器页签的读法：横条 + 底边线，激活项有侧壁、底边开口与下方内容相连。
-   现在只有一个 WorkBuddy 页签，形制先立好，加客户端时不动布局。 */
+/* ── 三方接入：分段页签 ─────────────────────────────────────────────
+   上一版是浏览器页签（横条 + 底边线 + 激活项开口），那是把「网页」的形制搬进桌面应用；
+   这一版改成分段控件：白底胶囊容器里放一颗颗药丸，激活项是主色浅底。
+   它和左侧导航的激活态用的是同一套语言（浅主色底 + 主色字），全局只有一种「选中」表达。
+
+   `.view-stack` 是 flex 列、默认 stretch，所以必须显式不拉伸，否则它会横贯整页。 */
 .tabs {
   display: flex;
-  align-items: flex-end;
-  gap: var(--s-xxs);
-  border-bottom: 1px solid var(--hairline);
+  align-items: center;
+  gap: 2px;
+  width: fit-content;
+  align-self: flex-start;
+  padding: 3px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-xs);
 }
 
 .tab {
-  position: relative;
-  padding: 7px 14px 8px;
-  border: 1px solid transparent;
-  border-bottom: none;
-  border-radius: var(--r-md) var(--r-md) 0 0;
+  padding: 5px 14px;
+  border: 0;
+  border-radius: var(--r-md);
   background: transparent;
   color: var(--ink-muted);
   font-size: var(--t-small);
   font-weight: 500;
+  box-shadow: none;
 }
 
 .tab:hover:not(.is-active):not(:disabled):not([aria-disabled='true']) {
-  background: var(--surface-hover);
+  background: var(--surface-2);
   color: var(--ink);
+  box-shadow: none;
 }
 
-.tab.is-active {
-  border-color: var(--hairline);
-  background: var(--surface-1);
-  color: var(--ink);
+/* 激活项：`0,4,0`（`.tabs` 前缀）—— 悬停时不能被通用按钮规则改成灰底 */
+.tabs .tab.is-active,
+.tabs .tab.is-active:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--primary-soft);
+  color: var(--primary);
   font-weight: 600;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 14%, transparent);
 }
 
-/* 激活页签盖住横条的底边线：页签与内容「连着」靠这 1px 的开口 */
-.tab.is-active::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -1px;
-  height: 1px;
-  background: var(--surface-1);
-}
-
-/* ── 三方接入：模型卡片网格（勾选 = 写入，取消勾选 = 移除） ────────── */
+/* ── 三方接入 / 可用模型：模型卡片网格 ─────────────────────────────── */
 
 /* 网格容器同时是滚动区：模型多时在格子里滚，整页不动（见下方 :has 布局链） */
 .model-card-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 6px;
+  gap: var(--s-xs);
   /* 行数不足时贴顶排布：容器被布局链拉高后，卡片不该跟着摊开 */
   align-content: start;
   min-height: 0;
   /* 空间充裕时也别高过这个：大窗口里这一页不该被卡片撑满一整屏 */
-  max-height: 360px;
+  max-height: 380px;
   overflow-y: auto;
+  /* 滚动条出现时预留位置：模型多的页签与模型少的页签之间切换时，
+     滚动条一出现内容宽度就少 10px，每张卡的名字都会重排一次。 */
+  scrollbar-gutter: stable;
   /* 滚到头不再把滚动链传给整页 —— 格子里继续滚轮，页面不该跟着动 */
   overscroll-behavior: contain;
 }
 
-/* 一张模型卡就是一颗按钮：整卡可点，选中就是整卡的主色描边 + 底色。 */
+/* 三方接入的网格给一个高度下限。
+ *
+ * 两个页签的模型数不同（WorkBuddy 八条、Codex 只留 GPT 系三条），网格会从三行塌成
+ * 一行 —— 整张卡片跟着矮 95px，说明行与按钮全部上移一个身位。135px 是三行卡片的高度
+ * （39.4×3 + 8×2 = 134.2，留 0.8 的余量）：切换页签时卡片高度不动，少几个模型就少
+ * 几行，由空白补齐。弹窗里的同一张网格不受影响（`.modal-body.is-list > .model-card-list`
+ * 有更高特异性把 min-height 归零，那里由定高的弹窗自己兜底）。 */
+.view-stack .model-card-list {
+  min-height: 135px;
+}
+
+/* 一张模型卡就是一颗按钮：浅灰底 + 一档发丝描边，整卡可点。
+   描边不是必需的（底色差已经足够），但网格密集时它负责把每一格「切」出来 ——
+   没有它，同色底 + 8px 间缝看起来像一张表格的单元格，而不是一颗颗可点的卡。
+   勾选 = 主色浅底 + 主色描边（与导航、页签同一个「选中」语义）。 */
 .model-card {
   display: flex;
   align-items: center;
   gap: var(--s-xs);
   min-width: 0;
-  padding: 8px 10px;
+  padding: 9px 11px;
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
-  background: transparent;
+  background: var(--surface-2);
   color: var(--ink);
   text-align: left;
   font-family: var(--font-mono);
   font-size: var(--t-small);
+  box-shadow: none;
+  transition:
+    background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
 }
 
-.model-card:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--surface-hover);
+/* 特异性 (0,4,0)：压过通用按钮规则，悬停才能翻白。
+   这里**不做位移**：网格容器有 overflow（模型多时内滚），第一行上移 1px 会被裁掉，
+   而密集网格里 1px 抬升本来也看不出来 —— 换成「翻白 + 投影」已经足够表达可点。 */
+.model-card-list .model-card:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-1);
   border-color: var(--hairline-strong);
+  box-shadow: var(--shadow-xs);
 }
 
 .model-card.is-checked {
+  border-color: color-mix(in srgb, var(--primary) 55%, transparent);
+  background: var(--primary-soft);
+}
+
+.model-card-list .model-card.is-checked:hover:not(:disabled):not([aria-disabled='true']) {
   border-color: var(--primary);
   background: var(--primary-soft);
 }
@@ -579,19 +644,35 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
 /* 空态横跨整行，不然会被塞进一个格子里挤成一竖条 */
 .model-card-empty {
   grid-column: 1 / -1;
-  padding: var(--s-sm) 8px;
+  padding: var(--s-md) 8px;
   color: var(--ink-tertiary);
   font-size: var(--t-small);
 }
 
-/* 卡片底部的一行说明：与弹窗时代的 modal-hint 同一句职责，只是改住卡片里 */
-.wb-hint {
-  padding-top: var(--s-sm);
-  border-top: 1px solid var(--hairline);
-  font-size: var(--t-caption);
-  color: var(--ink-tertiary);
+/* 卡头计数：「共 8 个 · 已接入 3」和「共 3 个 · 已接入 1 · 当前 gpt-5.1-codex」
+   差着 100 多像素，而它右边紧跟着「恢复 / 清空 / 应用」三颗按钮 —— 不定宽的话，
+   切页签或改搜索词时三颗按钮会左右横移。
+   定宽 + 右对齐 + 省略号：按钮原地不动，完整内容写在 title 里。 */
+.card-sub.count {
+  flex: none;
+  width: 212px;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
+/* 卡片底部的一行说明：与弹窗时代的 modal-hint 同一句职责，只是改住卡片里。
+   两个客户端各有一段说明（各自讲清勾选与「应用」的后果），字数不完全一样，
+   但都占三行：给一个下限（14 内距 + 19×3 行），切换页签时这张卡不会因为说明少一行而矮 19px。 */
+.wb-hint {
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+  font-size: var(--t-caption);
+  line-height: 1.65;
+  color: var(--ink-tertiary);
+  min-height: 72px;
+}
 
 /* 页面级布局：三方接入页整页不滚动，模型多时只在卡片网格里滚。
    .view-body 平时是普通滚动容器（见 shell.css）；这里只对含卡片网格的页面
@@ -621,6 +702,30 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
 
 .view-body:has(.model-card-list) .card:has(.model-card-list) .model-card-list {
   flex: 1 1 auto;
+}
+
+/* ── 应用更新：结果区 ─────────────────────────────────────────────── */
+/* 「检查更新」是用户动作，结果的形态有好几种：下载中（进度条）/ 安装中 / 出错 /
+   有新版本（带发布说明）。每一种都让卡片长高一点，版本号与按钮行就被推下去一次 ——
+   用户读到的是「页面换了一张卡」，而不是「查到了结果」。
+   把这几块统一收进一个定高区：有结果时卡片高度一致，变的只有区内的内容。
+   没有结果可报（检查中 / 已是最新）时这块**整块不渲染** —— 那两个结论卡头的 pill
+   已经写了，留一块定高空白只会让卡片中间空出一个洞。 */
+.update-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  /* 128px：一条状态句（约 40）、或进度条 + 一行说明（约 50）、或四行发布说明；
+     再多就在区内滚。 */
+  height: 128px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+/* 进度条与它下面那行说明是一组，间距比 stage 的 10px 紧一档 */
+.update-stage .progress-caption {
+  margin-top: -4px;
 }
 
 /* ── 窄窗口：所有栅格落回单列 ─────────────────────────────────────── */

@@ -25,7 +25,7 @@ body {
   overflow: hidden;
 }
 
-/* 外壳三段式：标题栏 / 主区 / 状态栏。主区自己再分成导航与内容。 */
+/* 外壳三段式：标题栏 / 主区。主区自己再分成导航与内容。 */
 #app {
   height: 100%;
   display: flex;
@@ -82,10 +82,11 @@ code {
 }
 
 /* 可访问性基线：键盘聚焦才画环（鼠标点击不画）。
-   输入框的 focus 样式在 components.css 里用 box-shadow 单独处理，特异性更高。 */
+   输入框的 focus 样式在 components.css 里用 box-shadow 单独处理，特异性更高。
+   环留 2px 的 offset，在圆角卡片边缘上也不会贴死。 */
 :focus-visible {
   outline: 2px solid var(--primary-ring);
-  outline-offset: 1px;
+  outline-offset: 2px;
 }
 
 /* 兜底：万一还有没被 .osb-* 接管的可滚区域，也用自绘的细条，不落回系统样式。

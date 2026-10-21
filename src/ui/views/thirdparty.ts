@@ -72,7 +72,7 @@ function workbuddyPanel(state: AppState): string {
 }
 
 /**
- * Codex 面板：与 WorkBuddy 同一张卡形 —— 卡头（标题 · 计数 · 恢复 · 清空 ·
+ * Codex 面板：与 WorkBuddy 同一张卡形 —— 卡头（标题 · 计数 · 恢复 · 取消接入 ·
  * 应用），下面依次是搜索框、网格、说明行。
  *
  * 差异只在语义：WorkBuddy 勾的是自定义模型清单，Codex 勾的是 /model 选择器的
@@ -150,7 +150,7 @@ function codexCard(state: AppState): string {
         <div class="card-head"><span class="card-title">Codex 模型</span></div>
         ${emptyState(
           hasModels ? '清单里没有 GPT 系模型' : '还没有可用模型清单',
-          hasModels ? 'Codex 桌面端只支持 gpt- 开头的模型' : '先到「可用模型」分区从上游同步',
+          hasModels ? 'Codex 桌面端只支持 gpt- 开头的模型' : '先到概览页「可用模型」弹窗同步',
         )}
       </div>`;
   }
@@ -165,13 +165,11 @@ function codexCard(state: AppState): string {
       <div class="card-head">
         <span class="card-title">Codex 模型</span>
         <span class="card-head-spacer"></span>
-        <span class="card-sub">${countLabel(universe.length, shown.length, query, catalogIds.length, current)}</span>
+        ${countChip(countLabel(universe.length, shown.length, query, catalogIds.length, current))}
         <button class="small" type="button" data-action="codex-reset"` +
         `${dirty ? '' : ' disabled'} title="放弃未应用的勾选，恢复当前配置">恢复</button>
-        ${imported
-          ? `<button class="small" type="button" data-action="codex-remove"` +
-            `${actionAttrs(state, ACTION.codexRemove)}>清空</button>`
-          : ''}
+        <button class="small" type="button" data-action="codex-remove"` +
+        `${imported ? ` title="还原接管前的 Codex 配置，并移除指向本应用的条目"${actionAttrs(state, ACTION.codexRemove)}` : ' disabled'}>取消接入</button>
         <button class="small primary" type="button" data-action="codex-apply"` +
         `${!dirty && (checked.size === 0 || (imported && keyOk && active)) ? ' disabled' : ''}` +
         `${!dirty && checked.size === 0 ? ' title="先勾选要接入的模型"' : ''}${actionAttrs(state, ACTION.codexApply)}>应用</button>
@@ -204,6 +202,7 @@ function codexCard(state: AppState): string {
             ).join('')
           : `<div class="model-card-empty">没有匹配「${esc(query)}」的模型，换个关键词试试</div>`}
       </div>`}
+      <div class="wb-hint">勾选写入 Codex 的模型目录（kiro2api-model-catalog.json），点「应用」一次生效；「取消接入」把 config.toml 还原成接管前的样子并移除指向本应用的条目；「恢复」放弃未应用的改动。Codex 只在启动时读一次配置，应用之后要重启才认得新目录</div>
     </div>`;
 }
 
@@ -246,7 +245,7 @@ function modelsCard(state: AppState): string {
     return `
       <div class="card">
         <div class="card-head"><span class="card-title">WorkBuddy 模型</span></div>
-        ${emptyState('还没有可用模型清单', '先到「可用模型」分区从上游同步')}
+        ${emptyState('还没有可用模型清单', '先到概览页「可用模型」弹窗同步')}
       </div>`;
   }
 
@@ -269,13 +268,11 @@ function modelsCard(state: AppState): string {
       <div class="card-head">
         <span class="card-title">WorkBuddy 模型</span>
         <span class="card-head-spacer"></span>
-        <span class="card-sub">${countLabel(universe.length, shown.length, query, importedIds.length)}</span>
+        ${countChip(countLabel(universe.length, shown.length, query, importedIds.length))}
         <button class="small" type="button" data-action="workbuddy-reset"` +
         `${dirty ? '' : ' disabled'} title="放弃未应用的勾选，恢复当前配置">恢复</button>
-        ${importedIds.length
-          ? `<button class="small" type="button" data-action="workbuddy-clear"` +
-            `${actionAttrs(state, ACTION.workbuddyClear)}>清空</button>`
-          : ''}
+        <button class="small" type="button" data-action="workbuddy-clear"` +
+        `${importedIds.length ? actionAttrs(state, ACTION.workbuddyClear) : ' disabled'}>清空</button>
         <button class="small primary" type="button" data-action="workbuddy-apply"` +
         `${dirty ? '' : ' disabled'}${actionAttrs(state, ACTION.workbuddyApply)}>应用</button>
       </div>
@@ -335,6 +332,19 @@ function modelCard(model: string, checked: boolean, keyOk: boolean, known: boole
 }
 
 /**
+ * 卡头的计数块。
+ *
+ * 定宽（`.card-sub.count`）+ 右对齐：内容里含「当前 <模型名>」，长短随模型名变化，
+ * 而它右边紧跟着「恢复 / 取消接入 / 应用」三颗按钮 —— 不定宽的话，切页签或改搜索词时
+ * 这三颗按钮会整体左右横移。完整内容写在 `title` 里，放不下时省略号收尾。
+ *
+ * 顺手转义：模型名来自上游清单与本地配置文件，不保证只有字母数字。
+ */
+function countChip(label: string): string {
+  return `<span class="card-sub count" title="${esc(label)}">${esc(label)}</span>`;
+}
+
+/**
  * 卡头的计数：没搜索时是总数，搜索时是「命中 / 总数」；两种都带上已接入数。
  * Codex 的目录是我们的才带上 Codex 当前选中的模型（与 WorkBuddy 共用，多传这一个参数）。
  */
@@ -351,8 +361,8 @@ function countLabel(
 }
 
 /**
- * Codex 重启确认弹窗。Codex 只在启动时读一次配置，应用 / 清空后的变更要重启
- * 才生效 —— 弹窗只问「现在重启吗」，按变更类型（写入 / 清空）区分说明。
+ * Codex 重启确认弹窗。Codex 只在启动时读一次配置，应用 / 取消接入后的变更要重启
+ * 才生效 —— 弹窗只问「现在重启吗」，按变更类型（写入 / 取消接入）区分说明。
  * 「稍后」只是关掉弹窗，配置不回退；点遮罩不关（只认按钮），避免误触丢掉提醒。
  */
 export function codexRestartModal(state: AppState): string {
@@ -360,7 +370,7 @@ export function codexRestartModal(state: AppState): string {
   const text =
     state.codexRestartPrompt === 'applied'
       ? 'Codex 的模型配置已更新，它只在启动时读取配置。强制重启会直接结束 ChatGPT（Codex）的进程并重新拉起，未保存的会话会丢失。'
-      : '本应用的 Codex 配置已移除，它只在启动时读取配置。强制重启会直接结束 ChatGPT（Codex）的进程并重新拉起，让它回到默认模型；未保存的会话会丢失。';
+      : '本应用的 Codex 配置已移除，接管前的配置已还原。它只在启动时读取配置，强制重启会直接结束 ChatGPT（Codex）的进程并重新拉起；未保存的会话会丢失。';
   return `
     <div class="modal-backdrop">
       <div class="modal-card" role="alertdialog" aria-modal="true" aria-label="重启 Codex 应用">

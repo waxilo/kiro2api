@@ -2,12 +2,16 @@
    这一层决定「屏幕上哪一块归谁」，不含任何业务视觉。
 
    ┌──────────────────────────────────────────────────────────┐
-   │ .titlebar   白 · 品牌 / 更新入口 / 窗口按钮（可拖拽区）      │
+   │ .titlebar   白 · 品牌 / 版本 / 窗口按钮（可拖拽区）        │
    ├────────────┬─────────────────────────────────────────────┤
    │ .rail 白   │ .view-head   标题 + 说明 + 该分区的动作（固定）│
    │ 分组导航   ├─────────────────────────────────────────────┤
    │            │ .view-host → .view-body   内容（唯一滚动区）  │
-   └────────────┴─────────────────────────────────────────────┘ */
+   └────────────┴─────────────────────────────────────────────┘
+                                     ↑ 这一整块是灰画布
+
+   分隔只画一条（标题栏底下那条极淡的线）：导航与内容之间靠「白 / 灰」的底色差
+   自己分开，再加一条竖线就是两套分隔语言并存，反而显得碎。 */
 
 /* ── 标题栏 ─────────────────────────────────────────────────────────── */
 /* 拖拽由 data-tauri-drag-region="deep" 接管（它会跳过按钮等可点击元素），
@@ -17,7 +21,7 @@
   display: flex;
   align-items: center;
   height: var(--titlebar-h);
-  padding-left: var(--s-sm);
+  padding-left: var(--s-md);
   background: var(--chrome);
   border-bottom: 1px solid var(--hairline);
   user-select: none;
@@ -27,7 +31,7 @@
 /* macOS 是覆盖式标题栏：红绿灯由系统画在我们这层之上，左侧必须留出安全区；
    右侧没有自绘窗口按钮，留一点内边距免得内容顶到窗口边缘。 */
 .platform-macos .titlebar {
-  padding-left: 78px;
+  padding-left: 82px;
   padding-right: var(--s-sm);
 }
 
@@ -39,8 +43,8 @@
 }
 
 .titlebar-logo {
-  width: 19px;
-  height: 19px;
+  width: 20px;
+  height: 20px;
   flex: none;
   border-radius: var(--r-xs);
 }
@@ -73,7 +77,9 @@
   height: 100%;
 }
 
-/* ── 自绘窗口按钮（仅 Windows；macOS 用系统红绿灯）───────────────── */
+/* ── 自绘窗口按钮（仅 Windows；macOS 用系统红绿灯）─────────────────
+   贴边整块的矩形命中区是 Windows 的惯例：系统标题栏上的三个按钮本来就不圆，
+   这里跟随它，圆角只留给页面内部的控件。 */
 .window-controls {
   display: flex;
   align-items: stretch;
@@ -91,16 +97,18 @@
   border-radius: 0;
   background: transparent;
   color: var(--ink-muted);
+  box-shadow: none;
 }
 
 /* components.css 顶部的通用 `button:hover:not(:disabled):not([aria-disabled='true'])`
-   特异性 (0,3,1)，压得过类选择器写法的 (0,3,0) —— 悬浮底色会被它钉成 surface-1，
+   特异性 (0,3,1)，压得过类选择器写法的 (0,3,0) —— 悬浮底色会被它钉成 surface-hover，
    关闭键的红底也曾因此从未生效。下面每条都照抄同样的限定把特异性抬到 (0,4,0)+，
-   与 chip 的处理同理：不靠源码顺序去赌。 */
+   与 views.css 里模型卡的处理同理：不靠源码顺序去赌。 */
 .wc-btn:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--wc-hover);
   border-color: transparent;
   color: var(--ink);
+  box-shadow: none;
 }
 .wc-btn:active:not(:disabled):not([aria-disabled='true']) {
   background: var(--wc-active);
@@ -152,7 +160,6 @@
   flex-direction: column;
   padding: var(--s-md) var(--s-sm) var(--s-sm);
   background: var(--chrome);
-  border-right: 1px solid var(--hairline);
   overflow-y: auto;
   /* 导航本身不需要滚动条；万一内容超出（窗口极矮）也照样能用滚轮 */
   scrollbar-width: none;
@@ -162,12 +169,12 @@
 }
 
 .rail-group + .rail-group {
-  margin-top: var(--s-md);
+  margin-top: 20px;
 }
 
 .rail-eyebrow {
   padding: 0 10px;
-  margin-bottom: var(--s-xxs);
+  margin-bottom: 6px;
   font-size: var(--t-eyebrow);
   font-weight: 600;
   /* 分组标签用正字距，与负字距的标题形成「这是分类、不是内容」的对照 */
@@ -179,31 +186,39 @@
   position: relative;
   display: flex;
   align-items: center;
-  gap: var(--s-xs);
+  gap: 10px;
   width: 100%;
-  padding: 6px 10px;
+  padding: 7px 10px;
   border: 0;
   border-radius: var(--r-md);
   background: transparent;
   color: var(--ink-muted);
   font-size: var(--t-body);
   text-align: left;
+  box-shadow: none;
 }
 
-.rail-item:hover:not(.is-active) {
+/* 特异性抬到 (0,4,0)：见 components.css 顶部那条通用按钮规则。 */
+.rail-item:hover:not(.is-active):not(:disabled):not([aria-disabled='true']) {
   background: var(--surface-2);
   border-color: transparent;
   color: var(--ink);
+  box-shadow: none;
 }
 
-/* 当前分区用主色底 + 主色字：这是 --primary 允许出现的少数位置之一 */
+/* 当前分区用主色底 + 主色字：这是 --primary 允许出现的少数位置之一。
+   内描边让这块浅色底在白导航栏上有一个清楚的边界（否则边缘会糊掉）。 */
 .rail-item.is-active {
   background: var(--primary-soft);
   color: var(--primary);
   font-weight: 600;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 14%, transparent);
 }
-.rail-item.is-active:hover {
+/* `.rail` 前缀不是装饰：悬停在当前项上时，通用按钮规则（0,3,1）会把这层浅主色底
+   改回 surface-hover，非 `(0,4,0)` 压不过它。 */
+.rail .rail-item.is-active:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--primary-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 14%, transparent);
 }
 
 .rail-icon {
@@ -224,7 +239,7 @@
 .rail-badge {
   position: absolute;
   top: 50%;
-  right: 7px;
+  right: 9px;
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -251,7 +266,9 @@
   min-height: 0;
 }
 
-/* 分区标题固定不滚动：滚动时仍然知道自己在哪一页、这一页是干什么的 */
+/* 分区标题固定不滚动：滚动时仍然知道自己在哪一页、这一页是干什么的。
+   上边距比下边距大（28 / 16）—— 标题与窗口顶部分开，说明与内容靠近，
+   标题这一组才像是「贴在内容上的页眉」，而不是浮在半空。 */
 .view-head {
   flex: none;
   display: flex;
@@ -260,7 +277,7 @@
   width: 100%;
   max-width: var(--content-max);
   margin: 0 auto;
-  padding: var(--s-lg) var(--s-xl) var(--s-md);
+  padding: 28px var(--content-gutter) 16px;
 }
 
 .view-head-text {
@@ -271,13 +288,14 @@
   font-family: var(--font-display);
   font-size: var(--t-display);
   font-weight: 640;
-  line-height: 1.2;
+  line-height: 1.25;
   color: var(--ink);
 }
 
 .view-desc {
-  margin-top: 3px;
+  margin-top: 4px;
   font-size: var(--t-small);
+  line-height: 1.5;
   color: var(--ink-subtle);
 }
 
@@ -286,7 +304,7 @@
   align-items: center;
   gap: var(--s-xs);
   margin-left: auto;
-  padding-top: var(--s-xxs);
+  padding-top: 2px;
 }
 
 /* 定位基准：自绘滚动条的轨道挂在它这里，所以它必须是 position: relative，
@@ -312,15 +330,16 @@
 }
 
 /* 内容列：宽度上限 + 居中，让行宽落在好读的区间；
-   内边距放在这里而不是 .view-host，是为了让滚动条轨道始终压在留白上。 */
+   内边距放在这里而不是 .view-host，是为了让滚动条轨道始终压在留白上。
+   卡片间距 16px、底部 40px —— 滚动到底时最后一张卡片不贴着窗口边。 */
 .view-stack {
   display: flex;
   flex-direction: column;
-  gap: var(--s-sm);
+  gap: var(--s-md);
   width: 100%;
   max-width: var(--content-max);
   margin: 0 auto;
-  padding: 0 var(--s-xl) var(--s-xxl);
+  padding: 0 var(--content-gutter) var(--s-xxl);
 }
 
 /* 切分区的入场：只播一次，靠 shell.ts 加/摘 is-entering 控制。
@@ -353,14 +372,14 @@
 }
 
 /* ── 自绘滚动条 ─────────────────────────────────────────────────────
-   轨道固定在 .view-host 右侧 12px 内：.view-stack 右侧有 32px 内边距，
+   轨道固定在 .view-host 右侧 6px 内：.view-stack 右侧有 32px 内边距，
    所以这条窄带永远压在空白上，不会挡住任何内容；即使不透明也能安全接收指针事件。 */
 .osb-track {
   position: absolute;
-  top: 2px;
-  right: 2px;
-  bottom: 2px;
-  width: 12px;
+  top: 4px;
+  right: 4px;
+  bottom: 4px;
+  width: 10px;
   z-index: 20;
   opacity: 0;
   transition: opacity 0.16s var(--ease);
@@ -377,7 +396,7 @@
 }
 
 .osb-thumb {
-  width: 8px;
+  width: 6px;
   height: 40px;
   margin: 0 auto;
   border-radius: var(--r-pill);
@@ -392,11 +411,11 @@
 }
 
 /* ── 窄窗口 ───────────────────────────────────────────────────────── */
-/* 导航收成纯图标条，卡片栅格落回单列。窗口最小宽度由 tauri.conf.json 限制，
+/* 导航收成纯图标条，卡片栅格落回单列。窗口最小宽度由 tauri.conf.json 限制（720px），
    所以这里只需要处理到「侧边栏该让位」这一档。 */
 @media (max-width: 860px) {
   .shell-main {
-    grid-template-columns: 56px minmax(0, 1fr);
+    grid-template-columns: 60px minmax(0, 1fr);
   }
 
   .rail {
@@ -411,13 +430,17 @@
 
   .rail-item {
     justify-content: center;
-    padding: 7px 0;
+    padding: 8px 0;
   }
 
   .rail-group + .rail-group {
     margin-top: var(--s-sm);
     padding-top: var(--s-sm);
     border-top: 1px solid var(--hairline);
+  }
+
+  .view-head {
+    padding-top: 22px;
   }
 
   .view-head,

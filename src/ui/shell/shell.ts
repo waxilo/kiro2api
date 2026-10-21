@@ -15,6 +15,7 @@ import { scheduler } from '../../services/scheduler';
 import { updater } from '../../services/updater';
 import {
   bindBackendEvents,
+  closeModal,
   dispatch,
   navigate,
   refresh,
@@ -30,6 +31,7 @@ import { bindEnglishFields } from '../shared/english-field';
 import { captureFocus, restoreFocus } from '../shared/focus';
 import { ScrollArea } from '../shared/scroll-area';
 import { toast } from '../shared/toast';
+import { renderModal } from '../modals';
 import { VIEWS, type ViewSpec } from '../views';
 import { codexRestartModal } from '../views/thirdparty';
 import { renderRail, updateRail } from './rail';
@@ -38,7 +40,18 @@ import { bindTitlebar, renderTitlebar, reportShellReady, updateTitlebar } from '
 let headEl: HTMLElement;
 let bodyEl: HTMLElement;
 let modalEl: HTMLElement;
+/** 导航 + 内容区。弹窗开着时整块 `inert`，见 `render()`。 */
+let mainEl: HTMLElement;
 let scrollArea: ScrollArea | null = null;
+/**
+ * 上一次渲染时挂的是哪个弹窗（`''` 表示没有）。
+ *
+ * 用途只有一个：判断「这一帧是不是刚打开」。弹窗的入场动画是 CSS 动画，节点一重建就会
+ * 重播 —— 而 store 每变一次（在搜索框里敲一个字、后台推来一次模型清单）整个弹窗都会重建。
+ * 结果是弹窗在用户打字时一次次轻微缩放，读起来就是「尺寸在变」。
+ * 记住上次挂的是谁，只有换人时才让动画出场，其余帧一律加 `is-settled` 关掉。
+ */
+let lastModalKey = '';
 
 // ── 组装 ────────────────────────────────────────────────────────────────
 
@@ -64,12 +77,14 @@ export function mountApp(container: HTMLElement): void {
   const head = document.getElementById('view-head');
   const body = document.getElementById('view-body');
   const modal = document.getElementById('modal-host');
-  if (!head || !body || !modal) {
-    throw new Error('外壳结构不完整：缺少 #view-head 或 #view-body 或 #modal-host');
+  const main = container.querySelector<HTMLElement>('.shell-main');
+  if (!head || !body || !modal || !main) {
+    throw new Error('外壳结构不完整：缺少 #view-head / #view-body / #modal-host / .shell-main');
   }
   headEl = head;
   bodyEl = body;
   modalEl = modal;
+  mainEl = main;
 
   bindTitlebar();
   useFeedback({ toast });
@@ -124,7 +139,29 @@ function render(state: AppState, previous?: AppState): void {
 
   // 弹窗宿主在视图之外（fixed 定位不随内容滚动），但同走这一个渲染入口：
   // store 一变它就必然跟上，与「重画只有一个入口」的约束保持一致。
-  modalEl.innerHTML = codexRestartModal(state);
+  //
+  // 两种弹窗共用这一个宿主，优先级由「哪个更需要立刻回答」决定：Codex 重启确认是
+  // 一个待决定的问句，它一旦挂出来就该盖住一切（它只在三方接入的操作之后出现，
+  // 与概览弹窗本来也不会同时存在）。
+  //
+  // 弹窗里也有输入（模型搜索框），所以它同样要过一遍焦点快照 ——
+  // 后台事件触发的重绘会把正在敲的字连同光标一起扔掉。
+  const modalFocus = captureFocus(modalEl);
+  // 弹窗开着时把导航与内容区整块 `inert`：遮罩只挡得住鼠标，Tab 键照样能跑到后面去，
+  // 于是一个「盖住整页」的弹窗还允许用户按 Tab 点亮它下面的按钮。`inert` 一并解决
+  // 聚焦、命中与读屏三件事。两个弹窗（确认弹窗与概览弹窗）都算「盖住了整页」。
+  mainEl.inert = Boolean(state.modal || state.codexRestartPrompt);
+  // 「刚打开」的判据：这一刻挂的弹窗与上一帧不是同一个。同一弹窗内的任何重绘都不再播动画。
+  const modalKey = state.modal ?? (state.codexRestartPrompt ? 'codex-restart' : '');
+  const modalOpened = modalKey !== lastModalKey;
+  lastModalKey = modalKey;
+  modalEl.innerHTML = codexRestartModal(state) || renderModal(state);
+  if (modalKey && !modalOpened) {
+    modalEl.querySelector('.modal-backdrop')?.classList.add('is-settled');
+    modalEl.querySelector('.modal-card')?.classList.add('is-settled');
+  }
+  restoreFocus(modalEl, modalFocus);
+  syncModalFocus(state, previous);
 
   // 放在最后：页面已经是正确的样子了，提示只是叠上去的一层，不参与布局。
   announceError(state, previous);
@@ -147,6 +184,28 @@ function render(state: AppState, previous?: AppState): void {
 function announceError(state: AppState, previous?: AppState): void {
   if (!state.error || state.error === previous?.error) return;
   toast(state.error, 'error');
+}
+
+/**
+ * 弹窗开 / 关那一帧的焦点搬家。
+ *
+ * * 打开：把焦点放进卡片（`tabindex="-1"`）。两件事因此成立 —— Escape 有接收者
+ *   （键盘事件从焦点元素往上传），读屏也会念出 `aria-labelledby` 指的那颗标题。
+ * * 关闭：还给原来那颗指标卡。用户关掉之后接着按 Tab 或回车，仍在熟悉的位置上。
+ *
+ * 只在「开 / 关」时搬家，不是每次重绘都抢焦点：后台事件每几秒就可能重画一次，
+ * 每次都抢会把用户在别处的操作打断（例如刚点开下载源下拉框就被夺走焦点）。
+ */
+function syncModalFocus(state: AppState, previous?: AppState): void {
+  if (state.modal && state.modal !== previous?.modal) {
+    modalEl.querySelector<HTMLElement>('#modal-card')?.focus({ preventScroll: true });
+    return;
+  }
+  if (!state.modal && previous?.modal) {
+    document
+      .querySelector<HTMLElement>(`[data-modal="${previous.modal}"]`)
+      ?.focus({ preventScroll: true });
+  }
 }
 
 function renderHead(spec: ViewSpec, state: AppState): string {
@@ -185,7 +244,15 @@ function playEnter(host: HTMLElement): void {
 function bindEvents(container: HTMLElement): void {
   container.addEventListener('click', (event) => {
     const origin = event.target as HTMLElement | null;
-    // 先看导航：它与动作按钮可能嵌套在同一块结构里，先匹配更具体的语义
+    // 先看弹窗遮罩：点卡片外面就是「关掉」，这是浮层的通用直觉。
+    // 判据写成「命中了 data-modal-dismiss，且点到的不是卡片内部」——
+    // 比给卡片挂 stopPropagation 稳，视图整块换 innerHTML 也不会失效。
+    const dismiss = origin?.closest<HTMLElement>('[data-modal-dismiss]');
+    if (dismiss && !origin?.closest('.modal-card')) {
+      closeModal();
+      return;
+    }
+    // 再看导航：它与动作按钮可能嵌套在同一块结构里，先匹配更具体的语义
     const nav = origin?.closest<HTMLElement>('[data-nav]');
     if (nav?.dataset.nav) {
       navigate(nav.dataset.nav as ViewId);
@@ -210,16 +277,23 @@ function bindEvents(container: HTMLElement): void {
     }
   });
 
-  // 三个搜索框（可用模型分区、三方接入分区的两张网格）按 id 分流，各自的值归各自的动作。
+  // 三个搜索框（可用模型弹窗、三方接入分区的两张网格）按 id 分流，各自的值归各自的动作。
   bindEnglishFields(container, (id, next) => {
     if (id === 'workbuddy-filter') setWorkbuddyFilter(next);
     else if (id === 'codex-filter') setCodexFilter(next);
     else setModelFilter(next);
   });
 
-  // Escape 清空搜索。焦点还在框里，重绘后外壳的焦点快照会把光标放回原位。
+  // Escape 关弹窗；没有弹窗时清空搜索。焦点还在框里，重绘后外壳的焦点快照会把光标放回原位。
+  //
+  // 顺序有讲究：弹窗浮在最上面一层，用户按 Escape 想的一定是「关掉这个」，
+  // 而不是「清空下面那个搜索框」。
   container.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    if (store.get().modal) {
+      closeModal();
+      return;
+    }
     const target = event.target as HTMLElement;
     if (target.id === 'model-filter' && store.get().modelFilter) setModelFilter('');
     if (target.id === 'workbuddy-filter' && store.get().workbuddyFilter) {

@@ -1,14 +1,13 @@
-/* 设计令牌 —— Linear 工业极简骨架的**浅色**版本。
+/* 设计令牌 —— 现代简洁（soft minimal）浅色主题。
  *
- * 骨架取自 Linear 的 design system（近黑画布 + 四级 surface 阶梯 + 1px 发丝边框 +
- * 单一蓝紫强调 + 几乎不用阴影），把它的明度轴整体翻到浅色侧：
- * 深色里「越亮层级越高」，浅色里对应「越白层级越高」。
- *
- * 三条硬规则（改样式时逐条核对，它们是工业感的来源，不是审美偏好）：
- *   1. 层级只靠「surface 阶梯 + 发丝边框」表达，阴影只留给浮层；
- *   2. 圆角只用下面六档，不出现 5px / 7px / 10px 这类游离值；
- *   3. --primary 稀缺使用：只出现在主 CTA、focus ring、当前导航项、品牌标记、链接。
- *      全局出现频率越高，工业感越弱。
+ * 三条原则决定这套界面的样子，改样式时逐条核对：
+ *   1. **灰底浮白卡**：内容区坐落在浅灰画布上，卡片是纯白 + 柔和阴影 —— 层级靠
+ *      「底色差 + 阴影」表达，边框只留一层几乎看不见的发丝线兜住边缘。
+ *      这取代了上一版的「发丝边框 + 零阴影」，也是圆角与阴影同时存在的原因。
+ *   2. **留白优先**：间距阶梯是 4 的倍数，卡片内距 20px、卡片之间 16px、内容列左右 32px。
+ *      元素之间先靠留白分组，不靠线。加线之前先问一句「加点间距能不能解决」。
+ *   3. **--primary 稀缺使用**：只出现在主 CTA、focus 环、当前导航项、品牌标记、链接。
+ *      出现频率越高，界面越花。
  *
  * 只做浅色主题：`color-scheme: light` 是必须的，否则 WebView 会把原生控件
  * （滚动条、复选框、下拉箭头）按系统深色画，和页面配色对不上。
@@ -17,45 +16,45 @@
   color-scheme: light;
 
   /* ── 画布与 surface 阶梯 ─────────────────────────────────────────── */
-  --canvas: #f6f7f9; /* 内容区底面 */
-  --chrome: #ffffff; /* 标题栏 / 导航 / 状态栏 —— 包裹内容区的三块白 */
+  --canvas: #f3f4f7; /* 内容区底面：灰，用来把白卡片托起来 */
+  --chrome: #ffffff; /* 标题栏 / 导航 —— 与画布形成明暗对比，不再另画分隔线 */
   --surface-1: #ffffff; /* 卡片、面板 */
-  --surface-2: #f4f6f8; /* 内嵌：输入框、内层面板、条形底 */
-  --surface-3: #eceef2; /* 更深一层：轨道、代码块 */
-  --surface-hover: #f7f8fa;
+  --surface-2: #f5f6f9; /* 内嵌：卡片里的子块、输入框、条形底 */
+  --surface-3: #ebedf2; /* 更深一层：轨道、代码块、按压态 */
+  --surface-hover: #fafbfc;
 
-  /* ── 发丝边框：三级，对应「卡片 / 输入 / 嵌套」三种强度 ─────────── */
-  --hairline: #e7e9ee;
-  --hairline-strong: #d7dbe2;
-  --hairline-tertiary: #c6ccd6;
+  /* ── 发丝边框：只用来兜住色调差看不出来的边缘 ───────────────────── */
+  --hairline: #edeef2;
+  --hairline-strong: #e0e2e9;
+  --hairline-tertiary: #ced2dc;
 
   /* ── 文本 ───────────────────────────────────────────────────────── */
-  --ink: #14161b; /* 标题与正文 */
-  --ink-muted: #565d6b; /* 次级信息 */
-  --ink-subtle: #818996; /* 三级：说明、单位 */
-  --ink-tertiary: #a7adba; /* 四级：占位、禁用、装饰 */
+  --ink: #14161d; /* 标题与正文 */
+  --ink-muted: #525a6b; /* 次级信息 */
+  --ink-subtle: #7b8394; /* 三级：说明、单位 */
+  --ink-tertiary: #a2a9b8; /* 四级：占位、禁用、装饰 */
 
   /* ── 强调色 ─────────────────────────────────────────────────────── */
-  --primary: #5e6ad2;
-  --primary-hover: #4f5ac0;
-  --primary-active: #464fa8;
-  --primary-soft: #eef0fb; /* 选中态底色：当前导航项、当前 chip */
-  --primary-ring: rgba(94, 106, 210, 0.3); /* focus 环 */
+  --primary: #5b63d8;
+  --primary-hover: #4c54c8;
+  --primary-active: #434ab4;
+  --primary-soft: #eff0fd; /* 选中态底色：当前导航项、勾选的模型卡 */
+  --primary-ring: rgba(91, 99, 216, 0.22); /* focus 环 */
 
   /* ── 语义色 ─────────────────────────────────────────────────────── */
-  --success: #1f8f52;
-  --success-soft: #e9f6ef;
-  --warning: #95610b;
-  --warning-soft: #fdf4e2;
-  --danger: #bf3a30;
+  --success: #12805c;
+  --success-soft: #e8f6f0;
+  --warning: #98640a;
+  --warning-soft: #fdf4e3;
+  --danger: #c33a34;
   --danger-soft: #fdeeed;
 
   /* ── 圆角阶梯 ───────────────────────────────────────────────────── */
-  --r-xs: 4px;
-  --r-sm: 6px;
-  --r-md: 8px;
-  --r-lg: 12px;
-  --r-xl: 16px;
+  --r-xs: 6px; /* 徽标内部、极小控件 */
+  --r-sm: 8px; /* 胶囊标签、地址条 */
+  --r-md: 10px; /* 按钮、输入框 */
+  --r-lg: 14px; /* 内嵌子块：协议卡、目录块、模型卡 */
+  --r-xl: 18px; /* 卡片、指标块、弹窗 */
   --r-pill: 9999px;
 
   /* ── 间距阶梯：4px 基数 ─────────────────────────────────────────── */
@@ -68,8 +67,8 @@
   --s-xxl: 40px;
 
   /* ── 字号阶梯 ───────────────────────────────────────────────────── */
-  --t-display: 25px; /* 视图标题 */
-  --t-headline: 18px; /* 指标数值 */
+  --t-display: 24px; /* 视图标题 */
+  --t-headline: 22px; /* 指标数值 */
   --t-title: 14px; /* 卡片标题 */
   --t-body: 13px; /* 正文与按钮 */
   --t-small: 12.5px; /* 说明 */
@@ -78,31 +77,44 @@
 
   /* ── 字体 ───────────────────────────────────────────────────────────
      不引外部字体：这是离线桌面应用，webfont 会带来首屏闪字与一条额外网络依赖，
-     而系统自带的那一档恰好是各平台上的最优解（Windows 的 Segoe UI Variable 带光学
-     尺寸轴，macOS 的 SF Pro 也正是 Linear 规范里点名的回退）。区分度靠字号 / 字重 /
-     字距的纪律来建立，不靠换一套字形。 */
+     而系统自带的那一档恰好是各平台上的最优解。区分度靠字号 / 字重 / 字距的纪律
+     来建立，不靠换一套字形。 */
   --font-ui: "Segoe UI Variable Text", "Segoe UI", -apple-system, "SF Pro Text",
     "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
   --font-display: "Segoe UI Variable Display", "Segoe UI", -apple-system, "SF Pro Display",
     "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
   --font-mono: "Cascadia Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
-  /* ── 阴影：只给浮层（提示条）用 ─────────────────────────────────── */
-  --shadow-pop: 0 6px 20px -6px rgba(20, 22, 27, 0.18), 0 1px 2px rgba(20, 22, 27, 0.06);
+  /* ── 阴影：卡片靠一档极淡的投影浮起来，浮层再往上抬两档 ────────────
+     一律用「低透明度 + 大扩散 + 负偏移」，不用黑色硬阴影 —— 浅色底上硬阴影
+     会显脏，柔和的扩散才像光。 */
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05), 0 3px 8px -3px rgba(16, 24, 40, 0.09);
+  /* 卡片投影三层叠加：贴边 1px 定轮廓、近场 4px 出厚度、远场 16px 让它在灰底上「离地」。
+     单层大范围阴影在浅色底上要么糊成一圈灰边，要么淡到看不出来。 */
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.06), 0 4px 12px -6px rgba(16, 24, 40, 0.1),
+    0 16px 32px -24px rgba(16, 24, 40, 0.2);
+  --shadow-raise: 0 1px 3px rgba(16, 24, 40, 0.07), 0 8px 20px -8px rgba(16, 24, 40, 0.14),
+    0 20px 40px -28px rgba(16, 24, 40, 0.22);
+  --shadow-pop: 0 24px 56px -24px rgba(16, 24, 40, 0.32), 0 8px 20px -8px rgba(16, 24, 40, 0.12);
+  /* 主色按钮自己的投影：让它在灰底上「按住」而不是浮着 */
+  --shadow-primary: 0 1px 2px rgba(91, 99, 216, 0.3), 0 6px 16px -10px rgba(91, 99, 216, 0.6);
 
   /* ── 结构尺寸 ───────────────────────────────────────────────────── */
-  --titlebar-h: 38px;
-  --rail-w: 210px;
-  --content-max: 880px;
+  --titlebar-h: 40px;
+  --rail-w: 214px;
+  --content-max: 900px;
+  /* 内容列左右留白：既是留白，也是自绘滚动条轨道的落脚处（见 shell.css） */
+  --content-gutter: var(--s-xl);
 
   /* ── 动效：短、同一条曲线 ───────────────────────────────────────── */
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --dur: 150ms;
 
   /* ── 自绘窗口按钮 / 滚动条 ──────────────────────────────────────── */
-  --wc-hover: rgba(20, 22, 27, 0.06);
-  --wc-active: rgba(20, 22, 27, 0.11);
+  --wc-hover: rgba(20, 22, 29, 0.055);
+  --wc-active: rgba(20, 22, 29, 0.1);
   --wc-close-hover: #c42b1c;
-  --scroll-thumb: rgba(20, 22, 27, 0.16);
-  --scroll-thumb-hover: rgba(20, 22, 27, 0.32);
+  --scroll-thumb: rgba(20, 22, 29, 0.18);
+  --scroll-thumb-hover: rgba(20, 22, 29, 0.34);
 }

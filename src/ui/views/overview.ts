@@ -1,12 +1,15 @@
 // 概览：一屏之内回答「现在能不能用、接入地址是什么、还剩多少」。
 //
 // 这一页是唯一允许汇总别处分区信息的地方 —— 它是入口，用户第一眼就在这里。
-// 因此刻意只放**结论**（跑了没有、接入地址、两个关键数字），细节都留在各自分区，
-// 并用可点击的指标块把跳转做出来，避免这一页长成第二个「什么都有一点」的长列表。
+// 因此刻意只放**结论**（跑了没有、接入地址、两个关键数字）。
+//
+// 两个数字的细节不再各占一个分区，而是点开就地的弹窗（见 `ui/modals`）：
+// 「可用模型」「额度已用」本质上都是只读的、看一眼就关的东西，为它们单开页面等于让用户
+// 看完还得自己点回概览；放进弹窗，上下文（服务跑没跑、地址是什么）始终在旁边。
 import { esc, localTime, money2, percent4, remainingUntil } from '../../core/format';
 import { ACTION } from '../../state/actions';
 import { isPending, summarizeStatus } from '../../state/app-state';
-import { actionAttrs, note, statTile, statusPill, kvList, kv } from '../shared/render';
+import { actionAttrs, note, statTile, statusPill, kvList, kv, swapLabel } from '../shared/render';
 import { ICON } from '../shared/icons';
 import type { ViewSpec } from './types';
 
@@ -53,9 +56,21 @@ export const overviewView: ViewSpec = {
     const available = Boolean(status?.available);
     // 进行态文案：`pending` 里那条记录只负责把按钮标成不可用，名字才说明「是谁在跑」。
     // 只有正在跑的那一个按钮改文案，其余按钮保持原名（只是灰着），避免张冠李戴。
-    const startText = isPending(state, ACTION.startProxy) ? '启动中…' : '启动代理';
-    const stopText = isPending(state, ACTION.stopProxy) ? '停止中…' : '停止代理';
-    const refreshText = isPending(state, ACTION.refreshToken) ? '刷新中…' : '刷新凭据';
+    //
+    // 三处都走 `swapLabel`：文案长短不一样（「停止代理」80px vs「停止中…」76.5px），
+    // 直接换字会让按钮宽度跟着变 —— 它是靠右排的，那一排就整体横移一下。
+    const startText = swapLabel(
+      isPending(state, ACTION.startProxy) ? '启动中…' : '启动代理',
+      isPending(state, ACTION.startProxy) ? '启动代理' : '启动中…',
+    );
+    const stopText = swapLabel(
+      isPending(state, ACTION.stopProxy) ? '停止中…' : '停止代理',
+      isPending(state, ACTION.stopProxy) ? '停止代理' : '停止中…',
+    );
+    const refreshText = swapLabel(
+      isPending(state, ACTION.refreshToken) ? '刷新中…' : '刷新凭据',
+      isPending(state, ACTION.refreshToken) ? '刷新凭据' : '刷新中…',
+    );
     const expiryNote = status?.expiresAt ? remainingUntil(status.expiresAt) : '';
 
     const serviceCard = `
@@ -80,19 +95,22 @@ export const overviewView: ViewSpec = {
         </label>
       </div>`;
 
+    // 两块可点的指标卡：它们打开的是弹窗，不是切页（见 `ui/modals`）。
+    // 脚注写「点开能做什么」，而不是重复左边的标签 —— 用户已经知道自己是「额度」了，
+    // 需要知道的是按下去会发生什么。
     const tiles = `
       <div class="stat-grid">
         ${statTile({
           label: '可用模型',
           value: String(models?.models.length ?? 0),
-          hint: models?.models.length ? '来自 Kiro 账户' : '尚未同步',
-          goto: 'models',
+          hint: models?.models.length ? '来自 Kiro 账户 · 点开查看' : '尚未同步 · 点开同步',
+          opens: 'models',
         })}
         ${statTile({
           label: '额度已用',
           value: usage ? `${percent4(usage.percentUsed)}%` : '—',
-          hint: usage ? `剩余 ${money2(usage.remaining)}` : '点击查询',
-          goto: 'usage',
+          hint: usage ? `剩余 ${money2(usage.remaining)} · 点开查看` : '还没查过 · 点开查询',
+          opens: 'usage',
         })}
       </div>`;
 

@@ -1,8 +1,13 @@
-// 协议接入：两套协议并存是产品核心，所以这一页把「地址 + 三种复制格式」摊开。
+// 协议接入：两套协议并存是产品核心，所以这一页把两套地址并排摊开。
 //
-// 两张协议卡片上下堆叠、同一套结构渲染（只是数据不同）：标题 / 图标 / 地址 /
-// 客户端标签 / 操作行五段严格对齐，靠 36px 主题色图标底区分协议，不再用整条彩边。
+// 两张协议块上下堆叠、同一套结构渲染（只是数据不同），块内只有两段：
+// 身份（图标 + 名称 + 路由）与「地址条 + 复制地址」。身份用主题色的圆角图标底区分协议。
 // 复制反馈长在按钮上（「已复制」短暂替换文案），失败仍走 toast 给真实原因。
+//
+// 这一块做减法的顺序：先把「适用客户端」的一排描边胶囊压成一句灰字，再整句去掉；
+// 「复制 .env / 复制 JSON」两颗次要按钮也去掉 —— 地址条 + 一颗「复制地址」已经把
+// 「怎么连上来」说完了，其余都是同一件事的啰嗦版本。复制按钮挪到地址条右边同一行，
+// 于是整块只剩两段、两行高。
 //
 // 把模型写进第三方客户端的操作不在这里 —— 那是「三方接入」分区的职责，
 // 这一页只回答「客户端该怎么连上来」。
@@ -15,7 +20,7 @@ import { copyKindNeedsKey } from '../../core/ipc';
 import type { CopyKind } from '../../core/types';
 import { ACTION } from '../../state/actions';
 import { isBlocking, isPending, type AppState } from '../../state/app-state';
-import { actionAttrs, kv, kvList, mono, statusPill } from '../shared/render';
+import { actionAttrs, kv, kvList, mono, statusPill, swapLabel } from '../shared/render';
 import { ICON } from '../shared/icons';
 import type { ViewSpec } from './types';
 
@@ -23,15 +28,11 @@ interface ProtoSpec {
   name: string;
   /** 协议类型标签：客户端真正请求的路由。 */
   typeLabel: string;
-  /** 适用客户端（浅灰胶囊展示）。 */
-  clients: string[];
   /** 图标底色与选中标记的主题色：青绿 = Anthropic，蓝紫 = OpenAI。 */
   color: string;
   glyph: string;
   url: string;
   baseKind: CopyKind;
-  envKind: CopyKind;
-  jsonKind: CopyKind;
 }
 
 function protoSpecs(state: AppState): ProtoSpec[] {
@@ -40,44 +41,39 @@ function protoSpecs(state: AppState): ProtoSpec[] {
     {
       name: 'Anthropic Messages',
       typeLabel: '/anthropic/v1/messages',
-      clients: ['Claude Code', 'Anthropic SDK', 'Anthropic 兼容客户端'],
       color: '#0D9488',
       glyph: ICON.anthropic,
       url: access?.anthropicBaseUrl ?? '',
       baseKind: 'anthropic_base_url',
-      envKind: 'anthropic_env',
-      jsonKind: 'anthropic_json',
     },
     {
       name: 'OpenAI Chat Completions',
       typeLabel: '/openai/v1',
-      clients: ['OpenAI SDK', 'LangChain', 'Cherry Studio', 'OpenAI 兼容客户端'],
       color: '#6366F1',
       glyph: ICON.openai,
       url: access?.openaiBaseUrl ?? '',
       baseKind: 'openai_base_url',
-      envKind: 'openai_env',
-      jsonKind: 'openai_json',
     },
   ];
 }
 
 /**
- * 复制按钮。成功反馈直接把文案换成「已复制」（状态在 `AppState.copiedKind`），
- * 主按钮只给「复制地址」——它是这一行里唯一的主操作。
+ * 复制地址按钮。成功反馈直接把文案换成「已复制」（状态在 `AppState.copiedKind`）。
+ *
+ * 文案走 `swapLabel`：「复制地址」四字换成「已复制」三字，按钮会缩 13px，地址条于是
+ * 跟着变宽一下、再缩回去。「已复制」1.6 秒后复原，整行来回抖两次。
+ * 两段都渲染、只显示当前那段，按钮宽度就锁在最宽的一份上。
  */
 function copyButton(
   kind: CopyKind,
   label: string,
   state: AppState,
   enabled: boolean,
-  main = false,
 ): string {
   const copied = state.copiedKind === kind;
-  const cls = [main ? 'primary' : '', copied ? 'is-copied' : ''].filter(Boolean).join(' ');
   return (
-    `<button${cls ? ` class="${cls}"` : ''} data-action="copy" data-kind="${kind}"` +
-    `${enabled ? '' : ' disabled'}>${esc(copied ? '已复制' : label)}</button>`
+    `<button class="primary${copied ? ' is-copied' : ''}" data-action="copy" data-kind="${kind}"` +
+    `${enabled ? '' : ' disabled'}>${swapLabel(copied ? '已复制' : label, copied ? label : '已复制')}</button>`
   );
 }
 
@@ -97,21 +93,19 @@ function renderProto(proto: ProtoSpec, state: AppState): string {
     <div class="proto" style="--proto-color:${proto.color}">
       <div class="proto-head">
         <span class="proto-badge">${proto.glyph}</span>
-        <span class="proto-name">${esc(proto.name)}</span>
-        <span class="proto-type">${esc(proto.typeLabel)}</span>
+        <span class="proto-id">
+          <span class="proto-name">${esc(proto.name)}</span>
+          <span class="proto-type">${esc(proto.typeLabel)}</span>
+        </span>
         ${status}
       </div>
-      <div class="proto-url${urlMissing ? ' is-empty' : ''}" aria-label="API 地址">
-        <span class="proto-url-icon">${ICON.terminal}</span>
-        <span class="proto-url-text">${urlMissing ? '地址读取中' : esc(proto.url)}</span>
-      </div>
-      <div class="proto-tags">
-        ${proto.clients.map((client) => `<span class="proto-tag">${esc(client)}</span>`).join('')}
-      </div>
-      <div class="proto-actions">
-        ${copyButton(proto.baseKind, '复制地址', state, canCopy(proto.baseKind), true)}
-        ${copyButton(proto.envKind, '复制 .env', state, canCopy(proto.envKind))}
-        ${copyButton(proto.jsonKind, '复制 JSON', state, canCopy(proto.jsonKind))}
+      <div class="proto-endpoint">
+        <div class="proto-url${urlMissing ? ' is-empty' : ''}" aria-label="API 地址">
+          <span class="proto-url-text">${urlMissing ? '地址读取中' : esc(proto.url)}</span>
+        </div>
+        <div class="proto-actions">
+          ${copyButton(proto.baseKind, '复制地址', state, canCopy(proto.baseKind))}
+        </div>
       </div>
     </div>`;
 }
@@ -138,7 +132,10 @@ export const endpointsView: ViewSpec = {
                   ${isBlocking(state) || !hasKey ? 'disabled' : ''}>复制密钥</button>
           <button class="small danger" data-action="reset-key"
                   ${running ? 'disabled' : actionAttrs(state, ACTION.resetKey)}>
-            ${isPending(state, ACTION.resetKey) ? '重置中…' : '重置密钥'}
+            ${swapLabel(
+              isPending(state, ACTION.resetKey) ? '重置中…' : '重置密钥',
+              isPending(state, ACTION.resetKey) ? '重置密钥' : '重置中…',
+            )}
           </button>
         </div>
         ${kvList([kv('代理密钥', mono(access?.apiKeyMasked))])}
@@ -148,9 +145,7 @@ export const endpointsView: ViewSpec = {
       <div class="card">
         <div class="card-head">
           <span class="card-title">协议地址</span>
-          <span class="proto-count">2 种协议</span>
         </div>
-        <div class="proto-intro">根据客户端选择对应协议，一键复制即可使用</div>
         <div class="proto-grid">
           ${protoSpecs(state).map((proto) => renderProto(proto, state)).join('')}
         </div>

@@ -15,6 +15,7 @@ import {
   blockingLabel,
   isPending,
   store,
+  type ModalId,
   type PendingAction,
   type ThirdPartyTab,
   type ViewId,
@@ -47,7 +48,7 @@ export const ACTION = {
   workbuddyApply: '应用 WorkBuddy 变更',
   workbuddyClear: '清空 WorkBuddy 接入',
   codexApply: '应用 Codex 变更',
-  codexRemove: '清空 Codex 接入',
+  codexRemove: '取消 Codex 接入',
   codexRestart: '重启 Codex 应用',
 } as const;
 
@@ -101,10 +102,28 @@ const ACTION_TIMEOUT_MS = 45_000;
 // ── 基础 ────────────────────────────────────────────────────────────────
 
 export function navigate(view: ViewId): void {
-  store.set({ view });
+  // 顺带关掉概览弹窗：弹窗是「概览上的一个浮层」，换了分区它就没有落脚处了
+  // （正常情况下遮罩会挡住导航，这里是兜底，例如将来键盘快捷键切页）。
+  store.set({ view, modal: null });
   // 进入三方接入分区时拉一次扫描：两份配置用户随时可能手改，每次进分区都读一遍盘
   // （纯本地小文件），看到的一定是当下的状态。
   if (view === 'thirdparty') void loadThirdPartyScans();
+}
+
+/**
+ * 打开概览弹窗（可用模型 / 账户额度）。
+ *
+ * 纯界面状态：没有后端命令、没有耗时，因此不走 `run()` —— 它不该有忙碌语义，
+ * 也不该被别处的动作门控挡住。
+ */
+export function openModal(modal: ModalId): void {
+  store.set({ modal });
+}
+
+/** 关闭概览弹窗。已经是关着的时候什么都不做（避免一次无意义的重绘）。 */
+export function closeModal(): void {
+  if (!store.get().modal) return;
+  store.set({ modal: null });
 }
 
 /** 同时拉 WorkBuddy 与 Codex 的扫描（都是纯本地读盘）。单个失败不影响另一个。 */
@@ -151,7 +170,7 @@ function codexCatalogIds(): string[] {
 }
 
 /**
- * 「搜索词只收 ASCII」这把尺子，两个搜索框（可用模型分区、三方接入分区）共用。
+ * 「搜索词只收 ASCII」这把尺子，两个搜索框（可用模型弹窗、三方接入分区）共用。
  *
  * 裁掉过东西就说一句：否则用户看到自己刚贴进去的字凭空消失，只会以为是坏了。
  */
@@ -164,7 +183,7 @@ function asciiOnly(query: string): string {
 }
 
 /**
- * 更新「可用模型」分区的搜索词。
+ * 更新「可用模型」弹窗的搜索词。
  *
  * 不走 `run()`：它是一次纯本地的重绘触发，没有后端命令、没有耗时、也不该有 `busy` 语义 ——
  * 被上一个动作的忙碌状态挡住、连打字都被吞掉，那才是真的糟。
@@ -439,20 +458,25 @@ async function reveal(path: RevealTarget): Promise<void> {
 }
 
 /**
- * 清空 Codex 的接入配置：provider、密钥与模型目录一次移除（后端只动指向本应用
- * 的条目，ChatGPT 登录等原样保留）。「清空」按钮与「勾成空清单后应用」共用这个出口。
+ * 取消 Codex 接入（UI 上的「取消接入」按钮，空清单应用也走这里）。
  *
- * 确有移除且 Codex 正在跑时挂出重启确认：Codex 只在启动时读配置，正在跑的
+ * 后端有接管前的快照时**整份还原** config.toml，只把 auth.json 里那一个密钥键
+ * 归位 —— 所以这里要区分「已还原」与「只是删掉」：老用户（本次改动之前就接入过）
+ * 没有快照，只能说「已清空」，说了「已还原」是骗人。
+ *
+ * 确有改动且 Codex 正在跑时挂出重启确认：Codex 只在启动时读配置，正在跑的
  * 那个还捧着旧配置；没在跑就没有「重启才生效」的问题，下次启动自然读新配置。
  */
 async function clearCodex(): Promise<void> {
   await run(ACTION.codexRemove, async () => {
-    const { removed, codexRunning } = await backend.codexRemove();
+    const { removed, restored, codexRunning } = await backend.codexRemove();
     store.set({ codexChecked: null });
-    feedback.toast(
-      removed ? '已清空 Codex 的接入配置' : '没有找到指向本应用的 Codex 配置',
-      removed ? 'info' : 'error',
-    );
+    const text = restored
+      ? '已还原接管前的 Codex 配置'
+      : removed
+        ? '已清空 Codex 的接入配置'
+        : '没有找到指向本应用的 Codex 配置';
+    feedback.toast(text, removed ? 'info' : 'error');
     if (removed && codexRunning) store.set({ codexRestartPrompt: 'cleared' });
   });
 }
@@ -719,6 +743,16 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
 
     case 'update-install':
       await updater.install();
+      return;
+
+    case 'open-modal': {
+      const modal = dataset.modal as ModalId | undefined;
+      if (modal) openModal(modal);
+      return;
+    }
+
+    case 'close-modal':
+      closeModal();
       return;
 
     case 'goto': {

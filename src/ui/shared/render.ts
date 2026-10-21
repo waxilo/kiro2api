@@ -7,7 +7,14 @@
 // 本模块只负责结构，不负责转义，调用方用 `core/format` 里的 `esc` / `text` 处理数据。
 import { esc, formatRate } from '../../core/format';
 import { actionScope } from '../../state/actions';
-import { isBlocking, isPending, type AppState, type StatusSummary, type Tone, type ViewId } from '../../state/app-state';
+import {
+  isBlocking,
+  isPending,
+  type AppState,
+  type ModalId,
+  type StatusSummary,
+  type Tone,
+} from '../../state/app-state';
 import { ICON } from './icons';
 
 /**
@@ -62,6 +69,28 @@ export function kvList(rows: string[]): string {
   return `<dl class="kv">${rows.join('')}</dl>`;
 }
 
+/**
+ * 会换文案的按钮内容：**宽度锁死**。
+ *
+ * 「启动代理 → 启动中…」「复制 → 已复制」这类替换会改变文字宽度，而按钮在卡片头、
+ * 按钮行里都是靠边排的 —— 一个字宽的变化会让整排按钮左右挪一下，用户读到的是
+ * 「界面抖了一下」，而不是「状态变了」。
+ *
+ * 做法是把两段文字都渲染出来、由样式叠在同一个网格单元里，只让当前那份可见：
+ * 按钮宽度于是恒等于较宽的一份。不写死像素宽度，所以换字号、缩放、系统字体都不会失准。
+ * 被藏起来的那份带 `aria-hidden`，读屏不会把两句话都念一遍。
+ *
+ * ⚠️ 叠放由**按钮自己**当网格容器完成（样式里的 `button:has(> .swap-alt)`）。
+ * 别把它包成一个内联元素塞回按钮里：`inline-grid` 的行内基线会把按钮撑高 1.7px，
+ * 于是「有 swap 的按钮」比同排其它按钮高一圈 —— 抖动换了个地方，并没有消失。
+ */
+export function swapLabel(shown: string, alternate: string): string {
+  return (
+    `<span class="swap-label">${esc(shown)}</span>` +
+    `<span class="swap-alt" aria-hidden="true">${esc(alternate)}</span>`
+  );
+}
+
 /** 等宽值：用于路径、地址、密钥这类需要逐字符辨认的内容。 */
 export function mono(value: unknown, fallback = '—'): string {
   if (value === null || value === undefined || value === '') {
@@ -80,20 +109,27 @@ export interface StatTileSpec {
   /** 主数值，需为已转义或受控的 HTML。 */
   value: string;
   hint?: string;
-  /** 给了就整块可点，跳到该分区。 */
-  goto?: ViewId;
+  /** 给了就整块可点，就地打开概览弹窗（可用模型 / 账户额度）。 */
+  opens?: ModalId;
 }
 
-/** 指标块：一个小标签 + 一个大数值（+ 可选脚注）。可点时右侧出现箭头。 */
+/**
+ * 指标块：一个小标签 + 一个大数值（+ 可选脚注）。可点时右侧出现箭头。
+ *
+ * 可点的指标块**打开弹窗**而不是切页：它回答的是「看一眼就知道」的问题，
+ * 弹窗关闭后用户还在原来那一屏，不必再点回概览。`aria-haspopup="dialog"` 把这件事
+ * 提前告诉读屏，免得他们以为按下去会换页。
+ */
 export function statTile(spec: StatTileSpec): string {
   const inner = `
     <div class="stat-label">${esc(spec.label)}</div>
     <div class="stat-value">${spec.value}</div>
     ${spec.hint ? `<div class="stat-hint">${esc(spec.hint)}</div>` : ''}`;
 
-  if (!spec.goto) return `<div class="stat">${inner}</div>`;
+  if (!spec.opens) return `<div class="stat">${inner}</div>`;
   return `
-    <button class="stat is-link" data-action="goto" data-view="${spec.goto}" type="button">
+    <button class="stat is-link" data-action="open-modal" data-modal="${spec.opens}"
+            aria-haspopup="dialog" type="button">
       ${inner}
       <span class="stat-arrow">${ICON.chevron}</span>
     </button>`;
