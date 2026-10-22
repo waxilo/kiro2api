@@ -10,13 +10,24 @@
 //!   选择活跃 provider；
 //! * `wire_api = "chat"` 已被移除，只认 `wire_api = "responses"` —— 本代理在
 //!   `/openai/v1/responses` 提供该协议；
-//! * `requires_openai_auth = true` 时 Codex 用 `auth.json` 里 `OPENAI_API_KEY`
-//!   作为 Bearer 凭据 —— 与 cc-switch 的第三方接入模板同一条路。
+//! * 第三方密钥写在 provider 表的 `experimental_bearer_token` 里，Codex 直接拿它
+//!   当 `Authorization: Bearer` 发出去（cc-switch 的第三方接入模板同一条路）。
 //!
-//! 「接入」= 写 provider 表（base_url 指向本代理 /openai/v1）+ 把顶层
-//! `model_provider` 指到它 + 把密钥写进 auth.json。Codex 一次只有一个活跃
-//! provider，因此接入必然「占用」顶层选择 —— 移除时把指向我们的顶层键删掉，
-//! Codex 回落到内置 openai provider。
+//! 「接入」= 写 provider 表（base_url 指向本代理 /openai/v1 + 密钥）+ 把顶层
+//! `model_provider` 指到它。Codex 一次只有一个活跃 provider，因此接入必然
+//! 「占用」顶层选择 —— 移除时把指向我们的顶层键删掉，Codex 回落到内置 openai。
+//!
+//! ## 不碰 auth.json
+//!
+//! `auth.json` 是**官方登录态**的地盘（`tokens` / `auth_mode`），Codex App 里
+//! 显示的「账号」就来自它。早前版本把密钥写成 `auth.json` 的 `OPENAI_API_KEY`
+//! 并配 `requires_openai_auth = true`：身份当场被换成 API key 模式，界面上账号
+//! 变成我们的 provider 名；还原时只要密钥对不上（重置过密钥、换机器）就删不掉，
+//! 账号一直卡在第三方。
+//!
+//! 现在密钥只进 `config.toml`：无论接入还是取消，Codex 的官方登录态都原样不动。
+//! `auth.json` 只在**清理旧版残留**时被写（见 `clean_auth_residue`）—— 见不得
+//! 我们自己写进去的那个 `k2a-…` 留在那儿继续冒充用户的登录身份。
 //!
 //! ## 取消接管 = 还原，不是删除
 //!
@@ -27,10 +38,6 @@
 //! 所以接管前把 `config.toml` **整份**快照到应用数据目录（`Kiro2API/codex-backup/`），
 //! 取消接管时整份放回去。快照只在还没有快照时做一次 —— 重复点「应用」时配置里
 //! 已经是我们写的内容，再快照一次就把还原点覆盖成「接管后」了。
-//!
-//! auth.json 不做整份还原：里面的 ChatGPT token 会被 Codex 不停刷新，回滚整份
-//! 等于让用户掉登录。只把接管前那一个 `OPENAI_API_KEY` 放回去（接管前没有就删掉
-//! 我们自己写进去的那个，用户后来自己加的别动）。
 //!
 //! 缺快照（本次改动之前就接管过的）时退回旧行为：逐键删除，至少不留指向本应用的悬空配置。
 //!
@@ -66,6 +73,15 @@ use crate::workbuddy::origin_matches;
 /// 本应用在 Codex 里的 provider id。写配置与扫描识别都用它。
 const PROVIDER_ID: &str = "kiro2api";
 
+/// provider 表里放密钥的键。Codex 会把它当 `Authorization: Bearer` 发出去，
+/// 与 `requires_openai_auth`（读 auth.json 的 `OPENAI_API_KEY`）互斥 —— 我们只用
+/// 这一个，auth.json 留给官方登录。
+const TOKEN_FIELD: &str = "experimental_bearer_token";
+
+/// 本应用密钥的形态（`prefs::generate_api_key`）。用来认出「旧版写进 auth.json
+/// 的残留」—— 重置过密钥后，旧值已和当前密钥对不上，只能按形态认。
+const KEY_PREFIX: &str = "k2a-";
+
 /// 模型目录文件名（相对 ~/.codex）。指针识别按 basename 比对，用户就算把
 /// 指针写成绝对路径也认得出是我们的。
 const CATALOG_FILENAME: &str = "kiro2api-model-catalog.json";
@@ -78,7 +94,8 @@ pub struct CodexEntry {
     pub base_url: String,
     /// 顶层 `model_provider` 是否指向它（即 Codex 当前正在用它）。
     pub active: bool,
-    /// auth.json 里的密钥与当前代理密钥是否一致；false 时界面提示重置密钥已让它过期。
+    /// provider 配置里的密钥（`experimental_bearer_token`，旧版在 auth.json）与
+    /// 当前代理密钥是否一致；false 时界面提示重置密钥已让它过期。
     pub key_matches: bool,
 }
 
@@ -110,7 +127,8 @@ pub struct CodexScan {
 #[serde(rename_all = "camelCase")]
 pub struct CodexImportSummary {
     pub config_written: bool,
-    pub auth_written: bool,
+    /// 密钥是否（重新）写进 provider 配置。密钥只进 `config.toml`，不再写 auth.json。
+    pub key_written: bool,
     /// 模型目录文件被写入或删除
     pub catalog_written: bool,
     /// Codex 顶层默认模型被写入或撤除
@@ -178,9 +196,8 @@ struct TakeoverMeta {
     /// 接管那一刻 `config.toml` 是否存在。不存在说明这文件是我们从无到有写的，
     /// 取消接管时该把它删掉，而不是还原成一份空文件。
     had_config: bool,
-    /// 接管那一刻 `auth.json` 是否存在（同上：不存在就别留个空对象在那儿）。
-    had_auth: bool,
     /// 接管那一刻 auth.json 里用户自己的 `OPENAI_API_KEY`（没有则为 None）。
+    /// 我们不再往 auth.json 写密钥，这个字段只为还原旧版接管留下的现场。
     auth_key: Option<String>,
 }
 
@@ -203,7 +220,6 @@ fn snapshot_before_takeover(root: &Path, dir: &Path) -> Result<bool, String> {
         write_atomic(&backup_config_path(root), &text)?;
     }
     let auth_file = auth_path(dir);
-    let had_auth = auth_file.is_file();
     let auth_key = read_auth(&auth_file)
         .ok()
         .and_then(|auth| {
@@ -211,10 +227,13 @@ fn snapshot_before_takeover(root: &Path, dir: &Path) -> Result<bool, String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .filter(|key| !key.trim().is_empty());
+        .filter(|key| !key.trim().is_empty())
+        // 快照里这个键本身可能就是旧版我们自己写进去的（老用户点「应用」时
+        // auth.json 里已全是我们的痕迹）：那是残留，不能当成「用户的原始密钥」
+        // 记下来 —— 否则还原会把我们的密钥放回去，账号永远卡在第三方。
+        .filter(|key| !key.trim().starts_with(KEY_PREFIX));
     let meta = TakeoverMeta {
         had_config,
-        had_auth,
         auth_key,
     };
     let body = serde_json::to_string_pretty(&meta).map_err(|e| format!("序列化备份摘要失败: {e}"))?;
@@ -264,35 +283,22 @@ fn restore_from_backup(root: &Path, dir: &Path, api_key: &str) -> Result<bool, S
             .map_err(|e| format!("删除接管时新建的 config.toml 失败: {e}"))?;
     }
 
-    let mut auth_changed = false;
-    if let Some(obj) = auth.as_object_mut() {
-        let current = obj
-            .get("OPENAI_API_KEY")
-            .and_then(Value::as_str)
-            .map(str::trim);
-        match meta.auth_key.as_deref().map(str::trim) {
-            // 接管前有自己的密钥：放回去（已经被改回同一个值就不写盘）
-            Some(original) if current != Some(original) => {
-                obj.insert("OPENAI_API_KEY".to_string(), Value::String(original.to_string()));
-                auth_changed = true;
-            }
-            // 接管前没有：只删我们自己写进去的那个，用户后来自己加的别动
-            None if current == Some(api_key.trim()) => {
-                obj.remove("OPENAI_API_KEY");
-                auth_changed = true;
-            }
-            _ => {}
-        }
-    }
+    let auth_changed = match meta.auth_key.as_deref().map(str::trim) {
+        // 接管前有自己的密钥：放回去。旧快照可能记着的是我们自己写的密钥
+        // （见 `snapshot_before_takeover`），按形态认出来当残留处理。
+        Some(original) if !is_our_key(original, api_key) => restore_user_key(&mut auth, original),
+        // 接管前没有：把我们的痕迹清干净（新版不写 auth.json，旧版写过）。
+        // 不按「等于当前密钥」判 —— 密钥重置过、换了机器就删不掉，正是旧版
+        // 还原后 Codex 仍显示第三方账号的原因。
+        _ => clean_auth_residue(&mut auth, api_key),
+    };
     if auth_changed {
-        // 接管前根本没有 auth.json，而还原后它只剩一个空对象：连文件一起还回「不存在」
-        if !meta.had_auth && auth.as_object().is_some_and(|obj| obj.is_empty()) {
+        // 清完只剩空对象等于「没有登录态」：连文件一起还回「不存在」，
+        // 留一份 `{}` 只会让 Codex 与用户都以为这里还有点东西
+        if auth.as_object().is_some_and(|obj| obj.is_empty()) {
             let _ = fs::remove_file(&auth_file);
         } else {
-            write_atomic(
-                &auth_file,
-                &serde_json::to_string(&auth).map_err(|e| format!("序列化失败: {e}"))?,
-            )?;
+            write_auth(&auth_file, &auth)?;
         }
     }
 
@@ -440,10 +446,14 @@ fn parse_catalog_text(text: &str) -> Result<Vec<String>, String> {
 }
 
 /// entries 的 doc 级核心：scan_files 与测试共用同一次解析。
+///
+/// 密钥优先取 provider 表里的 `experimental_bearer_token`；表里没有时用
+/// `legacy_auth_key`（auth.json 的 `OPENAI_API_KEY`）兜底 —— 那是旧版写法，
+/// 老用户点「应用」后自然迁到新位置。
 fn entries_from_doc(
     doc: &DocumentMut,
     port: u16,
-    stored_key: Option<&str>,
+    legacy_auth_key: Option<&str>,
     current_key: Option<&str>,
 ) -> Vec<CodexEntry> {
     let active_provider = doc
@@ -453,10 +463,6 @@ fn entries_from_doc(
     let Some(providers) = doc.get("model_providers").and_then(|item| item.as_table_like()) else {
         return Vec::new();
     };
-    let key_matches = matches!(
-        (stored_key, current_key),
-        (Some(stored), Some(current)) if stored.trim() == current.trim()
-    );
     let mut entries = Vec::new();
     for (id, item) in providers.iter() {
         let Some(provider) = item.as_table_like() else {
@@ -468,6 +474,15 @@ fn entries_from_doc(
         if !origin_matches(base_url, port) {
             continue;
         }
+        let stored_key = provider
+            .get(TOKEN_FIELD)
+            .and_then(|v| v.as_str())
+            .or(legacy_auth_key);
+        let key_matches = matches!(
+            (stored_key, current_key),
+            (Some(stored), Some(current))
+                if !current.trim().is_empty() && stored.trim() == current.trim()
+        );
         entries.push(CodexEntry {
             id: id.to_string(),
             base_url: base_url.to_string(),
@@ -507,10 +522,19 @@ fn put_top_value(doc: &mut DocumentMut, key: &str, new: toml_edit::Value) {
 /// 指到它，并按 `models` 维护模型目录指针与顶层默认 model。只设置本应用的
 /// 键，provider 表里用户自己加的其余键（http_headers 等）原样保留。
 ///
+/// 密钥写进 provider 表的 `experimental_bearer_token`（auth.json 一概不碰）；
+/// 旧版写过的 `requires_openai_auth` 顺手清掉 —— 它会让 Codex 转而读 auth.json，
+/// 两个凭据来源同时在场只会打架。
+///
 /// 返回「是否接管了目录」—— Foreign 指针下一律 false（目录与 model 不碰）；
 /// models 为空且指针是我们的 = 撤指针撤 model，也算接管。顶层 model 的取舍：
 /// 用户已在 Codex /model 里选了我们清单中的模型时保留其选择，否则落到第一个。
-fn import_into_document(doc: &mut DocumentMut, base_url: &str, models: &[String]) -> bool {
+fn import_into_document(
+    doc: &mut DocumentMut,
+    base_url: &str,
+    api_key: &str,
+    models: &[String],
+) -> bool {
     if doc
         .get("model_providers")
         .and_then(Item::as_table_like)
@@ -536,7 +560,8 @@ fn import_into_document(doc: &mut DocumentMut, base_url: &str, models: &[String]
     provider.insert("name", value(PROVIDER_ID));
     provider.insert("base_url", value(base_url));
     provider.insert("wire_api", value("responses"));
-    provider.insert("requires_openai_auth", value(true));
+    provider.insert(TOKEN_FIELD, value(api_key));
+    provider.remove("requires_openai_auth");
     put_top_value(doc, "model_provider", PROVIDER_ID.into());
 
     // 指针状态此刻还是旧值（下面才动 model_catalog_json）
@@ -560,24 +585,118 @@ fn import_into_document(doc: &mut DocumentMut, base_url: &str, models: &[String]
     true
 }
 
-/// 密钥合并的核心（纯函数）：把 OPENAI_API_KEY 写进 auth 对象，其余字段
-/// （ChatGPT 登录的 tokens 等）原样保留。返回是否发生变化。
-fn merge_auth_key(auth: &mut Value, api_key: &str) -> bool {
+/// provider 表里记录的密钥。旧版把密钥写在 auth.json，这里返回 None，由调用方
+/// 用 auth.json 的值兜底（见 `scan_files`）。
+fn provider_token(doc: &DocumentMut) -> Option<String> {
+    doc.get("model_providers")
+        .and_then(|item| item.as_table_like())
+        .and_then(|providers| providers.get(PROVIDER_ID))
+        .and_then(|item| item.as_table_like())
+        .and_then(|provider| provider.get(TOKEN_FIELD))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// 这个 `OPENAI_API_KEY` 是不是我们写的：等于当前密钥，或者是本应用的密钥形态
+/// （`k2a-` 前缀 —— 重置过密钥之后，旧值就只剩形态可认）。用户自己的 `sk-…` 不动。
+fn is_our_key(value: &str, api_key: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && (value == api_key.trim() || value.starts_with(KEY_PREFIX))
+}
+
+/// auth 对象里除了 `auth_mode` 之外还有没有真凭据（ChatGPT tokens、PAT、Bedrock…）。
+/// 有就说明用户确实登录过官方，`auth_mode` 不能当残留删。
+fn has_real_credentials(obj: &serde_json::Map<String, Value>) -> bool {
+    [
+        "tokens",
+        "personal_access_token",
+        "agent_identity",
+        "bedrock_api_key",
+        "bedrock_access_keys",
+    ]
+    .iter()
+    .any(|key| {
+        obj.get(*key).is_some_and(|value| match value {
+            Value::Null => false,
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Object(map) => !map.is_empty(),
+            _ => true,
+        })
+    })
+}
+
+/// 清理 auth.json 的旧版残留（纯函数）。只做减法，官方登录凭据一个不碰。
+///
+/// * `OPENAI_API_KEY` 是我们的 → 删（旧版接管时写进去的）；
+/// * 删完只剩 `auth_mode = "apikey"`，既没有密钥也没有任何真凭据 → 连 `auth_mode`
+///   一起删。`resolved_mode` 是「显式 auth_mode 优先」，留着它 Codex 仍按 API key
+///   身份运行（界面账号卡在第三方），这是旧版还原不干净的真正原因。
+fn clean_auth_residue(auth: &mut Value, api_key: &str) -> bool {
     let Some(obj) = auth.as_object_mut() else {
         return false;
     };
-    let changed = obj
+    let mut changed = false;
+    if obj
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
-        .map(str::trim)
-        != Some(api_key.trim());
-    if changed {
-        obj.insert(
-            "OPENAI_API_KEY".to_string(),
-            Value::String(api_key.to_string()),
-        );
+        .is_some_and(|value| is_our_key(value, api_key))
+    {
+        obj.remove("OPENAI_API_KEY");
+        changed = true;
+    }
+    let api_key_mode = obj
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("apikey"));
+    let key_left = obj
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if api_key_mode && !key_left && !has_real_credentials(obj) {
+        obj.remove("auth_mode");
+        changed = true;
     }
     changed
+}
+
+/// 接管前的用户密钥归位（纯函数）。返回是否变化。
+fn restore_user_key(auth: &mut Value, original: &str) -> bool {
+    let Some(obj) = auth.as_object_mut() else {
+        return false;
+    };
+    let current = obj
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    if current == Some(original.trim()) {
+        return false;
+    }
+    obj.insert(
+        "OPENAI_API_KEY".to_string(),
+        Value::String(original.to_string()),
+    );
+    true
+}
+
+/// 把上面的纯函数落到盘上。`drop_if_empty` 为 true 时，清完只剩空对象的
+/// auth.json 直接删掉 —— 空文件与「没有」等价，留着只是噪音。
+fn clean_auth_file(auth_file: &Path, api_key: &str, drop_if_empty: bool) -> Result<bool, String> {
+    let mut auth = read_auth(auth_file)?;
+    if !clean_auth_residue(&mut auth, api_key) {
+        return Ok(false);
+    }
+    if drop_if_empty && auth.as_object().is_some_and(|obj| obj.is_empty()) {
+        let _ = fs::remove_file(auth_file);
+        return Ok(true);
+    }
+    write_auth(auth_file, &auth)?;
+    Ok(true)
+}
+
+/// 写 auth.json。内容来自读盘 + 删键，序列化失败只可能是内部问题。
+fn write_auth(path: &Path, auth: &Value) -> Result<(), String> {
+    let body = serde_json::to_string(auth).map_err(|e| format!("序列化失败: {e}"))?;
+    write_atomic(path, &body)
 }
 
 /// 移除的核心（纯函数）：删掉指向本应用的 provider 表与指向它的顶层选择，
@@ -623,18 +742,8 @@ fn remove_from_parts(
         catalog_removed = true;
     }
 
-    let mut auth_changed = false;
-    if let Some(obj) = auth.as_object_mut() {
-        let ours_key = obj
-            .get("OPENAI_API_KEY")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            == Some(api_key.trim());
-        if ours_key {
-            obj.remove("OPENAI_API_KEY");
-            auth_changed = true;
-        }
-    }
+    // 旧版把密钥写在 auth.json：按形态认（重置过密钥也认得出），新版没有这个键
+    let auth_changed = clean_auth_residue(auth, api_key);
     (config_changed, auth_changed, catalog_removed)
 }
 
@@ -702,9 +811,11 @@ fn import_to_dir(
         .get("model")
         .and_then(|item| item.as_str())
         .map(str::to_string);
+    let token_before = provider_token(&doc);
     let before = doc.to_string();
-    let catalog_managed = import_into_document(&mut doc, base_url, models);
+    let catalog_managed = import_into_document(&mut doc, base_url, api_key, models);
     let config_written = doc.to_string() != before;
+    let key_written = provider_token(&doc) != token_before;
     let model_written = doc
         .get("model")
         .and_then(|item| item.as_str())
@@ -735,15 +846,12 @@ fn import_to_dir(
         let _ = fs::remove_file(&catalog_file);
     }
 
-    let auth_file = auth_path(dir);
-    let mut auth = read_auth(&auth_file)?;
-    let auth_written = merge_auth_key(&mut auth, api_key);
-    if auth_written {
-        write_atomic(&auth_file, &serde_json::to_string(&auth).map_err(|e| format!("序列化失败: {e}"))?)?;
-    }
+    // auth.json 只清理旧版残留（早前版本把密钥写进了 OPENAI_API_KEY，可能还留下
+    // auth_mode = "apikey"）：它承载的是官方登录身份，我们不往里写自己的东西。
+    clean_auth_file(&auth_path(dir), api_key, true)?;
     Ok(CodexImportSummary {
         config_written,
-        auth_written,
+        key_written,
         catalog_written,
         model_written,
         codex_running: codex_app_running(),
@@ -785,6 +893,7 @@ fn scan_files(port: Option<u16>, api_key: Option<&str>) -> CodexScan {
             };
         }
     };
+    // 旧版把密钥写在 auth.json，读出来只作 provider 表缺 token 时的兜底
     let auth_key = read_auth(&auth_path(&dir))
         .ok()
         .and_then(|auth| auth.get("OPENAI_API_KEY").and_then(Value::as_str).map(str::to_string));
@@ -902,10 +1011,11 @@ fn remove_from_dir(
         write_atomic(&config_file, &doc.to_string())?;
     }
     if auth_changed {
-        write_atomic(
-            &auth_file,
-            &serde_json::to_string(&auth).map_err(|e| format!("序列化失败: {e}"))?,
-        )?;
+        if auth.as_object().is_some_and(|obj| obj.is_empty()) {
+            let _ = fs::remove_file(&auth_file);
+        } else {
+            write_auth(&auth_file, &auth)?;
+        }
     }
     if catalog_removed {
         let _ = fs::remove_file(catalog_path(dir));
@@ -920,6 +1030,7 @@ mod tests {
 
     const PORT: u16 = 5680;
     const BASE_URL: &str = "http://127.0.0.1:5680/openai/v1";
+    const API_KEY: &str = "k2a-1";
 
     #[test]
     fn import_creates_provider_and_activates_on_fresh_config() {
@@ -927,6 +1038,7 @@ mod tests {
         assert!(import_into_document(
             &mut doc,
             BASE_URL,
+            API_KEY,
             &["gpt-5.2-codex".to_string()],
         ));
         let text = doc.to_string();
@@ -934,7 +1046,9 @@ mod tests {
         let provider = &parsed["model_providers"][PROVIDER_ID];
         assert_eq!(provider["base_url"].as_str(), Some(BASE_URL));
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
-        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+        // 密钥进 provider 表，auth.json 一概不碰
+        assert_eq!(provider[TOKEN_FIELD].as_str(), Some(API_KEY));
+        assert!(provider.get("requires_openai_auth").is_none());
         assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
         // 勾选了模型：接管目录指针，默认模型落到第一个
         assert_eq!(parsed["model_catalog_json"].as_str(), Some(CATALOG_FILENAME));
@@ -959,6 +1073,7 @@ wire_api = "responses"
         assert!(import_into_document(
             &mut doc,
             BASE_URL,
+            API_KEY,
             &["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
         ));
         let text = doc.to_string();
@@ -984,11 +1099,15 @@ requires_openai_auth = true
 X-Custom = "keep-me"
 "#;
         let mut doc = input.parse::<DocumentMut>().unwrap();
-        import_into_document(&mut doc, BASE_URL, &[]);
+        import_into_document(&mut doc, BASE_URL, API_KEY, &[]);
         let text = doc.to_string();
         assert!(text.contains("127.0.0.1:5680"));
         assert!(!text.contains("127.0.0.1:1111"));
         assert!(text.contains("keep-me"), "用户自己的键必须保留");
+        assert!(
+            !text.contains("requires_openai_auth"),
+            "旧版写的 requires_openai_auth 必须清掉，否则 Codex 仍去读 auth.json"
+        );
         let parsed: DocumentMut = text.parse().unwrap();
         assert_eq!(parsed["model_provider"].as_str(), Some(PROVIDER_ID));
         // 从没写过目录 + 空清单：不该冒出指针
@@ -1004,7 +1123,7 @@ model = "their-pick"
         let mut doc = input.parse::<DocumentMut>().unwrap();
         let models = vec!["gpt-5.2".to_string()];
         // 目录归别家管：目录与 model 不碰，provider 照常接管
-        assert!(!import_into_document(&mut doc, BASE_URL, &models));
+        assert!(!import_into_document(&mut doc, BASE_URL, API_KEY, &models));
         let parsed: DocumentMut = doc.to_string().parse().unwrap();
         assert_eq!(
             parsed["model_catalog_json"].as_str(),
@@ -1021,7 +1140,7 @@ model = "their-pick"
         );
         let mut doc = input.parse::<DocumentMut>().unwrap();
         let models = vec!["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()];
-        assert!(import_into_document(&mut doc, BASE_URL, &models));
+        assert!(import_into_document(&mut doc, BASE_URL, API_KEY, &models));
         let parsed: DocumentMut = doc.to_string().parse().unwrap();
         // 用户在 Codex /model 里选的还在清单里：保留，不重置成第一个
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2-codex"));
@@ -1031,7 +1150,7 @@ model = "their-pick"
     fn import_overwrite_keeps_comments_on_replaced_keys() {
         let input = "# 选型说明\nmodel = \"gpt-5.3\"\n\n# 用这个中转\nmodel_provider = \"relay\"\n";
         let mut doc = input.parse::<DocumentMut>().unwrap();
-        import_into_document(&mut doc, BASE_URL, &["gpt-5.2".to_string()]);
+        import_into_document(&mut doc, BASE_URL, API_KEY, &["gpt-5.2".to_string()]);
         let text = doc.to_string();
         assert!(text.contains("# 选型说明"), "被覆盖键上的注释必须保留");
         assert!(text.contains("# 用这个中转"), "被覆盖键上的注释必须保留");
@@ -1044,7 +1163,7 @@ model = "their-pick"
     fn import_with_no_models_clears_ours_and_leaves_foreign() {
         let ours = format!("model_catalog_json = \"{CATALOG_FILENAME}\"\nmodel = \"gpt-5.2\"\n");
         let mut doc = ours.parse::<DocumentMut>().unwrap();
-        assert!(import_into_document(&mut doc, BASE_URL, &[]));
+        assert!(import_into_document(&mut doc, BASE_URL, API_KEY, &[]));
         let parsed: DocumentMut = doc.to_string().parse().unwrap();
         assert!(parsed.get("model_catalog_json").is_none());
         assert!(parsed.get("model").is_none());
@@ -1052,7 +1171,7 @@ model = "their-pick"
 
         let foreign = "model_catalog_json = \"other.json\"\nmodel = \"their-model\"\n";
         let mut doc = foreign.parse::<DocumentMut>().unwrap();
-        assert!(!import_into_document(&mut doc, BASE_URL, &[]));
+        assert!(!import_into_document(&mut doc, BASE_URL, API_KEY, &[]));
         let parsed: DocumentMut = doc.to_string().parse().unwrap();
         assert_eq!(parsed["model_catalog_json"].as_str(), Some("other.json"));
         assert_eq!(parsed["model"].as_str(), Some("their-model"));
@@ -1278,6 +1397,14 @@ wire_api = "responses"
         let inactive = entries_from(Some("k2a-2"), Some("k2a-1"));
         assert!(!inactive[0].key_matches);
 
+        // 新版把密钥写在 provider 表：表里的值优先于 auth.json 兜底
+        let with_token = format!(
+            "model_provider = \"{PROVIDER_ID}\"\n\n[model_providers.{PROVIDER_ID}]\nbase_url = \"{BASE_URL}\"\n{TOKEN_FIELD} = \"k2a-2\"\n"
+        );
+        let doc = with_token.parse::<DocumentMut>().unwrap();
+        let entries = entries_from_doc(&doc, PORT, Some("k2a-1"), Some("k2a-1"));
+        assert!(!entries[0].key_matches, "表里的密钥与当前不一致要报出来");
+
         // 没配过（config.toml 不存在按空文档算）：空清单
         let empty = "".parse::<DocumentMut>().unwrap();
         assert!(entries_from_doc(&empty, PORT, None, None).is_empty());
@@ -1286,16 +1413,43 @@ wire_api = "responses"
     }
 
     #[test]
-    fn merge_auth_key_preserves_other_fields() {
+    fn clean_residue_removes_our_key_and_keeps_official_login() {
         let mut auth = json!({
+            "OPENAI_API_KEY": "k2a-1",
             "tokens": { "access_token": "chatgpt" },
             "last_refresh": "2026-01-01",
         });
-        assert!(merge_auth_key(&mut auth, "k2a-1"));
-        assert_eq!(auth["OPENAI_API_KEY"], "k2a-1");
+        assert!(clean_auth_residue(&mut auth, "k2a-1"));
+        assert!(auth.get("OPENAI_API_KEY").is_none());
         assert_eq!(auth["tokens"]["access_token"], "chatgpt");
         // 幂等
-        assert!(!merge_auth_key(&mut auth, "k2a-1"));
+        assert!(!clean_auth_residue(&mut auth, "k2a-1"));
+    }
+
+    #[test]
+    fn clean_residue_recognizes_rotated_key_by_shape() {
+        // 重置过密钥：旧残留与当前密钥对不上，按 `k2a-` 形态仍要认得出
+        let mut auth = json!({ "OPENAI_API_KEY": "k2a-old" });
+        assert!(clean_auth_residue(&mut auth, "k2a-new"));
+        assert!(auth.as_object().unwrap().is_empty());
+        // 用户自己的密钥一概不动
+        let mut own = json!({ "OPENAI_API_KEY": "sk-user-own" });
+        assert!(!clean_auth_residue(&mut own, "k2a-new"));
+        assert_eq!(own["OPENAI_API_KEY"], "sk-user-own");
+    }
+
+    #[test]
+    fn clean_residue_drops_dead_api_key_mode() {
+        // 只删密钥会留下 auth_mode = "apikey"：显式模式优先于字段存在性，
+        // Codex 仍按 API key 身份运行（账号卡在第三方），必须一起撤
+        let mut dead = json!({ "auth_mode": "apikey", "OPENAI_API_KEY": "k2a-1" });
+        assert!(clean_auth_residue(&mut dead, "k2a-1"));
+        assert!(dead.as_object().unwrap().is_empty());
+
+        // 真凭据在场时 auth_mode 不能当残留删
+        let mut logged_in = json!({ "auth_mode": "apikey", "tokens": { "access_token": "x" } });
+        assert!(!clean_auth_residue(&mut logged_in, "k2a-1"));
+        assert_eq!(logged_in["auth_mode"], "apikey");
     }
 
     #[test]
@@ -1433,7 +1587,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn clear_restores_user_own_api_key() {
+    fn takeover_never_touches_user_auth_json() {
         let (dir, backup) = takeover_dirs("authkey");
         fs::write(config_path(&dir), ORIGINAL_CONFIG).unwrap();
         fs::write(
@@ -1443,16 +1597,45 @@ wire_api = "responses"
         .unwrap();
 
         import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
+        // 密钥进 config.toml，auth.json 一字不动 —— 官方登录态与账号显示不受影响
         let taken: Value =
             serde_json::from_str(&fs::read_to_string(auth_path(&dir)).unwrap()).unwrap();
-        assert_eq!(taken["OPENAI_API_KEY"], "k2a-1");
+        assert_eq!(taken["OPENAI_API_KEY"], "sk-user-own");
+        let config = fs::read_to_string(config_path(&dir)).unwrap();
+        assert!(config.contains("k2a-1"));
 
         remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
         let after: Value =
             serde_json::from_str(&fs::read_to_string(auth_path(&dir)).unwrap()).unwrap();
-        // 用户自己的密钥必须还回来（不能因为我们清空就把它删了）
+        // 用户自己的密钥必须还在（不能因为我们清空就把它删了）
         assert_eq!(after["OPENAI_API_KEY"], "sk-user-own");
         assert_eq!(after["tokens"]["a"], 1);
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn legacy_auth_residue_is_cleaned_on_both_sides() {
+        // 旧版接管留下的现场：auth.json 里有我们的密钥 + auth_mode = "apikey"
+        let (dir, backup) = takeover_dirs("legacy");
+        fs::write(config_path(&dir), ORIGINAL_CONFIG).unwrap();
+        fs::write(
+            auth_path(&dir),
+            json!({ "auth_mode": "apikey", "OPENAI_API_KEY": "k2a-old" }).to_string(),
+        )
+        .unwrap();
+
+        // 点「应用」即迁移：密钥挪进 provider 表，auth.json 的残留清空并删文件
+        import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
+        assert!(!auth_path(&dir).exists(), "旧残留清空后 auth.json 不该留着");
+
+        // 再放一份残留，走「取消接入」：同样要清干净（密钥已重置也对得上）
+        fs::write(
+            auth_path(&dir),
+            json!({ "auth_mode": "apikey", "OPENAI_API_KEY": "k2a-older" }).to_string(),
+        )
+        .unwrap();
+        remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
+        assert!(!auth_path(&dir).exists());
         fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 
@@ -1476,16 +1659,17 @@ wire_api = "responses"
     }
 
     #[test]
-    fn clear_removes_config_and_auth_we_created_from_nothing() {
+    fn clear_removes_config_we_created_from_nothing() {
         let (dir, backup) = takeover_dirs("fresh");
         // 接管前：没有 config.toml，也没有 auth.json
         import_to_dir(&dir, &backup, BASE_URL, "k2a-1", &["gpt-5.2".to_string()]).unwrap();
         assert!(config_path(&dir).is_file());
-        assert!(auth_path(&dir).is_file());
+        // 密钥写在 provider 表里，auth.json 连文件都不该冒出来
+        assert!(!auth_path(&dir).exists());
 
         let (removed, restored) = remove_from_dir(&dir, &backup, PORT, "k2a-1").unwrap();
         assert!(removed && restored);
-        // 还回「不存在」，而不是留两份空文件
+        // 还回「不存在」，而不是留一份空文件
         assert!(!config_path(&dir).exists());
         assert!(!auth_path(&dir).exists());
         fs::remove_dir_all(dir.parent().unwrap()).ok();
@@ -1496,7 +1680,7 @@ wire_api = "responses"
         // 本次改动之前就接管过的用户：没有快照，退回逐键删除（至少不留悬空配置）
         let (dir, backup) = takeover_dirs("nosnapshot");
         let mut doc: DocumentMut = ORIGINAL_CONFIG.parse().unwrap();
-        import_into_document(&mut doc, BASE_URL, &["gpt-5.2".to_string()]);
+        import_into_document(&mut doc, BASE_URL, API_KEY, &["gpt-5.2".to_string()]);
         fs::write(config_path(&dir), doc.to_string()).unwrap();
         fs::write(auth_path(&dir), json!({ "OPENAI_API_KEY": "k2a-1" }).to_string()).unwrap();
 

@@ -460,9 +460,10 @@ async function reveal(path: RevealTarget): Promise<void> {
 /**
  * 取消 Codex 接入（UI 上的「取消接入」按钮，空清单应用也走这里）。
  *
- * 后端有接管前的快照时**整份还原** config.toml，只把 auth.json 里那一个密钥键
- * 归位 —— 所以这里要区分「已还原」与「只是删掉」：老用户（本次改动之前就接入过）
- * 没有快照，只能说「已清空」，说了「已还原」是骗人。
+ * 后端有接管前的快照时**整份还原** config.toml；auth.json 不还原（里面的
+ * ChatGPT token 会被 Codex 不停刷新），只清掉旧版残留的我们的密钥与
+ * `auth_mode = "apikey"` —— 所以这里要区分「已还原」与「只是删掉」：老用户
+ * （本次改动之前就接入过）没有快照，只能说「已清空」，说了「已还原」是骗人。
  *
  * 确有改动且 Codex 正在跑时挂出重启确认：Codex 只在启动时读配置，正在跑的
  * 那个还捧着旧配置；没在跑就没有「重启才生效」的问题，下次启动自然读新配置。
@@ -695,7 +696,7 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
           summary.configWritten ? 'provider 已写入' : '',
           summary.catalogWritten ? '模型目录已更新' : '',
           summary.modelWritten ? '默认模型已写入' : '',
-          summary.authWritten ? '密钥已同步' : '',
+          summary.keyWritten ? '密钥已同步' : '',
         ].filter(Boolean);
         feedback.toast(parts.length ? `已应用 Codex 变更：${parts.join('、')}` : 'Codex 已是最新配置，没有变更');
         // 确有写入才问重启：Codex 只在启动时读一次配置，跑着的不重启就不换模型；

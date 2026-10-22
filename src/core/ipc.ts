@@ -77,8 +77,9 @@ export const backend = {
 
   // ── Codex 接入管理 ─────────────────────────────────────────────────────
   /**
-   * 接入 Codex：写 provider 表、激活它、同步密钥到 auth.json，并按传入的
-   * 模型清单维护目录文件与顶层默认 model（空清单 = 撤目录）。
+   * 接入 Codex：写 provider 表（含密钥 `experimental_bearer_token`）、激活它，
+   * 并按传入的模型清单维护目录文件与顶层默认 model（空清单 = 撤目录）。
+   * auth.json 是 Codex 官方登录态的地盘，一概不写。
    * 地址与密钥由后端从当前配置里取 —— 密钥不经过前端，与「复制」同一条纪律。
    */
   codexImport: (models: string[]) => invoke<CodexImportSummary>('k2a_codex_import', { models }),

@@ -100,7 +100,7 @@ function codexStateNote(state: AppState): string {
   if (!scan || !scan.entries.length) return '';
   if (!scan.entries.every((entry) => entry.keyMatches)) {
     return note(
-      'auth.json 里的密钥与当前代理密钥不一致，Codex 的请求会被 401 拒绝；点「应用」用当前密钥覆盖。',
+      '配置里记录的密钥与当前代理密钥不一致（多半是重置过密钥），Codex 的请求会被 401 拒绝；点「应用」用当前密钥覆盖。',
       'warn',
     );
   }

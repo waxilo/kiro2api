@@ -69,7 +69,7 @@ export interface CodexEntry {
   baseUrl: string;
   /** 顶层 `model_provider` 是否指向它 —— 即 Codex 当前是否正在用它。 */
   active: boolean;
-  /** auth.json 里的密钥与当前代理密钥是否一致；false 时界面提示重置密钥已让它过期。 */
+  /** provider 配置里的密钥与当前代理密钥是否一致；false 时界面提示重置密钥已让它过期。 */
   keyMatches: boolean;
 }
 
@@ -99,7 +99,8 @@ export interface CodexScan {
 /** `k2a_codex_import` 的返回：接入 Codex 后哪些东西真的写了。 */
 export interface CodexImportSummary {
   configWritten: boolean;
-  authWritten: boolean;
+  /** 密钥是否写进 provider 配置（`experimental_bearer_token`）；auth.json 一概不碰。 */
+  keyWritten: boolean;
   /** 模型目录文件被写入或删除。 */
   catalogWritten: boolean;
   /** Codex 顶层默认模型被写入或撤除。 */
