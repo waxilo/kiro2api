@@ -921,3 +921,40 @@ button.modal-close:hover:not(:disabled):not([aria-disabled='true']) {
     transform: translateY(10px) scale(0.98);
   }
 }
+
+/* ── 登录弹窗：等待浏览器确认时的验证码 ───────────────────────────── */
+.login-wait {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-sm);
+  text-align: center;
+}
+
+.login-wait-label {
+  font-size: var(--t-small);
+  color: var(--ink-subtle);
+}
+
+.login-code {
+  padding: 8px 18px;
+  border-radius: var(--r-lg);
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-family: var(--font-mono);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  user-select: all;
+}
+
+.login-wait-hint {
+  font-size: var(--t-caption);
+  color: var(--ink-tertiary);
+}
+
+.modal-body .btn-row {
+  justify-content: flex-end;
+}

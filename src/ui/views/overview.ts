@@ -120,12 +120,17 @@ export const overviewView: ViewSpec = {
     // * 凭据不可用 → 「重新检测」，只重读本地。此时「刷新凭据」必然失败（没有 refreshToken
     //   可刷），摆在那里只会把人引到一条死路上；而人真正会做的事是去窗口外面登录一次，
     //   再回来问「好了没」—— 这正是「重新检测」回答的问题。
+    // 「登录」打开设备码登录弹窗（data-modal 让弹窗关闭时焦点回到这颗按钮）；
+    // 已经是 Kiro2API 自己的登录时换成「退出登录」，回到读取 IDE / CLI 的凭据。
+    const loginButton = status?.ownLogin
+      ? `<button class="small" data-action="logout"${actionAttrs(state, ACTION.logout)}>退出登录</button>`
+      : `<button class="small" data-action="open-modal" data-modal="login">登录</button>`;
     const credentialAction = !status
       ? ''
       : available
-        ? `<button class="small" data-action="refresh-token"
+        ? `${loginButton}<button class="small" data-action="refresh-token"
                    ${actionAttrs(state, ACTION.refreshToken)}>${refreshText}</button>`
-        : `<button class="small" data-action="refresh">重新检测</button>`;
+        : `${loginButton}<button class="small" data-action="refresh">重新检测</button>`;
 
     const credentialBody = !status
       ? note('正在读取凭据状态…')
@@ -140,9 +145,8 @@ export const overviewView: ViewSpec = {
             ),
           ])
         : note(
-            '未找到凭据。请先登录 Kiro IDE，或执行 <code>kiro-cli login</code>，' +
-              '确认 <code>~/.aws/sso/cache/kiro-auth-token.json</code> 存在；' +
-              '登录完成后点右上角「重新检测」。',
+            '未找到凭据。点右上角「登录」用 Builder ID / IAM Identity Center 直接登录；' +
+              '也可以先登录 Kiro IDE 或执行 <code>kiro-cli login</code>，完成后点「重新检测」。',
             'warn',
           );
 

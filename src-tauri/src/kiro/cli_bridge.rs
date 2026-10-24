@@ -165,7 +165,7 @@ fn map_credentials(
 }
 
 /// 0600 + 原子替换，与 auth.rs 写令牌的口径一致
-fn write_secret_file(path: &Path, payload: &Value) -> Result<(), String> {
+pub(crate) fn write_secret_file(path: &Path, payload: &Value) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     {
         let mut file = fs::File::create(&tmp).map_err(|e| format!("创建 {:?} 失败：{e}", tmp))?;

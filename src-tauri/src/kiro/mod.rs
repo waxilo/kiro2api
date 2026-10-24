@@ -1,6 +1,7 @@
 //! Kiro 反代内核：把 Kiro（AWS Kiro IDE）私有 API 翻译成两套公开协议。
 //!
 //! - `auth`：Kiro IDE SSO 凭据读取 + OIDC token 刷新 + 账户模型/额度查询
+//! - `login`：设备码登录（Builder ID / IdC），凭据写进 kiro2api 自有目录
 //! - `eventstream`：AWS Event Stream 二进制帧解析
 //! - `models`：模型名映射 / effort 归一化 / token 估算 / 模型能力 schema
 //! - `transform`：Anthropic ↔ Kiro 请求响应转换
@@ -15,6 +16,7 @@
 pub mod auth;
 pub mod cli_bridge;
 pub mod eventstream;
+pub mod login;
 pub mod models;
 pub mod openai;
 pub mod responses;
@@ -22,4 +24,5 @@ pub mod server;
 pub mod service;
 pub mod transform;
 
+pub use login::*;
 pub use service::*;

@@ -631,6 +631,14 @@ impl Auth {
                     .and_then(|v| v.as_str())
                     .map(|s| format!("，过期 {s}"))
                     .unwrap_or_default();
+                if self.sso_cache_dir == crate::paths::own_credential_dir() {
+                    let who = match token.get("provider").and_then(|v| v.as_str()) {
+                        Some("BuilderId") => "Builder ID",
+                        Some("Enterprise") => "IAM Identity Center",
+                        _ => "设备码",
+                    };
+                    return format!("Kiro2API 登录（{who}）{expires}");
+                }
                 return format!(
                     "Kiro SSO 共享缓存（IDE/CLI 共用，{}）{expires}",
                     self.sso_token_path().display()

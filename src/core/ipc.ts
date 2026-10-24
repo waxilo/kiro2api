@@ -12,6 +12,8 @@ import type {
   CodexRestartResult,
   CodexScan,
   CopyKind,
+  LoginMethod,
+  LoginSession,
   ModelsState,
   ProxyAccess,
   ProxyStatus,
@@ -40,6 +42,18 @@ export const backend = {
   start: (port?: number) => invoke<ProxyStatus>('k2a_start', { port: port ?? null }),
   stop: () => invoke<ProxyStatus>('k2a_stop'),
   refreshToken: () => invoke<ProxyStatus>('k2a_refresh_token'),
+
+  // ── 设备码登录（凭据写进 kiro2api 自有目录，不碰 Kiro IDE / CLI 的登录）────
+  /** 发起登录并打开浏览器；结果走事件 `login://done` / `login://failed`。 */
+  loginStart: (method: LoginMethod, startUrl?: string, region?: string) =>
+    invoke<LoginSession>('k2a_login_start', {
+      method,
+      startUrl: startUrl ?? null,
+      region: region ?? null,
+    }),
+  loginCancel: () => invoke<void>('k2a_login_cancel'),
+  loginReopen: () => invoke<void>('k2a_login_reopen'),
+  logout: () => invoke<ProxyStatus>('k2a_logout'),
 
   // ── 模型 ──────────────────────────────────────────────────────────────
   // 只读的账户模型清单，同步走上游控制面，**不需要**代理在运行

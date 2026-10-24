@@ -8,6 +8,7 @@
 import { esc } from '../../core/format';
 import type { AppState, ModalId } from '../../state/app-state';
 import { ICON } from '../shared/icons';
+import { loginModal } from './login';
 import { modelsModal } from './models';
 import { usageModal } from './usage';
 import type { ModalSpec } from './types';
@@ -15,6 +16,7 @@ import type { ModalSpec } from './types';
 export const MODALS: Record<ModalId, ModalSpec> = {
   models: modelsModal,
   usage: usageModal,
+  login: loginModal,
 };
 
 export type { ModalSpec };

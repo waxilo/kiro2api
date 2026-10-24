@@ -14,6 +14,22 @@ export interface ProxyStatus {
   profileArn: string | null;
   configDir: string;
   debugLogPath: string;
+  /** 当前用的是 kiro2api 自己登录（设备码）的凭据。 */
+  ownLogin: boolean;
+}
+
+/** 设备码登录方式：AWS Builder ID / 企业 IAM Identity Center。 */
+export type LoginMethod = 'builder' | 'idc';
+
+/** `k2a_login_start` 的返回：等待用户在浏览器里确认的那次设备授权。 */
+export interface LoginSession {
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete: string;
+  /** 验证码失效时刻（UTC，RFC3339）。 */
+  expiresAt: string;
+  /** 是否已自动打开浏览器；false 时界面提示手动打开。 */
+  browserOpened: boolean;
 }
 
 /** `k2a_models` 的返回。 */

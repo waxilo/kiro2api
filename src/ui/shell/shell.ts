@@ -21,6 +21,7 @@ import {
   refresh,
   savePort,
   setCodexFilter,
+  setLoginField,
   setModelFilter,
   setWorkbuddyFilter,
   useFeedback,
@@ -260,6 +261,14 @@ function bindEvents(container: HTMLElement): void {
     }
     const action = origin?.closest<HTMLElement>('[data-action]');
     if (action) void dispatch(action.dataset.action ?? '', action.dataset);
+  });
+
+  // 登录弹窗的两个输入框逐键进 store（纯内存，不写盘）：弹窗会被后台事件重绘，
+  // 值只存在 DOM 里的话，没点「登录」之前敲的字会被换掉。
+  container.addEventListener('input', (event) => {
+    const target = event.target as HTMLInputElement;
+    if (target.id === 'login-start-url') setLoginField('startUrl', target.value);
+    else if (target.id === 'login-region') setLoginField('region', target.value);
   });
 
   // 用 change 而不是 input：输入端口时不要每敲一个字符就写盘 + 重绘

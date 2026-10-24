@@ -9,7 +9,14 @@ import { listen } from '@tauri-apps/api/event';
 
 import { englishOnly, errorText } from '../core/format';
 import { backend } from '../core/ipc';
-import type { CopyKind, ModelsState, ProxyStatus, RevealTarget, UsageInfo } from '../core/types';
+import type {
+  CopyKind,
+  LoginMethod,
+  ModelsState,
+  ProxyStatus,
+  RevealTarget,
+  UsageInfo,
+} from '../core/types';
 import { updater } from '../services/updater';
 import {
   blockingLabel,
@@ -50,6 +57,8 @@ export const ACTION = {
   codexApply: '应用 Codex 变更',
   codexRemove: '取消 Codex 接入',
   codexRestart: '重启 Codex 应用',
+  login: '发起登录',
+  logout: '退出登录',
 } as const;
 
 /**
@@ -77,6 +86,9 @@ const ACTION_SCOPE: Record<string, Scope> = {
   [ACTION.savePort]: 'global',
   [ACTION.refreshToken]: 'scoped',
   [ACTION.queryUsage]: 'scoped',
+  // 发起登录只等上游 OIDC 两次请求，不改配置；真正换凭据发生在后台轮询成功之后
+  [ACTION.login]: 'scoped',
+  [ACTION.logout]: 'global',
 };
 
 /** 这个动作的占用范围。 */
@@ -122,8 +134,17 @@ export function openModal(modal: ModalId): void {
 
 /** 关闭概览弹窗。已经是关着的时候什么都不做（避免一次无意义的重绘）。 */
 export function closeModal(): void {
-  if (!store.get().modal) return;
-  store.set({ modal: null });
+  const { modal, loginSession } = store.get();
+  if (!modal) return;
+  // 关掉登录弹窗 = 放弃这次登录：后台轮询没有界面可汇报了，留着只会在几分钟后
+  // 冒出一条「验证码已过期」。
+  if (modal === 'login' && loginSession) void backend.loginCancel();
+  store.set({ modal: null, loginSession: null });
+}
+
+/** 登录弹窗的输入（逐键写入 store，后台重绘不会把没提交的字弹回去）。 */
+export function setLoginField(field: 'startUrl' | 'region', value: string): void {
+  store.set(field === 'startUrl' ? { loginStartUrl: value } : { loginRegion: value });
 }
 
 /** 同时拉 WorkBuddy 与 Codex 的扫描（都是纯本地读盘）。单个失败不影响另一个。 */
@@ -746,6 +767,51 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
       await updater.install();
       return;
 
+    case 'login-method': {
+      const method = dataset.method as LoginMethod | undefined;
+      if (method && !store.get().loginSession) store.set({ loginMethod: method });
+      return;
+    }
+
+    case 'login-start': {
+      const { loginMethod, loginStartUrl, loginRegion } = store.get();
+      await run(
+        ACTION.login,
+        async () => {
+          const session = await backend.loginStart(
+            loginMethod,
+            loginMethod === 'idc' ? loginStartUrl : undefined,
+            loginMethod === 'idc' ? loginRegion : undefined,
+          );
+          // 等待期间用户关了弹窗：这次登录已被 closeModal 取消，别再把会话写回去
+          if (store.get().modal === 'login') store.set({ loginSession: session });
+          else void backend.loginCancel();
+        },
+        { resync: false },
+      );
+      return;
+    }
+
+    case 'login-cancel':
+      await backend.loginCancel();
+      store.set({ loginSession: null });
+      return;
+
+    case 'login-reopen':
+      try {
+        await backend.loginReopen();
+      } catch (error) {
+        feedback.toast(errorText(error), 'error');
+      }
+      return;
+
+    case 'logout':
+      await run(ACTION.logout, async () => {
+        store.set({ status: await backend.logout() });
+        feedback.toast('已退出 Kiro2API 登录');
+      });
+      return;
+
     case 'open-modal': {
       const modal = dataset.modal as ModalId | undefined;
       if (modal) openModal(modal);
@@ -798,6 +864,15 @@ export async function bindBackendEvents(): Promise<void> {
       void refresh();
     });
   }
+  // 设备码登录的结果（后台轮询线程发出）
+  await listen<ProxyStatus>('login://done', (event) => {
+    store.set({ status: event.payload, loginSession: null, modal: null, error: null });
+    feedback.toast('登录成功，凭据已保存');
+    void refresh();
+  });
+  await listen<string>('login://failed', (event) => {
+    store.set({ loginSession: null, error: `登录失败：${event.payload}` });
+  });
   await listen<string>('proxy://token-refresh-failed', (event) => {
     store.set({ error: `凭据刷新失败：${event.payload}` });
   });

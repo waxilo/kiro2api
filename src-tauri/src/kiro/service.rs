@@ -19,7 +19,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::kiro::models::kiro_model_to_public_model_id;
-use crate::paths::kiro_sso_cache_dir;
+use crate::paths::{active_credential_dir, kiro_sso_cache_dir};
 use crate::prefs::{
     cached_model_rates, cached_models, cached_usage, ensure_api_key, generate_api_key, load_config,
     mask_api_key, ms_to_iso, store_models, store_usage, update_config,
@@ -98,7 +98,7 @@ fn is_proxy_running(state: &ProxyStateRef) -> bool {
 
 fn new_auth() -> super::auth::Auth {
     super::auth::Auth::new(
-        kiro_sso_cache_dir(),
+        active_credential_dir(),
         None,
         KIRO_RUNTIME_URL.to_string(),
         KIRO_MANAGEMENT_URL.to_string(),
@@ -109,7 +109,12 @@ fn new_auth() -> super::auth::Auth {
 /// 凭据文件缺失时先尝试从 kiro-cli 的凭据库桥接一份（只读 CLI 侧数据，
 /// 且不覆盖已有文件），再按文件是否存在判定。
 pub(crate) fn has_credential_file() -> bool {
-    super::cli_bridge::ensure_bridged()
+    crate::paths::has_own_login() || super::cli_bridge::ensure_bridged()
+}
+
+/// 代理是否在运行（供登录模块判断凭据切换后要不要重启代理）。
+pub(crate) fn proxy_running(state: &ProxyStateRef) -> bool {
+    is_proxy_running(state)
 }
 
 pub(crate) fn is_locally_available() -> bool {
@@ -163,6 +168,8 @@ pub struct ProxyStatus {
     pub profile_arn: Option<String>,
     pub config_dir: String,
     pub debug_log_path: String,
+    /// 当前用的是 kiro2api 自己登录的凭据（界面据此显示「退出登录」）。
+    pub own_login: bool,
 }
 
 pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
@@ -180,6 +187,7 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
         profile_arn: auth.get_sso_profile_arn(),
         config_dir: crate::paths::get_data_path().display().to_string(),
         debug_log_path: crate::paths::get_debug_log_path().display().to_string(),
+        own_login: crate::paths::has_own_login(),
     };
     // 顺手让托盘跟上真实状态：正常启停各自会同步，这里兜住代理异常退出后的图标滞后
     crate::tray::sync_running(running, port);
@@ -265,8 +273,8 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
     let auth_ok = matches!(auth.get_authorization(), Ok(Some(_)));
     if !auth_ok {
         return Err(format!(
-            "未找到 Kiro 凭据：请先登录 Kiro IDE 或执行 `kiro-cli login`，\
-             确认 {} 存在后再试。",
+            "未找到 Kiro 凭据：请在「Kiro 凭据」卡片里点「登录」，或先登录 Kiro IDE / 执行 \
+             `kiro-cli login`，确认 {} 存在后再试。",
             kiro_sso_cache_dir().join("kiro-auth-token.json").display()
         ));
     }
@@ -294,7 +302,7 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
         default_model: default_model.clone(),
         runtime_url: KIRO_RUNTIME_URL.to_string(),
         management_url: KIRO_MANAGEMENT_URL.to_string(),
-        sso_cache_dir: kiro_sso_cache_dir(),
+        sso_cache_dir: active_credential_dir(),
         profile_arn_override: None,
     };
     let handle = super::server::start_proxy(config)?;
@@ -826,7 +834,7 @@ pub async fn k2a_refresh_token(app: AppHandle) -> Result<ProxyStatus, String> {
         .map_err(|e| format!("凭据刷新任务失败: {e}"))??;
     if !refreshed {
         return Err(
-            "未找到可刷新的 Kiro refreshToken，请先登录 Kiro IDE 或执行 `kiro-cli login`"
+            "未找到可刷新的 Kiro refreshToken，请先登录（凭据卡片「登录」/ Kiro IDE / `kiro-cli login`）"
                 .to_string(),
         );
     }
@@ -845,7 +853,7 @@ pub fn k2a_reveal(path: String) -> Result<(), String> {
     let target = match path.as_str() {
         "config" => crate::paths::get_data_path(),
         "log" => crate::paths::get_debug_log_path(),
-        "sso" => kiro_sso_cache_dir(),
+        "sso" => active_credential_dir(),
         other => return Err(format!("未知的路径类型: {other}")),
     };
     crate::reveal_in_file_manager(&target)

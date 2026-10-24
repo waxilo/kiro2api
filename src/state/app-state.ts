@@ -6,6 +6,8 @@
 import type {
   CodexScan,
   CopyKind,
+  LoginMethod,
+  LoginSession,
   ModelsState,
   ProxyAccess,
   ProxyStatus,
@@ -35,7 +37,7 @@ export type ViewId = (typeof VIEW_IDS)[number];
  * 「一眼就能看完的东西」摊成一屏，还要用户自己点回概览。放进弹窗之后，上下文（本地服务
  * 跑没跑、接入地址是什么）仍然在旁边，看完关掉就回到了原来那一屏。
  */
-export const MODAL_IDS = ['models', 'usage'] as const;
+export const MODAL_IDS = ['models', 'usage', 'login'] as const;
 
 export type ModalId = (typeof MODAL_IDS)[number];
 
@@ -143,6 +145,13 @@ export interface AppState {
    * 连续复制不同种类时以最后一次为准。
    */
   copiedKind: CopyKind | null;
+  /** 登录弹窗里选中的方式。 */
+  loginMethod: LoginMethod;
+  /** IdC 的 Start URL / 区域输入（逐键写入，后台重绘不会把没提交的字弹回去）。 */
+  loginStartUrl: string;
+  loginRegion: string;
+  /** 等待浏览器确认中的设备授权；null = 没有进行中的登录。 */
+  loginSession: LoginSession | null;
 }
 
 /** 「三方接入」分区的 tab 标识。接入新的第三方客户端时在这里扩。 */
@@ -198,6 +207,10 @@ export const store = createStore<AppState>({
   codexScan: null,
   codexChecked: null,
   codexFilter: '',
+  loginMethod: 'builder',
+  loginStartUrl: '',
+  loginRegion: 'us-east-1',
+  loginSession: null,
   codexRestartPrompt: null,
   copiedKind: null,
 });
