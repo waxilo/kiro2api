@@ -1,6 +1,6 @@
 [package]
 name = "kiro2api"
-version = "0.8.1"
+version = "0.9.0"
 description = "Kiro 额度转本地 API：Anthropic Messages + OpenAI Chat Completions 双协议反代"
 authors = ["waxilo"]
 edition = "2021"
