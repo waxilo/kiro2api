@@ -12,9 +12,11 @@
 //!
 //! 合并规则（界面文案与此保持一致）：
 //! * 条目按 `(url, 模型 id)` 认定「同一个」；
-//! * 已存在且 `apiKey` 一致 → 跳过；
-//! * 已存在但 `apiKey` 不同 → 只更新 `apiKey` —— WorkBuddy 侧自己的开关字段
-//!   （supportsImages 等）是用户在对方界面里调的，导入无权替他决定；
+//! * 能力开关（工具调用 / 图片输入 / 思考模式）由本应用决定，见 `CAPABILITIES` ——
+//!   它描述的是「上游接不接受」，不是用户的个人偏好，所以新条目直接写入、已有条目
+//!   一并补齐（否则用户每导入一次都要回 WorkBuddy 手工勾一遍）；
+//! * 除能力开关与 `apiKey` 外，条目里其余字段一概不动（条目名、vendor、自定义协议等）；
+//! * 已存在且 `apiKey` 与能力开关都一致 → 跳过；
 //! * 不存在 → 追加一条标准条目。
 
 use std::fs;
@@ -65,19 +67,46 @@ fn models_path() -> Result<PathBuf, String> {
     Ok(dir.join("models.json"))
 }
 
-/// 新条目的固定形态：vendor 与三个能力开关取自现网条目的惯例值。
+/// 条目的能力开关。三项全开：本应用的上游两侧路都通（`kiro::transform` 里
+/// Anthropic 的 `image` 块与 `thinking` 字段都会翻成 Kiro 的结构），在 WorkBuddy
+/// 侧把能力藏起来只会让用户以为发不了图、看不到思考过程。
+///
+/// 这是「上游能力」而不是「用户偏好」——所以导入时对已有条目也一并对齐，
+/// 用户在 WorkBuddy 里关掉的下次应用会被重新打开。
+const CAPABILITIES: [(&str, bool); 3] = [
+    ("supportsToolCall", true),
+    ("supportsImages", true),
+    ("supportsReasoning", true),
+];
+
+/// 把能力开关按 `CAPABILITIES` 写进条目，返回是否真的改了东西。
+/// 只碰这三项，条目里其余字段原样保留。
+fn apply_capabilities(entry: &mut serde_json::Value) -> bool {
+    let Some(obj) = entry.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, value) in CAPABILITIES {
+        if obj.get(key).and_then(|v| v.as_bool()) != Some(value) {
+            obj.insert(key.to_string(), serde_json::Value::Bool(value));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 新条目的固定形态：`vendor` 与能力开关取自本应用的惯例值。
 fn new_entry(model: &str, url: &str, api_key: &str) -> serde_json::Value {
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "id": model,
         "name": model,
         "vendor": "Custom",
         "url": url,
         "apiKey": api_key,
-        "supportsToolCall": true,
-        "supportsImages": false,
-        "supportsReasoning": false,
         "useCustomProtocol": false,
-    })
+    });
+    apply_capabilities(&mut entry);
+    entry
 }
 
 /// 合并的核心（纯函数，方便单元测试）：在 `entries` 上按规则增改，返回摘要。
@@ -103,14 +132,26 @@ fn merge_entries(
         });
         match existing {
             Some(entry) => {
-                if entry.get("apiKey").and_then(|v| v.as_str()).map(str::trim) == Some(api_key) {
-                    summary.unchanged += 1;
-                } else if let Some(obj) = entry.as_object_mut() {
-                    obj.insert(
-                        "apiKey".to_string(),
-                        serde_json::Value::String(api_key.to_string()),
-                    );
+                // 能力开关先补齐；密钥不一致时顺带换掉。两者都没动才算「无变化」。
+                let mut changed = apply_capabilities(entry);
+                let key_stale = entry
+                    .get("apiKey")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    != Some(api_key);
+                if key_stale {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert(
+                            "apiKey".to_string(),
+                            serde_json::Value::String(api_key.to_string()),
+                        );
+                        changed = true;
+                    }
+                }
+                if changed {
                     summary.updated += 1;
+                } else {
+                    summary.unchanged += 1;
                 }
             }
             None => {
@@ -374,15 +415,40 @@ mod tests {
     }
 
     #[test]
-    fn updates_only_api_key_and_keeps_user_fields() {
+    fn new_entry_opens_all_capabilities() {
+        let entry = entry("m1", "http://127.0.0.1:5680/openai/v1", "k1");
+        assert_eq!(entry["supportsToolCall"], true);
+        assert_eq!(entry["supportsImages"], true);
+        assert_eq!(entry["supportsReasoning"], true);
+        assert_eq!(entry["useCustomProtocol"], false);
+    }
+
+    #[test]
+    fn updates_api_key_and_keeps_other_fields() {
         let mut stale = entry("m1", "http://127.0.0.1:5680/openai/v1", "old-key");
-        // 用户在 WorkBuddy 里自己开过的开关，导入不得动它
-        stale["supportsImages"] = serde_json::Value::Bool(true);
+        // 条目名与 vendor 是用户自己的，导入不得动
+        stale["name"] = serde_json::Value::String("我的 Claude".into());
+        stale["vendor"] = serde_json::Value::String("Custom".into());
         let mut entries = vec![stale];
         let summary = merge_entries(&mut entries, &["m1".into()], "http://127.0.0.1:5680/openai/v1", "k2a-2");
         assert_eq!((summary.added, summary.updated, summary.unchanged), (0, 1, 0));
         assert_eq!(entries[0]["apiKey"], "k2a-2");
+        assert_eq!(entries[0]["name"], "我的 Claude");
+        assert_eq!(entries[0]["vendor"], "Custom");
+    }
+
+    #[test]
+    fn reopens_disabled_capabilities() {
+        // 旧条目（能力开关写死为关）与新导入的形态对齐：这也是「配置里那两项默认开」的落点
+        let mut stale = entry("m1", "http://127.0.0.1:5680/openai/v1", "k2a-1");
+        stale["supportsImages"] = serde_json::Value::Bool(false);
+        stale["supportsReasoning"] = serde_json::Value::Bool(false);
+        let mut entries = vec![stale];
+        let summary = merge_entries(&mut entries, &["m1".into()], "http://127.0.0.1:5680/openai/v1", "k2a-1");
+        assert_eq!((summary.added, summary.updated, summary.unchanged), (0, 1, 0));
         assert_eq!(entries[0]["supportsImages"], true);
+        assert_eq!(entries[0]["supportsReasoning"], true);
+        assert_eq!(entries[0]["apiKey"], "k2a-1");
     }
 
     #[test]

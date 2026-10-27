@@ -288,7 +288,7 @@ function modelsCard(state: AppState): string {
       <div class="model-card-list">
         ${cardGrid(shown, checked, keyOk, availableSet, query, state.models?.rates ?? {})}
       </div>
-      <div class="wb-hint">勾选写入、取消勾选移除，点「应用」一次生效；「清空」一次移除全部指向本应用的条目，取消全部勾选再「应用」效果相同；「恢复」放弃未应用的改动。写入使用当前代理地址与密钥，WorkBuddy 侧已有条目只更新密钥，其余设置不动</div>
+      <div class="wb-hint">勾选写入、取消勾选移除，点「应用」一次生效；「清空」一次移除全部指向本应用的条目，取消全部勾选再「应用」效果相同；「恢复」放弃未应用的改动。写入使用当前代理地址与密钥，并开启工具调用 / 图片输入 / 思考模式；WorkBuddy 侧已有条目一并同步这三项，其余设置不动</div>
     </div>`;
 }
 
