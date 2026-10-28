@@ -916,6 +916,49 @@ fn map_kiro_stop_reason(stop_reason: &str) -> String {
     }
 }
 
+/// 回合收尾时「一条可见内容都没有」的交代文案。
+///
+/// **思考块不算可见内容**：客户端只把正文与工具调用当成回答，只有 reasoning 的回合在界面上
+/// 就是一片空白 —— WorkBuddy 上表现为「已完成 54s + 查看所有产物」，用户看不到模型说了什么。
+/// 所以宁可补一条说明，也不静默收尾。
+///
+/// 优先级按「解释力」排：被丢弃的工具调用 > 协议泄漏 > 上游声称用工具却没用 > 只有思考 > 彻底空。
+fn empty_turn_fallback(
+    stop_reason: &str,
+    protocol_leak: bool,
+    had_thinking: bool,
+    dropped_tool: Option<&str>,
+) -> String {
+    if let Some(tool) = dropped_tool {
+        // `tool` 已是「名字 + 丢弃原因」的完整说明，别再自己拼原因：缺 id 的调用
+        // 名字其实声明过，写成「undeclared」是错的。
+        return format!("API Error: model called tool {tool}, but the call could not be delivered");
+    }
+    if protocol_leak {
+        return "API Error: response interrupted by protocol leak".to_string();
+    }
+    if stop_reason == "tool_use" {
+        return "API Error: upstream claimed tool_use but returned no tool call".to_string();
+    }
+    if had_thinking {
+        return "API Error: upstream returned reasoning only, no reply text".to_string();
+    }
+    "API Error: empty assistant response".to_string()
+}
+
+/// 记录一条被丢弃的工具调用。缺 id / 名字没在请求里声明时无法交给客户端执行，
+/// 只能丢弃 —— 但必须留痕：整轮若因此什么都不剩，收尾靠它说明「为什么没有输出」。
+fn note_dropped_tool(slot: &mut Option<String>, name: &str, missing_id: bool) {
+    let label = if name.is_empty() { "<unnamed>" } else { name };
+    let reason = if missing_id {
+        "no call id"
+    } else {
+        "not declared in request"
+    };
+    diag_log(&format!("[tool-call-dropped] name={label} reason={reason}"));
+    slot.get_or_insert_with(|| format!("\"{label}\" ({reason})"));
+}
+
 fn emit_text_block_sse(started: &mut bool, index: usize, text: &str, out: &mut String) {
     if text.is_empty() {
         return;
@@ -1376,12 +1419,16 @@ fn emit_buffered_kiro_events_to_anthropic_sse(
             &json!({ "type": "content_block_stop", "index": text_index.unwrap_or(0) }),
         ));
     }
-    if block_counter == 0 {
-        emit_fallback_text_block_sse(
-            &mut block_counter,
-            "API Error: empty assistant response",
-            &mut send,
+    // 同上：只有思考块时不补这一条，用户就会看到一个空白回合。
+    let had_visible_content = emitted_tools || text_index.is_some();
+    if !had_visible_content {
+        let fallback = empty_turn_fallback(
+            &stop_reason,
+            protocol_leak,
+            thinking_index.is_some(),
+            None,
         );
+        emit_fallback_text_block_sse(&mut block_counter, &fallback, &mut send);
     }
     let final_stop = normalize_stop_reason(
         &stop_reason,
@@ -1445,6 +1492,7 @@ fn pipe_kiro_body_to_anthropic_sse(
     let mut saw_native_tool = false;
     let mut emitted_tool_use = false;
     let mut invalid_native_tool = false;
+    let mut dropped_tool: Option<String> = None;
     let mut block_counter = 0usize;
     let mut native_tool_blocks: HashMap<String, NativeToolBlock> = HashMap::new();
     let mut native_tool_order: Vec<String> = Vec::new();
@@ -1540,6 +1588,13 @@ fn pipe_kiro_body_to_anthropic_sse(
                     send_text_immediate(&mut text_started, index, &visible, &mut send);
                 }
                 "toolUseEvent" => {
+                    let name = event
+                        .payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     let tool_id = event
                         .payload
                         .get("toolUseId")
@@ -1547,21 +1602,21 @@ fn pipe_kiro_body_to_anthropic_sse(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    // 与 OpenAI 通道同一取舍：缺 id 的调用只能丢，但必须留痕 ——
+                    // 整轮可能因此什么都不剩，收尾要靠它说明「为什么没有输出」。
                     if tool_id.is_empty() {
+                        note_dropped_tool(&mut dropped_tool, &name, true);
                         continue;
                     }
-                    let name = event
-                        .payload
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
 
                     if !native_tool_blocks.contains_key(&tool_id) {
+                        // 同上：只对**新登记的 id** 校验名字，已登记 id 的增量常常不带 name。
                         if !recovery_spec.declares(&name) {
+                            note_dropped_tool(&mut dropped_tool, &name, false);
                             continue;
                         }
                         let Some(block) = new_native_tool_block(&tool_id, &name) else {
+                            note_dropped_tool(&mut dropped_tool, &name, false);
                             continue;
                         };
                         native_tool_order.push(tool_id.clone());
@@ -1714,8 +1769,10 @@ fn pipe_kiro_body_to_anthropic_sse(
         }
     }
 
-    let had_assistant_content =
-        emitted_tool_use || text_block_index.is_some() || thinking_block_index.is_some() || !full_text.is_empty();
+    // 可见内容 = 正文块 或 工具块。**思考块不算**：它只是模型的草稿，客户端不把它当回答，
+    // 只有推理的回合在界面上就是空白。判据用「已发出的块」而不是 `full_text` ——
+    // 文本可能被协议守卫截断或被工具恢复吞掉，那时上游说了、用户却看不到。
+    let had_visible_content = emitted_tool_use || text_block_index.is_some();
 
     // 无效工具输入即使前面有思考/正文，也追加一条合法文本错误并以 end_turn 收尾。
     if invalid_native_tool {
@@ -1725,15 +1782,14 @@ fn pipe_kiro_body_to_anthropic_sse(
             &mut send,
         );
         stop_reason = "end_turn".to_string();
-    } else if !had_assistant_content {
-        let fallback = if stop_reason == "tool_use" {
-            "API Error: upstream claimed tool_use but returned no tool call"
-        } else if protocol_guard.detected() {
-            "API Error: response interrupted by protocol leak"
-        } else {
-            "API Error: empty assistant response"
-        };
-        emit_fallback_text_block_sse(&mut block_counter, fallback, &mut send);
+    } else if !had_visible_content {
+        let fallback = empty_turn_fallback(
+            &stop_reason,
+            protocol_guard.detected(),
+            thinking_block_index.is_some() || thinking_signature.is_some(),
+            dropped_tool.as_deref(),
+        );
+        emit_fallback_text_block_sse(&mut block_counter, &fallback, &mut send);
     }
 
     let final_stop =
@@ -1788,6 +1844,10 @@ fn pipe_kiro_body_to_openai_sse(
     let mut tool_blocks: HashMap<String, OpenAiToolBlock> = HashMap::new();
     let mut tool_order: Vec<String> = Vec::new();
     let mut emitted_any_tool_call = false;
+    // `full_text` 记的是「上游说了什么」，`emitted_text` 记的是「我们真的发了什么」。
+    // 收尾判空只能用后者：文本一旦被协议守卫截断或被工具恢复吞掉，前者非空而用户什么也看不到。
+    let mut emitted_text = false;
+    let mut dropped_tool: Option<String> = None;
 
     loop {
         let n = match reader.read(&mut read_buf) {
@@ -1862,8 +1922,16 @@ fn pipe_kiro_body_to_openai_sse(
                         json!({ "content": visible }),
                         None,
                     )));
+                    emitted_text = true;
                 }
                 "toolUseEvent" => {
+                    let name = event
+                        .payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     let tool_id = event
                         .payload
                         .get("toolUseId")
@@ -1871,18 +1939,18 @@ fn pipe_kiro_body_to_openai_sse(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    // 缺 id 调用没法交给客户端执行，只能丢 —— 但整轮可能因此什么都不剩，所以要留痕。
                     if tool_id.is_empty() {
+                        note_dropped_tool(&mut dropped_tool, &name, true);
                         continue;
                     }
-                    let name = event
-                        .payload
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
 
                     if !tool_blocks.contains_key(&tool_id) {
+                        // 名字没在请求里声明：客户端拿不到 schema，同样只能丢。
+                        // ⚠️ 只对**新登记的 id** 校验名字：上游后续增量常常只带 id 与 input 分片，
+                        // name 为空是正常的，对已登记的 id 再校验会把入参片段全丢掉。
                         if !recovery_spec.declares(&name) {
+                            note_dropped_tool(&mut dropped_tool, &name, false);
                             continue;
                         }
                         tool_order.push(tool_id.clone());
@@ -1983,6 +2051,7 @@ fn pipe_kiro_body_to_openai_sse(
                 json!({ "content": visible }),
                 None,
             )));
+            emitted_text = true;
         }
     }
 
@@ -2035,6 +2104,7 @@ fn pipe_kiro_body_to_openai_sse(
                     json!({ "content": text }),
                     None,
                 )));
+                emitted_text = true;
             }
             RecoveredContent::Tool(tool) => {
                 if invalid_native_tool {
@@ -2092,14 +2162,16 @@ fn pipe_kiro_body_to_openai_sse(
     } else if emitted_any_tool_call {
         stop_reason = "tool_use".to_string();
         &stop_reason
-    } else if full_text.is_empty() && !thinking_started {
-        let fallback = if stop_reason == "tool_use" {
-            "API Error: upstream claimed tool_use but returned no tool call"
-        } else if protocol_guard.detected() {
-            "API Error: response interrupted by protocol leak"
-        } else {
-            "API Error: empty assistant response"
-        };
+    } else if !emitted_text {
+        // 一条正文都没发出去。注意判据是「发了什么」而不是「上游说了什么」：
+        // 只有思考的回合在这里同样命中 —— 客户端的界面不会把 reasoning 当回答，
+        // 静默收尾等于让用户面对一个空白回合。
+        let fallback = empty_turn_fallback(
+            &stop_reason,
+            protocol_guard.detected(),
+            thinking_started,
+            dropped_tool.as_deref(),
+        );
         send(openai_sse_data(&openai_chunk(
             chat_id,
             response_model,
@@ -3829,6 +3901,44 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_only_turn_still_gets_visible_text() {
+        // 复刻 WorkBuddy 上的空白回合：上游只给思考 + END_TURN，没有正文也没有工具调用。
+        // 客户端不把 reasoning 当回答，所以必须补一条可见正文，不能静默收尾。
+        let events = vec![
+            KiroEvent {
+                event_type: "reasoningContentEvent".to_string(),
+                payload: json!({ "reasoningText": { "text": "先想想这么做对不对。" } }),
+            },
+            KiroEvent {
+                event_type: "metadataEvent".to_string(),
+                payload: json!({ "stopReason": "END_TURN" }),
+            },
+        ];
+        let mut out = String::new();
+        assert!(emit_buffered_kiro_events_to_anthropic_sse(
+            events,
+            ToolRecoverySpec::default(),
+            |chunk| out.push_str(&chunk),
+        ));
+        assert!(out.contains("\"type\":\"thinking\""));
+        assert!(
+            out.contains("reasoning only"),
+            "只有思考的回合必须补可见正文: {out}"
+        );
+        assert!(out.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    #[test]
+    fn empty_turn_fallback_prefers_the_most_specific_reason() {
+        assert!(empty_turn_fallback("tool_use", true, true, Some("\"Bash\" (no call id)"))
+            .contains("model called tool \"Bash\" (no call id)"));
+        assert!(empty_turn_fallback("tool_use", true, true, None).contains("protocol leak"));
+        assert!(empty_turn_fallback("tool_use", false, true, None).contains("claimed tool_use"));
+        assert!(empty_turn_fallback("end_turn", false, true, None).contains("reasoning only"));
+        assert!(empty_turn_fallback("end_turn", false, false, None).contains("empty assistant response"));
+    }
 
     #[test]
     fn normalize_request_target_accepts_origin_and_absolute_forms() {
