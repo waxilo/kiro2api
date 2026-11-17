@@ -29,22 +29,31 @@ pub fn is_known_kiro_model(model: &str) -> bool {
     )
 }
 
+/// Claude 各代的 effort 枚举（上游 schema 拿不到时的回退值）。
+const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+/// 4.6 两代没有 xhigh 这一档。
+const CLAUDE_46_EFFORT: &[&str] = &["low", "medium", "high", "max"];
+/// GPT 系列多一个 none。
+const GPT_EFFORT: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+
 /// 模型支持的 effort 级别（none/low/medium/high/xhigh/max）。
+///
+/// Claude 走「按形状识别」而不是白名单：上游不定期上新（`claude-opus-5.5` 等），
+/// 白名单漏掉一个型号就会让 [`effort_levels_for_model`] 变成空集 —— 后果不只是 effort 被丢掉，
+/// 更糟的是**任何原样合入的 effort 都失去了校验依据**，脏值会直接打到上游报
+/// `does not have a value in the enumeration [...]`。带日期后缀的公共 ID 有 6~8 位
+/// 版本号，被 [`looks_like_kiro_claude_model`] 挡掉，仍回退为空集。
 pub fn effort_levels_for_model(kiro_model: &str) -> &'static [&'static str] {
-    match kiro_model {
-        "claude-sonnet-5"
-        | "claude-opus-5"
-        | "claude-opus-4.8"
-        | "claude-opus-4.7"
-        | "claude-opus-4.5"
-        | "claude-sonnet-4.5"
-        | "claude-sonnet-4"
-        | "claude-haiku-4.5" => &["low", "medium", "high", "xhigh", "max"],
-        "claude-opus-4.6" | "claude-sonnet-4.6" => &["low", "medium", "high", "max"],
-        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
-            &["none", "low", "medium", "high", "xhigh", "max"]
-        }
-        _ => &[],
+    if matches!(kiro_model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") {
+        return GPT_EFFORT;
+    }
+    if !looks_like_kiro_claude_model(kiro_model) {
+        return &[];
+    }
+    if matches!(kiro_model, "claude-opus-4.6" | "claude-sonnet-4.6") {
+        CLAUDE_46_EFFORT
+    } else {
+        CLAUDE_EFFORT
     }
 }
 
@@ -113,20 +122,30 @@ pub fn get_supported_effort_levels(schema: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn normalize_effort_for_kiro_model(effort: Option<&str>, kiro_model: &str) -> Option<String> {
+/// 把请求里的 effort 收敛到「模型真正接受的枚举值」，是 effort 的唯一出口。
+///
+/// 返回 `None` 的语义是「不要发这个字段」，而不是「发个默认值」—— 上游对枚举校验
+/// 是严格的，宁可省略也不能赌一个没被接受的字面量。`levels` 为空表示该模型不接受
+/// effort，任何取值都应丢弃。
+pub fn normalize_effort(effort: Option<&str>, levels: &[String]) -> Option<String> {
     let effort = effort?;
-    let supported = effort_levels_for_model(kiro_model);
-    if supported.is_empty() {
+    if levels.is_empty() {
         return None;
     }
-    if supported.contains(&effort) {
+    if levels.iter().any(|level| level == effort) {
         return Some(effort.to_string());
     }
-    if effort == "xhigh" && supported.contains(&"max") {
+    // `xhigh` 是最高档的写法之一；只支持 max 的模型收敛过去，反之亦然。
+    if effort == "xhigh" && levels.iter().any(|level| level == "max") {
         return Some("max".to_string());
     }
-    if effort == "none" {
-        return None;
+    if effort == "max" && !levels.iter().any(|level| level == "max") {
+        if levels.iter().any(|level| level == "xhigh") {
+            return Some("xhigh".to_string());
+        }
+        if levels.iter().any(|level| level == "high") {
+            return Some("high".to_string());
+        }
     }
     None
 }
@@ -309,6 +328,9 @@ pub struct ModelProfile {
     pub supports_reasoning: bool,
     /// effort 的落位字段
     pub effort_placement: EffortPlacement,
+    /// 接受 effort 的枚举值；空集表示该模型不接受 effort（任何取值都不许发）。
+    /// 有 schema 时取 schema 的 `enum`，否则回退 [`effort_levels_for_model`]。
+    pub effort_levels: Vec<String>,
     /// schema 顶层允许的字段白名单；None 表示 schema 未知，不做白名单过滤。
     pub allowed_fields: Option<Vec<String>>,
 }
@@ -346,7 +368,11 @@ fn schema_allowed_fields(schema: &Value) -> Option<Vec<String>> {
         .map(|map| map.keys().cloned().collect())
 }
 
-fn default_profile(family: ModelFamily) -> ModelProfile {
+fn default_profile(family: ModelFamily, kiro_model: &str) -> ModelProfile {
+    let effort_levels: Vec<String> = effort_levels_for_model(kiro_model)
+        .iter()
+        .map(|level| level.to_string())
+        .collect();
     match family {
         ModelFamily::Claude => ModelProfile {
             family,
@@ -355,6 +381,7 @@ fn default_profile(family: ModelFamily) -> ModelProfile {
             supports_output_config: true,
             supports_reasoning: false,
             effort_placement: EffortPlacement::OutputConfigEffort,
+            effort_levels,
             allowed_fields: None,
         },
         ModelFamily::Gpt => ModelProfile {
@@ -364,6 +391,7 @@ fn default_profile(family: ModelFamily) -> ModelProfile {
             supports_output_config: false,
             supports_reasoning: true,
             effort_placement: EffortPlacement::ReasoningEffort,
+            effort_levels,
             allowed_fields: None,
         },
         ModelFamily::Deepseek | ModelFamily::Other => ModelProfile {
@@ -373,6 +401,7 @@ fn default_profile(family: ModelFamily) -> ModelProfile {
             supports_output_config: true,
             supports_reasoning: false,
             effort_placement: EffortPlacement::OutputConfigEffort,
+            effort_levels,
             allowed_fields: None,
         },
     }
@@ -383,16 +412,30 @@ fn default_profile(family: ModelFamily) -> ModelProfile {
 pub fn resolve_model_profile(kiro_model: &str, schema: Option<&Value>) -> ModelProfile {
     let family = ModelFamily::classify(kiro_model);
     match schema {
-        Some(schema) if schema.is_object() => ModelProfile {
-            family,
-            allow_max_tokens: schema_has_property(schema, "max_tokens"),
-            supports_thinking: schema_has_property(schema, "thinking"),
-            supports_output_config: schema_has_property(schema, "output_config"),
-            supports_reasoning: schema_has_property(schema, "reasoning"),
-            effort_placement: schema_effort_placement(schema),
-            allowed_fields: schema_allowed_fields(schema),
-        },
-        _ => default_profile(family),
+        Some(schema) if schema.is_object() => {
+            // effort 枚举以 schema 为准；schema 只声明了属性却没给 enum 时退回型号默认，
+            // 避免「schema 没枚举 ⇒ 一律不许发」把正常请求也削成没有 effort。
+            let schema_levels = get_supported_effort_levels(schema);
+            let effort_levels = if schema_levels.is_empty() {
+                effort_levels_for_model(kiro_model)
+                    .iter()
+                    .map(|level| level.to_string())
+                    .collect()
+            } else {
+                schema_levels
+            };
+            ModelProfile {
+                family,
+                allow_max_tokens: schema_has_property(schema, "max_tokens"),
+                supports_thinking: schema_has_property(schema, "thinking"),
+                supports_output_config: schema_has_property(schema, "output_config"),
+                supports_reasoning: schema_has_property(schema, "reasoning"),
+                effort_placement: schema_effort_placement(schema),
+                effort_levels,
+                allowed_fields: schema_allowed_fields(schema),
+            }
+        }
+        _ => default_profile(family, kiro_model),
     }
 }
 
@@ -490,6 +533,63 @@ mod tests {
             normalize_kiro_model(Some("claude-opus-4-1-20250805"), "x"),
             "claude-opus-5"
         );
+    }
+
+    /// effort 枚举要按形状跟着型号走：上游新上的 `5.5` 也必须有档位，否则
+    /// 「模型支持哪些 effort」与「哪些 effort 算合法」同时失效。
+    #[test]
+    fn effort_levels_follow_model_shape_not_a_whitelist() {
+        assert_eq!(effort_levels_for_model("claude-opus-5.5"), CLAUDE_EFFORT);
+        assert_eq!(effort_levels_for_model("claude-sonnet-5.5"), CLAUDE_EFFORT);
+        assert_eq!(effort_levels_for_model("claude-opus-5"), CLAUDE_EFFORT);
+        // 4.6 两代少一档 xhigh
+        assert_eq!(effort_levels_for_model("claude-opus-4.6"), CLAUDE_46_EFFORT);
+        // GPT 家族多一个 none
+        assert_eq!(effort_levels_for_model("gpt-5.6-sol"), GPT_EFFORT);
+        // 不带 effort 能力的模型必须是空集：空集 = 任何取值都不许发
+        assert!(effort_levels_for_model("deepseek-3.2").is_empty());
+        // 带日期后缀的公共 ID 不是 Kiro 型号，不能被当成 Claude 档位依据
+        assert!(effort_levels_for_model("claude-3-5-sonnet-20241022").is_empty());
+    }
+
+    #[test]
+    fn normalize_effort_only_returns_values_inside_the_enum() {
+        let claude: Vec<String> = CLAUDE_EFFORT.iter().map(|s| s.to_string()).collect();
+        let claude46: Vec<String> = CLAUDE_46_EFFORT.iter().map(|s| s.to_string()).collect();
+        let gpt: Vec<String> = GPT_EFFORT.iter().map(|s| s.to_string()).collect();
+
+        assert_eq!(normalize_effort(Some("high"), &claude).as_deref(), Some("high"));
+        // none 不在 Claude 的枚举里 → 不发
+        assert_eq!(normalize_effort(Some("none"), &claude), None);
+        // 不认识的写法一律不发，不猜
+        assert_eq!(normalize_effort(Some("minimal"), &claude), None);
+        // xhigh ↔ max 互转，按模型实际档位收敛
+        assert_eq!(normalize_effort(Some("xhigh"), &claude46).as_deref(), Some("max"));
+        assert_eq!(normalize_effort(Some("max"), &claude46).as_deref(), Some("max"));
+        // 空枚举 = 模型不接受 effort
+        assert_eq!(normalize_effort(Some("high"), &[]), None);
+        // GPT 认 none
+        assert_eq!(normalize_effort(Some("none"), &gpt).as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn profile_effort_levels_come_from_schema_when_present() {
+        let schema = json!({
+            "properties": {
+                "output_config": { "properties": { "effort": { "enum": ["low", "high"] } } }
+            }
+        });
+        let profile = resolve_model_profile("claude-opus-5.5", Some(&schema));
+        assert_eq!(profile.effort_levels, vec!["low".to_string(), "high".to_string()]);
+
+        // schema 声明了属性却没有 enum → 退回型号默认，而不是「一律不许发」
+        let schema_no_enum = json!({
+            "properties": {
+                "output_config": { "properties": { "effort": { "type": "string" } } }
+            }
+        });
+        let profile = resolve_model_profile("claude-opus-5.5", Some(&schema_no_enum));
+        assert_eq!(profile.effort_levels.len(), CLAUDE_EFFORT.len());
     }
 
     #[test]

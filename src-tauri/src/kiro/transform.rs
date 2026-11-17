@@ -5,8 +5,8 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::kiro::models::{
-    estimate_tokens, get_requested_effort, normalize_effort_for_kiro_model, resolve_model_profile,
-    EffortPlacement, ModelProfile,
+    estimate_tokens, get_requested_effort, normalize_effort, resolve_model_profile, EffortPlacement,
+    ModelProfile,
 };
 use crate::protocol_guard::normalize_stop_reason;
 
@@ -2092,6 +2092,19 @@ fn merge_object(target: &mut Map<String, Value>, source: &Value) {
     }
 }
 
+/// 把已校验过的 effort 写进 `output_config` / `reasoning` 容器（容器不存在就建）。
+fn write_effort(extra: &mut Map<String, Value>, holder: &str, effort: Option<&str>) {
+    let Some(effort) = effort else {
+        return;
+    };
+    let entry = extra
+        .entry(holder.to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("effort".to_string(), json!(effort));
+    }
+}
+
 fn apply_thinking_fields(extra: &mut Map<String, Value>, thinking: &Value) {
     if !thinking.is_object() {
         return;
@@ -2109,6 +2122,101 @@ fn apply_thinking_fields(extra: &mut Map<String, Value>, thinking: &Value) {
             extra.insert("thinking".to_string(), json!({ "type": "adaptive", "display": display }));
         }
         _ => {}
+    }
+}
+
+/// effort 取值终检：`output_config.effort` / `reasoning.effort` 里不在模型枚举内的
+/// 字面量一律不发。
+///
+/// 为什么前面几步挡不住：入站 `additionalModelRequestFields` 与 `output_config` 是
+/// **原样深合并**进 extra 的，[`get_requested_effort`] 不认识的写法（`none`、`minimal`、
+/// `HIGH` 之类大小写变体）会原封不动跟上去；第 6 步的 schema 白名单只校验**字段名**、
+/// 不看**取值**，于是上游回一句
+/// `Invalid additionalModelRequestFields: does not have a value in the enumeration [...]`。
+/// 这里按 [`ModelProfile::effort_levels`]（schema 的 enum，缺省为型号默认）统一收口：
+/// 认识的取值就地改成规范写法，不认识的就删掉——省略永远是安全的，猜一个没被接受的
+/// 值不是。
+fn sanitize_effort_fields(extra: &mut Map<String, Value>, profile: &ModelProfile) {
+    let mut dropped: Vec<String> = Vec::new();
+    for holder in ["output_config", "reasoning"] {
+        let Some(object) = extra.get_mut(holder).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(current) = object.get("effort").cloned() else {
+            continue;
+        };
+        match sanitize_effort_value(&current, profile) {
+            Some(level) => {
+                object.insert("effort".to_string(), Value::String(level));
+            }
+            None => {
+                object.remove("effort");
+                dropped.push(format!("{holder}.effort={current}"));
+            }
+        }
+    }
+
+    // 顶层 effort：有的客户端直接塞进 additionalModelRequestFields.effort。schema 明说
+    // 认这个顶层字段就原地校验，否则搬进该模型的落位容器 —— 反正不能让未校验的字面量
+    // 留在顶层（Kiro 的 effort 只认 output_config / reasoning 两处）。
+    if let Some(current) = extra.remove("effort") {
+        match sanitize_effort_value(&current, profile) {
+            Some(level) => {
+                let schema_allows_top_level = profile
+                    .allowed_fields
+                    .as_ref()
+                    .map(|fields| fields.iter().any(|field| field == "effort"))
+                    .unwrap_or(false);
+                if schema_allows_top_level {
+                    extra.insert("effort".to_string(), Value::String(level));
+                } else if let Some(holder) = effort_holder(profile) {
+                    let occupied = extra
+                        .get(holder)
+                        .and_then(|value| value.get("effort"))
+                        .is_some();
+                    if !occupied {
+                        write_effort(extra, holder, Some(&level));
+                    }
+                }
+            }
+            None => dropped.push(format!("effort={current}")),
+        }
+    }
+
+    // 只剩空对象时整块去掉：上游对「给了对象却没有任何属性」也会挑刺。
+    for holder in ["output_config", "reasoning"] {
+        let empty = extra
+            .get(holder)
+            .and_then(Value::as_object)
+            .map(|object| object.is_empty())
+            .unwrap_or(false);
+        if empty {
+            extra.remove(holder);
+        }
+    }
+
+    if !dropped.is_empty() {
+        eprintln!(
+            "[kiro] effort 取值不在 {:?} 的枚举内，已移除: {dropped:?}（允许: {:?}）",
+            profile.family, profile.effort_levels
+        );
+    }
+}
+
+/// 单个 effort 取值的规范化：命中枚举返回规范写法，否则 `None`（= 不许发）。
+fn sanitize_effort_value(value: &Value, profile: &ModelProfile) -> Option<String> {
+    value
+        .as_str()
+        .map(|raw| raw.trim().to_lowercase())
+        .and_then(|raw| normalize_effort(Some(&raw), &profile.effort_levels))
+}
+
+/// effort 该落进哪个容器；`None` 表示该模型没有 effort 落位。
+fn effort_holder(profile: &ModelProfile) -> Option<&'static str> {
+    match profile.effort_placement {
+        EffortPlacement::OutputConfigEffort => Some("output_config"),
+        EffortPlacement::ReasoningEffort if profile.supports_reasoning => Some("reasoning"),
+        _ => None,
     }
 }
 
@@ -2149,7 +2257,7 @@ fn build_additional_model_request_fields_with_profile(
     }
 
     let effort = get_requested_effort(body)
-        .and_then(|effort| normalize_effort_for_kiro_model(Some(&effort), kiro_model));
+        .and_then(|effort| normalize_effort(Some(&effort), &profile.effort_levels));
 
     // 3. max_tokens：仅对 schema/族允许的模型保留（Claude 且一般 ≥1024）
     if profile.allow_max_tokens {
@@ -2173,19 +2281,11 @@ fn build_additional_model_request_fields_with_profile(
         extra.remove("thinking");
     }
 
-    // 5. effort 落位：Claude 走 output_config.effort，GPT 走 reasoning.effort
+    // 5. effort 落位：Claude 走 output_config.effort，GPT 走 reasoning.effort。
+    //    取值已由 normalize_effort 收敛到模型枚举内；None 的语义是「不发这个字段」。
     match profile.effort_placement {
         EffortPlacement::OutputConfigEffort => {
-            if let Some(effort) = effort {
-                if effort != "none" {
-                    let existing = extra
-                        .entry("output_config".to_string())
-                        .or_insert_with(|| json!({}));
-                    if let Some(existing_obj) = existing.as_object_mut() {
-                        existing_obj.insert("effort".to_string(), json!(effort));
-                    }
-                }
-            }
+            write_effort(&mut extra, "output_config", effort.as_deref());
         }
         EffortPlacement::ReasoningEffort => {
             if profile.supports_reasoning {
@@ -2198,14 +2298,7 @@ fn build_additional_model_request_fields_with_profile(
                     }
                 }
             }
-            if let Some(effort) = effort {
-                let existing = extra
-                    .entry("reasoning".to_string())
-                    .or_insert_with(|| json!({}));
-                if let Some(existing_obj) = existing.as_object_mut() {
-                    existing_obj.insert("effort".to_string(), json!(effort));
-                }
-            }
+            write_effort(&mut extra, "reasoning", effort.as_deref());
         }
         EffortPlacement::Unsupported => {}
     }
@@ -2229,6 +2322,9 @@ fn build_additional_model_request_fields_with_profile(
             );
         }
     }
+
+    // 7. effort 取值终检：顶层白名单只看字段名，取值得按枚举单独校验
+    sanitize_effort_fields(&mut extra, profile);
 
     if extra.is_empty() {
         None
@@ -3669,6 +3765,104 @@ mod tests {
         });
         let built = build_kiro_request_with_schema(&body, "gpt-5.6-luna", Some("arn"), &schema).unwrap();
         assert!(built.get("additionalModelRequestFields").is_none());
+    }
+
+    /// 复现用户报的 502：客户端带 `output_config.effort = "none"`（想关思考），
+    /// Kiro 的枚举只有 low/medium/high/xhigh/max，原样透传就会被打回
+    /// `does not have a value in the enumeration [...]`。
+    #[test]
+    fn outbound_effort_never_leaks_values_outside_the_enum() {
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "max_tokens": 32000,
+            "output_config": { "effort": "none" },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        let additional = built.get("additionalModelRequestFields");
+        assert!(
+            additional.and_then(|a| a.get("output_config")).is_none(),
+            "只剩空 effort 的 output_config 不能发出去: {additional:?}"
+        );
+    }
+
+    /// 入站 `additionalModelRequestFields` 是原样深合并的，脏值同样要在这里被拦下：
+    /// 大小写变体归一、未知字面量删除。
+    #[test]
+    fn inbound_additional_fields_effort_is_sanitized_against_the_enum() {
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "additionalModelRequestFields": {
+                "output_config": { "effort": "HIGH" }
+            },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        assert_eq!(built["additionalModelRequestFields"]["output_config"]["effort"], "high");
+
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "additionalModelRequestFields": {
+                "output_config": { "effort": "minimal" }
+            },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        let additional = built.get("additionalModelRequestFields");
+        assert!(
+            additional.and_then(|a| a.get("output_config")).is_none(),
+            "未知 effort 必须整块删除: {additional:?}"
+        );
+    }
+
+    /// 顶层 `effort`（不放在 output_config 里）不能原样透传：schema 不认这个顶层字段时
+    /// 搬进该模型的落位容器，非法值同样丢掉。
+    #[test]
+    fn top_level_effort_is_relocated_or_dropped() {
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "additionalModelRequestFields": { "effort": "HIGH" },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        let additional = &built["additionalModelRequestFields"];
+        assert!(additional.get("effort").is_none(), "顶层 effort 不能留在原地");
+        assert_eq!(additional["output_config"]["effort"], "high");
+
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "additionalModelRequestFields": { "effort": "none" },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        assert!(
+            built.get("additionalModelRequestFields").is_none(),
+            "非法顶层 effort 不应产生任何 additional 字段"
+        );
+    }
+
+    /// schema 给出的 enum 是唯一事实源：schema 只认 low/high 时，medium 也不能发。
+    #[test]
+    fn schema_enum_overrides_model_default_effort_levels() {
+        let schema = json!({
+            "properties": {
+                "output_config": { "properties": { "effort": { "enum": ["low", "high"] } } }
+            }
+        });
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "output_config": { "effort": "medium" },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built =
+            build_kiro_request_with_schema(&body, "claude-opus-5.5", Some("arn"), &schema).unwrap();
+        assert!(
+            built
+                .get("additionalModelRequestFields")
+                .and_then(|a| a.get("output_config"))
+                .is_none(),
+            "schema 不认 medium，不能透传"
+        );
     }
 
     // ============ antml 参数块泄漏恢复 ============
