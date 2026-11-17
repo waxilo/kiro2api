@@ -42,14 +42,32 @@ pub(crate) fn active_credential_dir() -> PathBuf {
     }
 }
 
-/// kiro-cli（>= 2.31）自己的凭据库：macOS 实测为
-/// `~/Library/Application Support/kiro-cli/data.sqlite3`。
+/// kiro-cli 自己的凭据库候选路径，按顺序逐个试（先到先用）。
 /// 只读桥接用，见 kiro::cli_bridge。
-pub(crate) fn kiro_cli_db_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("kiro-cli")
-        .join("data.sqlite3")
+///
+/// kiro-cli 把凭据库放在**平台各自的数据目录**，位置并不统一：
+/// - macOS(实测 2.31)：`~/Library/Application Support/kiro-cli/data.sqlite3`
+/// - Windows(实测 v3)：`%LOCALAPPDATA%\Kiro-Cli\data.sqlite3`
+///
+/// ⚠️ 曾经只按 `dirs::data_dir()` 拼 `kiro-cli/data.sqlite3`：在 macOS 上
+/// `data_dir` 就是 `~/Library/Application Support`，一切正常；但在 Windows 上
+/// `data_dir` 是 **Roaming**，而 CLI 实际写在 **Local**，于是桥接永远找不到库、
+/// 静默退回 `~/.aws/sso/cache` 里那份可能已过期的旧令牌 —— 表现为「kiro-cli
+/// 明明登录着，本应用却要求重新登录」。只测 macOS 时看不出这个洞。
+pub(crate) fn kiro_cli_db_paths() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Windows / Linux 的本机数据目录（Windows 上即 %LOCALAPPDATA%）
+    if let Some(base) = dirs::data_local_dir() {
+        candidates.push(base.join("Kiro-Cli").join("data.sqlite3"));
+    }
+    // macOS / Linux 的应用数据目录（macOS 上即 ~/Library/Application Support）
+    if let Some(base) = dirs::data_dir() {
+        let path = base.join("kiro-cli").join("data.sqlite3");
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates
 }
 
 /// 上游请求诊断日志（排查 502 / schema 报错时用）。

@@ -1,15 +1,18 @@
 //! kiro-cli 凭据桥接：新版 kiro-cli（>= 2.31）不再写 Kiro IDE 的
 //! `~/.aws/sso/cache/kiro-auth-token.json`，而是把凭据存进自己的密钥库
-//! （macOS 实测：`~/Library/Application Support/kiro-cli/data.sqlite3` 的
-//! `auth_kv` 表，另镜像一份到钥匙串）。本模块在规范凭据文件缺失时，
-//! 从该库只读取出令牌与 device registration，按 IDE 的文件格式落盘，
-//! 之后 [`super::auth::Auth`] 的读取与 IdC/social 刷新链路原样可用。
+//! （`data.sqlite3` 的 `auth_kv` 表，位置按平台不同 —— macOS 在
+//! `~/Library/Application Support/kiro-cli/`，Windows 在 `%LOCALAPPDATA%\Kiro-Cli\`，
+//! 见 [`crate::paths::kiro_cli_db_paths`]；另镜像一份到钥匙串）。
+//! 本模块在规范凭据文件缺失时，从该库只读取出令牌与 device registration，
+//! 按 IDE 的文件格式落盘，之后 [`super::auth::Auth`] 的读取与 IdC/social
+//! 刷新链路原样可用。
 //!
 //! 只在规范文件缺失时触发：本机可能同时存在 IDE 与 CLI 两套不同登录
 //! （client_id 不同），桥接绝不覆盖已有的 IDE 凭据。
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -17,7 +20,7 @@ use rusqlite::OpenFlags;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::paths::{kiro_cli_db_path, kiro_sso_cache_dir};
+use crate::paths::{kiro_cli_db_paths, kiro_sso_cache_dir};
 
 /// 令牌记录键：IdC 与 social/外部 IdP 两种登录各存一行
 const TOKEN_KEYS: [&str; 2] = ["kirocli:odic:token", "kirocli:external-idp:token"];
@@ -35,28 +38,39 @@ pub(crate) fn ensure_bridged() -> bool {
     canonical.is_file()
 }
 
+/// 逐个候选路径尝试桥接：kiro-cli 的凭据库位置按平台不同（见
+/// `paths::kiro_cli_db_paths`），找到一个能用的就停。
 fn try_bridge(canonical: &Path) {
-    let db = kiro_cli_db_path();
-    if !db.is_file() || !should_attempt(&db) {
-        return;
-    }
-    if let Err(e) = bridge(canonical, &db) {
-        crate::diag::log(&format!("[cli-bridge] kiro-cli 凭据桥接失败：{e}"));
+    for db in kiro_cli_db_paths() {
+        if !db.is_file() || !should_attempt(&db) {
+            continue;
+        }
+        match bridge(canonical, &db) {
+            Ok(()) => return,
+            Err(e) => crate::diag::log(&format!(
+                "[cli-bridge] {} 桥接失败：{e}",
+                db.display()
+            )),
+        }
     }
 }
 
 /// 桥接失败时按 db 的 mtime 节流：mtime 没变（CLI 没重新登录）就不反复重试，
 /// 状态轮询不会每次都去开 sqlite；CLI 一旦重新登录，mtime 变化自动重试。
+///
+/// 按**路径**分别记 mtime：候选路径可能不止一个，用单个全局槽位会让两个候选
+/// 每次调用交替「看起来有变化」，节流形同失效。
 fn should_attempt(db: &Path) -> bool {
-    static LAST: Mutex<Option<SystemTime>> = Mutex::new(None);
+    static LAST: Mutex<Option<HashMap<PathBuf, Option<SystemTime>>>> = Mutex::new(None);
     let mtime = fs::metadata(db).and_then(|m| m.modified()).ok();
     let Ok(mut last) = LAST.lock() else {
         return false;
     };
-    if last.is_some() && *last == mtime {
+    let seen = last.get_or_insert_with(HashMap::new);
+    if seen.get(db).is_some_and(|known| *known == mtime) {
         return false;
     }
-    *last = mtime;
+    seen.insert(db.to_path_buf(), mtime);
     true
 }
 
