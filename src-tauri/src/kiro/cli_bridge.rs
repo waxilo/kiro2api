@@ -22,20 +22,73 @@ use sha2::{Digest, Sha256};
 
 use crate::paths::{kiro_cli_db_paths, kiro_sso_cache_dir};
 
+use super::auth::parse_expiry_ms;
+
 /// 令牌记录键：IdC 与 social/外部 IdP 两种登录各存一行
 const TOKEN_KEYS: [&str; 2] = ["kirocli:odic:token", "kirocli:external-idp:token"];
 const REGISTRATION_KEY: &str = "kirocli:odic:device-registration";
 
-/// 规范凭据文件是否可用；缺失时先尝试桥接一次。
-/// 供 `has_credential_file` 等状态判定与启动路径调用，需容忍高频调用：
-/// 规范文件存在时只有一次 stat 的开销。
+/// 距过期不足这个秒数就认为「需要续期」，不必为它跳过桥接。
+const USABLE_SKEW_SECS: i64 = 120;
+
+/// 规范凭据文件是否可用：缺失、或**存在但已经怎么都用不了**时，先尝试桥接一次。
+/// 供 `has_credential_file` 等状态判定与启动路径调用，需容忍高频调用。
+///
+/// ⚠️ 这里不能只判断「文件存在」。IDE 留下的过期令牌会一直躺在
+/// `~/.aws/sso/cache/kiro-auth-token.json`，只看存在性就等于永久跳过桥接：
+/// 用户明明 `kiro-cli` 已登录，应用却每次都拿那份过期文件去续期，报
+/// `SSO client registration expired` 并要求重新登录 —— 这正是 Windows 上的
+/// 实际表现（kiro-cli v3 已不再写这份文件）。
 pub(crate) fn ensure_bridged() -> bool {
     let canonical = kiro_sso_cache_dir().join("kiro-auth-token.json");
-    if canonical.is_file() {
+    if credential_usable(&canonical) {
         return true;
     }
     try_bridge(&canonical);
-    canonical.is_file()
+    credential_usable(&canonical)
+}
+
+/// 现有凭据能不能用：访问令牌还没过期，**或者**过期了但续期链路完整
+/// （有 refreshToken + 对应 client 注册文件且其有效期未过）。
+///
+/// 第二种情形必须算「可用」，否则会把 IDE 那套仍可续期的登录当成废的覆盖掉。
+fn credential_usable(canonical: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(canonical) else {
+        return false;
+    };
+    let Ok(token) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let fresh = token
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(parse_expiry_ms)
+        .is_some_and(|ms| ms > now_ms + USABLE_SKEW_SECS * 1000);
+    if fresh {
+        return true;
+    }
+    let has_refresh = token
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .is_some_and(|v| !v.is_empty());
+    if !has_refresh {
+        return false;
+    }
+    let Some(hash) = token.get("clientIdHash").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(kiro_sso_cache_dir().join(format!("{hash}.json"))) else {
+        return false;
+    };
+    let Ok(registration) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    registration
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(parse_expiry_ms)
+        .is_some_and(|ms| ms > now_ms)
 }
 
 /// 逐个候选路径尝试桥接：kiro-cli 的凭据库位置按平台不同（见

@@ -1002,7 +1002,8 @@ fn now_ms() -> i64 {
 }
 
 /// 解析过期时间：优先 RFC3339，其次 epoch 毫秒/秒。
-fn parse_expiry_ms(value: &str) -> Option<i64> {
+/// `pub(crate)`：凭据桥接要判断现有令牌还能不能用，避免两个地方各写一份解析。
+pub(crate) fn parse_expiry_ms(value: &str) -> Option<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
         return Some(dt.timestamp_millis());
     }
