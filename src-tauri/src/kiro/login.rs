@@ -102,7 +102,7 @@ fn post_json(client: &Client, url: &str, body: &Value) -> Result<(bool, Value), 
         .header("content-type", "application/json")
         .json(body)
         .send()
-        .map_err(|e| format!("请求 {url} 失败：{e}"))?;
+        .map_err(|e| super::net::describe_reqwest_error(&e))?;
     let ok = response.status().is_success();
     let status = response.status();
     let text = response.text().unwrap_or_default();

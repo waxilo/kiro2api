@@ -28,7 +28,20 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+# 出站请求的路由与信任必须和系统一致，否则 mac 上会出现「浏览器能上网、应用所有请求都失败」：
+# - `system-proxy`：reqwest 的默认特性。关掉后它只读 `HTTP(S)_PROXY` 环境变量，不读 macOS
+#   系统代理（ClashX / Surge 只改 SystemConfiguration），而双击启动的 .app 又继承不到 shell env
+#   —— 用户开着代理，应用却在直连。
+# - `rustls-tls-native-roots`：从系统钥匙串加载根证书，企业根 / 代理 MITM 重签的证书才认。
+# - `rustls-tls-webpki-roots`：内置 Mozilla 根，作为 native 加载不到证书时的兜底。
+#   两套根在 reqwest 0.12 里可共存（`tls_built_in_certs_webpki` 与 `_native` 是两个独立开关）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "blocking",
+    "system-proxy",
+    "rustls-tls-webpki-roots",
+    "rustls-tls-native-roots",
+] }
 base64 = "0.22"
 tiny_http = "0.12"
 regex = "1"

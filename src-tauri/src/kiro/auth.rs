@@ -284,9 +284,12 @@ impl Auth {
         let elapsed = crate::diag::secs(started.elapsed());
         crate::diag::log(&match &response {
             Ok(r) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，HTTP {}", r.status()),
-            Err(e) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，失败：{e}"),
+            Err(e) => format!(
+                "[refresh:{source}] 上游请求 {url}：{elapsed}，失败：{}",
+                super::net::describe_reqwest_error(e)
+            ),
         });
-        let response = response.map_err(|e| format!("SSO OIDC refresh request failed: {e}"))?;
+        let response = response.map_err(|e| super::net::describe_reqwest_error(&e))?;
 
         let status = response.status();
         let text = response.text().unwrap_or_default();
@@ -333,9 +336,12 @@ impl Auth {
         let elapsed = crate::diag::secs(started.elapsed());
         crate::diag::log(&match &response {
             Ok(r) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，HTTP {}", r.status()),
-            Err(e) => format!("[refresh:{source}] 上游请求 {url}：{elapsed}，失败：{e}"),
+            Err(e) => format!(
+                "[refresh:{source}] 上游请求 {url}：{elapsed}，失败：{}",
+                super::net::describe_reqwest_error(e)
+            ),
         });
-        let response = response.map_err(|e| format!("Kiro auth refresh request failed: {e}"))?;
+        let response = response.map_err(|e| super::net::describe_reqwest_error(&e))?;
 
         let status = response.status();
         let text = response.text().unwrap_or_default();
@@ -704,7 +710,7 @@ impl Auth {
             .header("user-agent", "KiroIDE")
             .json(&json!({ "origin": "AI_EDITOR", "profileArn": profile_arn }))
             .send()
-            .map_err(|e| format!("ListAvailableModels request failed: {e}"))?;
+            .map_err(|e| super::net::describe_reqwest_error(&e))?;
         let status = response.status();
         let data: Value = response.json().unwrap_or_else(|_| json!({}));
         if !status.is_success() {
@@ -819,7 +825,7 @@ impl Auth {
 
         let response = request
             .send()
-            .map_err(|e| format!("查询 Kiro 额度失败: {e}"))?;
+            .map_err(|e| super::net::describe_reqwest_error(&e))?;
         let status = response.status();
         let data: Value = response.json().unwrap_or_else(|_| json!({}));
         if !status.is_success() {

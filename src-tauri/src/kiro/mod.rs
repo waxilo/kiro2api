@@ -18,6 +18,7 @@ pub mod cli_bridge;
 pub mod eventstream;
 pub mod login;
 pub mod models;
+pub mod net;
 pub mod openai;
 pub mod responses;
 pub mod server;
