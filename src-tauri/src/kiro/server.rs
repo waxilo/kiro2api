@@ -59,8 +59,7 @@ use crate::kiro::responses::{
 };
 use crate::kiro::transform::{
     anthropic_message_response_with_tools, build_kiro_request, build_kiro_request_with_schema,
-    ensure_tool_id_unique, recover_tool_calls_from_text, RecoveredContent, TextToolRecoveryGuard,
-    ToolRecoverySpec,
+    RecoveredContent, TextToolRecoveryGuard, ToolRecoverySpec,
 };
 use crate::protocol_guard::{normalize_stop_reason, sanitize_protocol_text, ProtocolTextGuard};
 use crate::diag::log as diag_log;
@@ -1219,262 +1218,6 @@ fn emit_fallback_text_block_sse(
     ));
 }
 
-enum BufferedKiroPart {
-    Text(String),
-    NativeTool(String),
-}
-
-fn push_buffered_text(parts: &mut Vec<BufferedKiroPart>, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    if let Some(BufferedKiroPart::Text(previous)) = parts.last_mut() {
-        previous.push_str(text);
-    } else {
-        parts.push(BufferedKiroPart::Text(text.to_string()));
-    }
-}
-
-fn emit_buffered_kiro_events_to_anthropic_sse(
-    events: Vec<KiroEvent>,
-    recovery_spec: ToolRecoverySpec,
-    mut send: impl FnMut(String),
-) -> bool {
-    let mut parts = Vec::new();
-    let mut native_tools: HashMap<String, NativeToolBlock> = HashMap::new();
-    let mut completed_tools: HashMap<String, Value> = HashMap::new();
-    let mut thinking = String::new();
-    let mut thinking_signature = None;
-    let mut stop_reason = "end_turn".to_string();
-    let mut invalid_tool = false;
-
-    for event in events {
-        match event.event_type.as_str() {
-            "assistantResponseEvent" => {
-                if let Some(text) = event.payload.get("content").and_then(Value::as_str) {
-                    push_buffered_text(&mut parts, text);
-                }
-            }
-            "reasoningContentEvent" => {
-                let (text, signature) = extract_reasoning_parts(&event.payload);
-                thinking.push_str(&text);
-                if signature.is_some() {
-                    thinking_signature = signature;
-                }
-            }
-            "toolUseEvent" => {
-                let id = event
-                    .payload
-                    .get("toolUseId")
-                    .or_else(|| event.payload.get("tool_use_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-                let name = event.payload.get("name").and_then(Value::as_str).unwrap_or("").trim();
-                if id.is_empty() || !recovery_spec.declares(name) {
-                    invalid_tool = true;
-                    continue;
-                }
-                if !native_tools.contains_key(id) {
-                    let Some(block) = new_native_tool_block(id, name) else {
-                        invalid_tool = true;
-                        continue;
-                    };
-                    native_tools.insert(id.to_string(), block);
-                    parts.push(BufferedKiroPart::NativeTool(id.to_string()));
-                }
-                let Some(block) = native_tools.get_mut(id) else {
-                    invalid_tool = true;
-                    continue;
-                };
-                if block.name != name {
-                    invalid_tool = true;
-                    block.open = false;
-                    continue;
-                }
-                let is_stop = event.payload.get("stop").and_then(Value::as_bool).unwrap_or(false);
-                match update_native_tool(block, event.payload.get("input"), is_stop) {
-                    NativeToolUpdate::Pending => {}
-                    NativeToolUpdate::Complete(mut tool) => {
-                        normalize_native_tool_input(&recovery_spec, &mut tool);
-                        completed_tools.insert(id.to_string(), tool);
-                    }
-                    NativeToolUpdate::Invalid => invalid_tool = true,
-                }
-            }
-            "metadataEvent" => {
-                if let Some(reason) = event.payload.get("stopReason").and_then(Value::as_str) {
-                    stop_reason = map_kiro_stop_reason(reason);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if native_tools.values().any(|tool| tool.open)
-        || completed_tools.len() != native_tools.len()
-    {
-        invalid_tool = true;
-    }
-    if invalid_tool {
-        let mut block_counter = 0;
-        emit_fallback_text_block_sse(
-            &mut block_counter,
-            "API Error: model returned an incomplete tool call",
-            &mut send,
-        );
-        emit_sse_message_delta_stop(&mut send, "end_turn", 0);
-        return true;
-    }
-
-    let mut ordered = Vec::new();
-    let mut incomplete_tool = false;
-    let mut protocol_leak = false;
-    let mut output_tokens_text = String::new();
-    for part in parts {
-        match part {
-            BufferedKiroPart::Text(raw) => {
-                output_tokens_text.push_str(&raw);
-                let (text, detected) = sanitize_protocol_text(&raw);
-                protocol_leak |= detected;
-                let recovered = recover_tool_calls_from_text(&text, &recovery_spec);
-                incomplete_tool |= recovered.incomplete_tool;
-                for recovered_part in recovered.parts {
-                    match &recovered_part {
-                        RecoveredContent::Tool(tool)
-                            if completed_tools
-                                .values()
-                                .any(|native| recovery_spec.is_native_mirror(tool, native)) => {}
-                        _ => ordered.push(recovered_part),
-                    }
-                }
-            }
-            BufferedKiroPart::NativeTool(id) => {
-                if let Some(tool) = completed_tools.get(&id) {
-                    ordered.push(RecoveredContent::Tool(tool.clone()));
-                }
-            }
-        }
-    }
-
-    let native_tool_ids = completed_tools.keys().cloned().collect::<std::collections::HashSet<_>>();
-    let mut seen_tool_ids = native_tool_ids.clone();
-    for (index, part) in ordered.iter_mut().enumerate() {
-        if let RecoveredContent::Tool(tool) = part {
-            let id = tool.get("id").and_then(Value::as_str).unwrap_or("");
-            if !native_tool_ids.contains(id) {
-                ensure_tool_id_unique(tool, &mut seen_tool_ids, index);
-            }
-        }
-    }
-
-    let mut block_counter = 0;
-    let mut thinking_started = false;
-    let mut thinking_index = None;
-    if !thinking.is_empty() || thinking_signature.is_some() {
-        thinking_index = Some(block_counter);
-        block_counter += 1;
-        emit_thinking_start_sse(thinking_index.unwrap(), &mut send);
-        thinking_started = true;
-        if !thinking.is_empty() {
-            emit_thinking_delta_sse(thinking_index.unwrap(), &thinking, &mut send);
-        }
-    }
-    close_thinking_block_sse(
-        &mut thinking_started,
-        thinking_index,
-        &thinking_signature,
-        &mut send,
-    );
-
-    let mut text_started = false;
-    let mut text_index = None;
-    let mut emitted_tools = false;
-    for part in ordered {
-        match part {
-            RecoveredContent::Text(text) if !text.is_empty() => {
-                let index = ensure_text_block_index(&mut text_index, &mut block_counter);
-                send_text_immediate(&mut text_started, index, &text, &mut send);
-            }
-            RecoveredContent::Tool(tool) => {
-                if text_started {
-                    send(sse_event(
-                        "content_block_stop",
-                        &json!({ "type": "content_block_stop", "index": text_index.unwrap_or(0) }),
-                    ));
-                    text_started = false;
-                    text_index = None;
-                }
-                let mut out = String::new();
-                emit_tool_blocks_sse(&[tool], &mut block_counter, &mut out);
-                send(out);
-                emitted_tools = true;
-            }
-            RecoveredContent::Text(_) => {}
-        }
-    }
-    if text_started {
-        send(sse_event(
-            "content_block_stop",
-            &json!({ "type": "content_block_stop", "index": text_index.unwrap_or(0) }),
-        ));
-    }
-    // 同上：只有思考块时不补这一条，用户就会看到一个空白回合。
-    let had_visible_content = emitted_tools || text_index.is_some();
-    if !had_visible_content {
-        let fallback = empty_turn_fallback(
-            &stop_reason,
-            protocol_leak,
-            thinking_index.is_some(),
-            None,
-        );
-        emit_fallback_text_block_sse(&mut block_counter, &fallback, &mut send);
-    }
-    let final_stop = normalize_stop_reason(
-        &stop_reason,
-        emitted_tools,
-        incomplete_tool || protocol_leak,
-    );
-    emit_sse_message_delta_stop(
-        &mut send,
-        final_stop,
-        estimate_tokens(&output_tokens_text),
-    );
-    true
-}
-
-fn pipe_buffered_kiro_tools_to_anthropic_sse(
-    mut reader: impl Read,
-    recovery_spec: ToolRecoverySpec,
-    mut send: impl FnMut(String),
-) -> bool {
-    let mut bytes = Vec::new();
-    if let Err(error) = reader.read_to_end(&mut bytes) {
-        let mut block_counter = 0;
-        emit_fallback_text_block_sse(
-            &mut block_counter,
-            &format!("API Error: 读取 Kiro 流失败: {error}"),
-            &mut send,
-        );
-        emit_sse_message_delta_stop(&mut send, "end_turn", 0);
-        return false;
-    }
-    let events = match parse_event_stream_checked(&bytes) {
-        Ok(events) => events,
-        Err(error) => {
-            let mut block_counter = 0;
-            emit_fallback_text_block_sse(
-                &mut block_counter,
-                &format!("API Error: {error}"),
-                &mut send,
-            );
-            emit_sse_message_delta_stop(&mut send, "max_tokens", 0);
-            return false;
-        }
-    };
-    emit_buffered_kiro_events_to_anthropic_sse(events, recovery_spec, send)
-}
-
 /// 解析上游 Event Stream，边收边推 Anthropic SSE。返回是否干净结束（流是否被完整读完）。
 fn pipe_kiro_body_to_anthropic_sse(
     mut reader: impl Read,
@@ -1751,7 +1494,8 @@ fn pipe_kiro_body_to_anthropic_sse(
             "content_block_stop",
             &json!({ "type": "content_block_stop", "index": index }),
         ));
-        text_block_index = None;
+        // 这里不再清 `text_block_index`：后面只用 `text_started` 判断「发过正文没有」，
+        // 清空只会让收尾那一步看不到事实（早期就是因此误判成空回合）。
     }
 
     // 原生工具整轮均合法后才按首次出现顺序发出；不同 ID 的相同参数调用仍各自保留。
@@ -1772,7 +1516,11 @@ fn pipe_kiro_body_to_anthropic_sse(
     // 可见内容 = 正文块 或 工具块。**思考块不算**：它只是模型的草稿，客户端不把它当回答，
     // 只有推理的回合在界面上就是空白。判据用「已发出的块」而不是 `full_text` ——
     // 文本可能被协议守卫截断或被工具恢复吞掉，那时上游说了、用户却看不到。
-    let had_visible_content = emitted_tool_use || text_block_index.is_some();
+    //
+    // 判据必须是 `text_started`，不能是 `text_block_index`：上面关闭正文块时已经把它置空，
+    // 用索引判断会让**每个纯文本回合**都被认成空回合，结尾多出一段
+    // "API Error: empty assistant response"。
+    let had_visible_content = emitted_tool_use || text_started;
 
     // 无效工具输入即使前面有思考/正文，也追加一条合法文本错误并以 end_turn 收尾。
     if invalid_native_tool {
@@ -2620,11 +2368,11 @@ fn respond_sse_stream_fetch(
         // 立即刷出首包，避免客户端一直空等
         send(": keepalive\n\n".to_string());
 
-        let clean = if recovery_spec.is_empty() {
-            pipe_kiro_body_to_anthropic_sse(reader, recovery_spec, send)
-        } else {
-            pipe_buffered_kiro_tools_to_anthropic_sse(reader, recovery_spec, send)
-        };
+        // 声明了工具也必须边收边推：早期版本把带 tools 的请求整条 `read_to_end`
+        // 之后再吐，用户看到的是「等半天，然后整段答案一次性出现」——
+        // 也就是常被误判成「这个模型不支持流式」的现象。工具块的整轮校验本来
+        // 就只影响块内入参，正文没有理由陪着一起等。
+        let clean = pipe_kiro_body_to_anthropic_sse(reader, recovery_spec, send);
         if clean {
             health.record_success();
             if let Some(e) = &entry {
@@ -3901,6 +3649,45 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::eventstream::build_frame;
+
+    /// 把一组上游事件编成 event stream 字节后喂给真实的增量出参管道。
+    ///
+    /// 断言必须走「帧编码 → 增量解析 → SSE 出参」，不能直接对事件向量调发射函数：
+    /// 早期那版缓冲发射器正是因为绕开了管道才让「带工具就整段缓冲」活了下来。
+    fn anthropic_sse_from_events(events: &[KiroEvent], spec: ToolRecoverySpec) -> String {
+        let mut bytes = Vec::new();
+        for event in events {
+            bytes.extend_from_slice(&build_frame(&event.event_type, &event.payload));
+        }
+        anthropic_sse_from_reader(Cursor::new(bytes), spec)
+    }
+
+    fn anthropic_sse_from_reader(reader: impl Read, spec: ToolRecoverySpec) -> String {
+        let mut out = String::new();
+        pipe_kiro_body_to_anthropic_sse(reader, spec, |chunk| out.push_str(&chunk));
+        out
+    }
+
+    /// 把出参里的正文 delta 依序拼回整段文本。
+    ///
+    /// 不能直接 `out.find("原文")`：正文分片边界由工具恢复守卫决定（可能切在词中间），
+    /// 断言落在原始字节上就会假失败。
+    fn sse_text(out: &str) -> String {
+        let mut text = String::new();
+        for line in out.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            if let Some(chunk) = value.pointer("/delta/text").and_then(Value::as_str) {
+                text.push_str(chunk);
+            }
+        }
+        text
+    }
 
     #[test]
     fn reasoning_only_turn_still_gets_visible_text() {
@@ -3916,18 +3703,124 @@ mod tests {
                 payload: json!({ "stopReason": "END_TURN" }),
             },
         ];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            ToolRecoverySpec::default(),
-            |chunk| out.push_str(&chunk),
-        ));
+        let out = anthropic_sse_from_events(&events, ToolRecoverySpec::default());
         assert!(out.contains("\"type\":\"thinking\""));
         assert!(
             out.contains("reasoning only"),
             "只有思考的回合必须补可见正文: {out}"
         );
         assert!(out.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    #[test]
+    fn text_only_turn_has_no_trailing_empty_turn_error() {
+        // 回归：关闭正文块时会把 text_block_index 置空，旧判据据此认定「没发出可见内容」，
+        // 于是每个正常回答的结尾都多出一段 `API Error: empty assistant response`。
+        let events = vec![
+            KiroEvent {
+                event_type: "assistantResponseEvent".to_string(),
+                payload: json!({ "content": "答案在这里" }),
+            },
+            KiroEvent {
+                event_type: "metadataEvent".to_string(),
+                payload: json!({ "stopReason": "END_TURN" }),
+            },
+        ];
+        let out = anthropic_sse_from_events(&events, ToolRecoverySpec::default());
+        assert_eq!(sse_text(&out), "答案在这里");
+        assert!(
+            !out.contains("API Error"),
+            "正常回合不该补错误正文: {out}"
+        );
+        let blocks = out
+            .lines()
+            .filter(|line| *line == "event: content_block_start")
+            .count();
+        assert_eq!(blocks, 1, "只该有一个正文块: {out}");
+        assert!(out.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    /// 一次只吐一帧的 reader：用来观察「出参是否在上游读完之前就开始写」。
+    struct FrameAtATime {
+        frames: Vec<Vec<u8>>,
+        cursor: usize,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for FrameAtATime {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.cursor >= self.frames.len() {
+                return Ok(0);
+            }
+            let frame = &self.frames[self.cursor];
+            assert!(frame.len() <= buf.len(), "测试帧必须小于读缓冲");
+            buf[..frame.len()].copy_from_slice(frame);
+            self.cursor += 1;
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(frame.len())
+        }
+    }
+
+    #[test]
+    fn tools_request_streams_before_upstream_eof() {
+        // 回归：带 tools 的请求曾被整条 `read_to_end` 后才吐第一个字，
+        // 表现就是「等很久，然后整段答案一次性出现」——常被误判成模型不支持流式。
+        // 这条用例盯的是「正文 delta 必须在上游读完之前发出」，与总耗时无关。
+        let spec = ToolRecoverySpec::from_body(&json!({
+            "tools": [{ "name": "Bash", "input_schema": { "type": "object" } }]
+        }));
+        let events = vec![
+            KiroEvent {
+                event_type: "assistantResponseEvent".to_string(),
+                payload: json!({ "content": "第一段" }),
+            },
+            KiroEvent {
+                event_type: "assistantResponseEvent".to_string(),
+                payload: json!({ "content": "第二段" }),
+            },
+            KiroEvent {
+                event_type: "toolUseEvent".to_string(),
+                payload: json!({
+                    "toolUseId": "call_stream",
+                    "name": "Bash",
+                    "input": { "command": "ls" },
+                    "stop": true
+                }),
+            },
+            KiroEvent {
+                event_type: "metadataEvent".to_string(),
+                payload: json!({ "stopReason": "TOOL_USE" }),
+            },
+        ];
+        let frames = events
+            .iter()
+            .map(|event| build_frame(&event.event_type, &event.payload))
+            .collect::<Vec<_>>();
+        let total = frames.len();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = FrameAtATime {
+            frames,
+            cursor: 0,
+            reads: Arc::clone(&reads),
+        };
+
+        let mut out = String::new();
+        let mut first_text_at = None;
+        pipe_kiro_body_to_anthropic_sse(reader, spec, |chunk| {
+            if first_text_at.is_none() && chunk.contains("\"text_delta\"") {
+                first_text_at = Some(reads.load(Ordering::SeqCst));
+            }
+            out.push_str(&chunk);
+        });
+
+        let at = first_text_at.expect("必须发出正文 delta");
+        assert!(
+            at < total,
+            "正文 delta 必须在上游读完（共 {total} 帧）之前发出，实际已读 {at} 帧"
+        );
+        assert!(sse_text(&out).contains("第一段"));
+        assert!(out.contains("call_stream"));
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
     }
 
     #[test]
@@ -4352,7 +4245,10 @@ mod tests {
     }
 
     #[test]
-    fn buffered_tool_events_preserve_text_tool_text_order() {
+    fn tool_round_streams_text_first_and_appends_tools_at_the_end() {
+        // 正文与工具交错时不再追求「块顺序与上游逐字一致」：正文必须边收边发，
+        // 而工具块只有整轮校验完才能决定发还是不发（发出的块撤不回）。
+        // 取舍是「首字延迟」优先 —— 顺带把工具块统一收到末尾，正文之间的先后仍然保序。
         let spec = ToolRecoverySpec::from_body(&json!({
             "tools": [{
                 "name": "Bash",
@@ -4383,21 +4279,22 @@ mod tests {
                 payload: json!({ "content": "after" }),
             },
         ];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            spec,
-            |chunk| out.push_str(&chunk),
-        ));
-        let before = out.find("before").unwrap();
-        let tool = out.find("call_order").unwrap();
-        let after = out.find("after").unwrap();
-        assert!(before < tool && tool < after);
+        let out = anthropic_sse_from_events(&events, spec);
+        // 正文被合成同一个块（工具事件不再打断正文块），内容必须一字不少。
+        assert_eq!(sse_text(&out), "beforeafter", "{out}");
+        let last_text_delta = out.rfind("\"text\":").expect("必须发出正文");
+        let tool = out.find("call_order").expect("必须发出工具块");
+        assert!(
+            last_text_delta < tool,
+            "工具块应统一追加在正文之后: {out}"
+        );
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
     }
 
     #[test]
-    fn buffered_tool_events_reject_missing_stop() {
+    fn tool_event_without_stop_is_finalized_at_eof() {
+        // 上游可能省略 `stop`：EOF 时只要入参已是完整对象，就按完整工具收下。
+        // 早期缓冲路径会把它判成残缺整轮丢掉，实际是上游省略了结束标记而已。
         let spec = ToolRecoverySpec::from_body(&json!({
             "tools": [{ "name": "Bash", "input_schema": { "type": "object" } }]
         }));
@@ -4409,16 +4306,11 @@ mod tests {
                 "input": { "command": "side-effect" }
             }),
         }];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            spec,
-            |chunk| out.push_str(&chunk),
-        ));
-        assert!(!out.contains("\"type\":\"tool_use\""));
-        assert!(!out.contains("call_open"));
-        assert!(out.contains("incomplete tool call"));
-        assert!(out.contains("\"stop_reason\":\"end_turn\""));
+        let out = anthropic_sse_from_events(&events, spec);
+        assert!(out.contains("\"type\":\"tool_use\""), "应补成完整工具块: {out}");
+        assert!(out.contains("call_open"));
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
+        assert!(!out.contains("incomplete tool call"));
     }
 
     /// 从 SSE 输出里取出首个 input_json_delta 的 partial_json 并解码成 JSON。
@@ -4440,7 +4332,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_tool_events_repair_antml_polluted_input() {
+    fn tool_events_repair_antml_polluted_input() {
         // 真实样本（会话 791513c9 第 374 行）：上游把 antml 参数序列半解析成
         // `{"-B":"3\">\n<parameter name=\"-n\">true", ...}`，`-B` 该是 number 却成了 string。
         // 旧行为整轮报 "incomplete tool call"；现在应按 schema 重建出干净入参。
@@ -4472,12 +4364,7 @@ mod tests {
                 "stop": true
             }),
         }];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            spec,
-            |chunk| out.push_str(&chunk),
-        ));
+        let out = anthropic_sse_from_events(&events, spec);
         assert!(!out.contains("incomplete tool call"), "不应再整轮失败: {out}");
         assert!(out.contains("toolu_bdrk_polluted"));
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
@@ -4493,7 +4380,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_tool_events_accept_tuple_schema_and_tolerate_opaque_schema() {
+    fn tool_events_accept_tuple_schema_and_tolerate_opaque_schema() {
         // 真实样本（2026-09-10 16:07，会话 75fd38f7）：AskUserQuestion 的 schema 是元组形态
         // （draft-7 序列化成数组形式的 `items`），旧校验器读不懂 → 任何入参都被判非法 →
         // 整轮被替换成 "model returned an incomplete tool call"。
@@ -4561,12 +4448,7 @@ mod tests {
                 "stop": true
             }),
         }];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            spec,
-            |chunk| out.push_str(&chunk),
-        ));
+        let out = anthropic_sse_from_events(&events, spec);
         assert!(!out.contains("incomplete tool call"), "不应整轮失败: {out}");
         assert!(out.contains("toolu_bdrk_ask"));
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
@@ -4588,19 +4470,14 @@ mod tests {
                 "stop": true
             }),
         }];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            opaque,
-            |chunk| out.push_str(&chunk),
-        ));
+        let out = anthropic_sse_from_events(&events, opaque);
         assert!(!out.contains("incomplete tool call"), "schema 读不懂时应放行: {out}");
         assert!(out.contains("toolu_bdrk_opaque"));
         assert_eq!(first_tool_input(&out), json!({ "anything": 1 }));
     }
 
     #[test]
-    fn buffered_tool_events_pass_through_schema_violating_input() {
+    fn tool_events_pass_through_schema_violating_input() {
         // 真实 case（2026-09-10 17:16，会话 75fd38f7）：入参对不上 schema 时，旧行为会把整轮
         // 替换成 "model returned an incomplete tool call"。客户端自己会做权威校验 ——
         // 单条工具报错可恢复（模型能读到错误并重试），整轮报废不可恢复，所以必须放行。
@@ -4625,12 +4502,7 @@ mod tests {
                 "stop": true
             }),
         }];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            spec,
-            |chunk| out.push_str(&chunk),
-        ));
+        let out = anthropic_sse_from_events(&events, spec);
         assert!(!out.contains("incomplete tool call"), "不应整轮失败: {out}");
         assert!(out.contains("call_schema_bad"));
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
@@ -4638,7 +4510,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_tool_events_accept_real_ask_user_question_schema() {
+    fn tool_events_accept_real_ask_user_question_schema() {
         // 端到端复刻 16:07 / 17:16 的 AskUserQuestion 故障：用从本地 CLI 抓到的**真实** schema，
         // 正常的入参必须原样透出成 tool_use，而不是整轮错误文本。
         let tool: Value =
@@ -4671,12 +4543,7 @@ mod tests {
                 "stop": true
             }),
         }];
-        let mut out = String::new();
-        assert!(emit_buffered_kiro_events_to_anthropic_sse(
-            events,
-            spec,
-            |chunk| out.push_str(&chunk),
-        ));
+        let out = anthropic_sse_from_events(&events, spec);
         assert!(!out.contains("incomplete tool call"), "不应整轮失败: {out}");
         assert!(out.contains("toolu_bdrk_ask_real"));
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
@@ -5355,6 +5222,88 @@ mod tests {
 
         handle.stop();
         println!("[live] DONE");
+    }
+
+    /// 临时手工验证（非 CI）：Anthropic 协议**带 tools** 时是否真的边收边推。
+    ///
+    /// 这是「模型没有流式输出」的现场复现：只要整条上游被读完才吐，首字就会紧贴
+    /// 结束时间（差值≈0）；正常应该是首字早早到、剩余时间都在持续推字。
+    ///
+    /// 运行：cargo test -p kiro2api --lib kiro::server::tests::live_anthropic_streams_with_tools -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires real Kiro SSO credentials"]
+    fn live_anthropic_streams_with_tools() {
+        let config = ProxyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 5052,
+            proxy_api_key: Some("live-test-key".to_string()),
+            default_model: "claude-opus-5".to_string(),
+            runtime_url: "https://runtime.us-east-1.kiro.dev/".to_string(),
+            management_url: "https://management.us-east-1.kiro.dev/".to_string(),
+            sso_cache_dir: crate::paths::kiro_sso_cache_dir(),
+            profile_arn_override: None,
+        };
+        let handle = start_proxy(config).expect("proxy starts");
+        let port = handle.port;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .unwrap();
+
+        let body = json!({
+            "model": "gpt-5.6-luna",
+            "max_tokens": 600,
+            "stream": true,
+            "tools": [{
+                "name": "get_current_time",
+                "description": "Get the current local time",
+                "input_schema": { "type": "object", "properties": {} }
+            }],
+            "messages": [{
+                "role": "user",
+                "content": "用中文写 20 行短句，每行一句关于秋天的描写，不要调用工具。"
+            }],
+        });
+
+        let started = std::time::Instant::now();
+        let mut resp = client
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", "live-test-key")
+            .json(&body)
+            .send()
+            .unwrap();
+        assert!(resp.status().is_success(), "stream request failed: {}", resp.status());
+
+        let mut raw = String::new();
+        let mut buf = [0u8; 4096];
+        let mut first_delta_at = None;
+        let mut text_bytes = 0usize;
+        loop {
+            let n = resp.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+            if first_delta_at.is_none() && chunk.contains("\"text_delta\"") {
+                first_delta_at = Some(started.elapsed());
+            }
+            text_bytes += chunk.matches("\"text_delta\"").count();
+            raw.push_str(&chunk);
+        }
+        let finished_at = started.elapsed();
+        let first = first_delta_at.expect("必须发出正文 delta");
+        let head_gap = finished_at.saturating_sub(first);
+        println!(
+            "[live] 带工具流式：首字 {:?} / 收尾 {:?} / 尾段 {:?} / delta 数 {}",
+            first, finished_at, head_gap, text_bytes
+        );
+
+        assert!(raw.contains("message_stop"), "SSE 必须正常收尾");
+        assert!(!raw.contains("API Error"), "正常回合不该补错误正文");
+        assert!(
+            head_gap > std::time::Duration::from_millis(300),
+            "整段缓冲才会让首字紧贴收尾（尾段仅 {head_gap:?}）"
+        );
     }
 
     /// 临时手工验证（非 CI）：OpenAI 兼容入口走真实 Kiro 凭据的完整链路。
