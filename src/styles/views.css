@@ -302,6 +302,134 @@
   box-shadow: none;
 }
 
+/* ── 概览：默认值单选组 ────────────────────────────────────────────
+   造型直接复用「三方接入」页签的 .tabs / .tab（全局只有一种「选中」表达）。
+   这里只补两件它没有的事：
+   1. `is-wrap` —— 上下文有九档，窄窗口必须换行，否则药丸横向溢出把卡片撑破；
+   2. 左侧标签列 —— `.tabs` 是 `fit-content`，不设拉伸它会缩成药丸自身的宽度。 */
+.pref-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-sm);
+}
+
+.pref-row + .pref-row {
+  margin-top: 10px;
+}
+
+.pref-label {
+  flex: none;
+  width: 60px;
+  padding-top: 7px;
+  font-size: var(--t-small);
+  color: var(--ink-subtle);
+}
+
+.tabs.is-wrap {
+  flex: 1;
+  flex-wrap: wrap;
+  width: auto;
+  align-self: stretch;
+  justify-content: flex-start;
+}
+
+/* 落在卡片里时改成「卡内子块」的形制：浅灰、无描边、去阴影。
+   白底描边胶囊放在白卡里就是盒子里再套盒子 —— 页签在页面上这么画是对的，
+   进了卡片就得按卡内的规矩来。 */
+.card .tabs.is-wrap {
+  border: 0;
+  background: var(--surface-2);
+  box-shadow: none;
+}
+
+/* 悬停翻白：与 `.dir-tile` / `.model-card` 同一套反馈。
+   特异性 (0,5,1) 压过通用按钮 hover 的 (0,3,1)，否则会被刷成灰底。 */
+.card .tabs.is-wrap .tab:hover:not(.is-active):not(:disabled):not([aria-disabled='true']) {
+  background: var(--surface-1);
+  color: var(--ink);
+}
+
+/* 英文档位名（`low` / `high` …）：等宽 + 小一号 + 灰，读作注释而不是第二段主文字。
+   客户端里填的就是这几个字，所以必须露出来，但不能跟中文说明抢注意力。 */
+.tab-hint {
+  margin-left: 5px;
+  font-family: var(--font-mono);
+  font-size: var(--t-caption);
+  font-weight: 500;
+  color: var(--ink-subtle);
+}
+
+/* 选中时跟着主色走，但压淡一档 —— 主文字仍是中文说明。 */
+.tabs .tab.is-active .tab-hint {
+  color: color-mix(in srgb, var(--primary) 55%, transparent);
+}
+
+/* 标题旁的感叹号 + 悬浮说明。
+   说明为什么不做脚注：卡片里两行控件已经填满，脚注白占一行高度，而它只在
+   「想搞清楚为什么」时才有人读 —— 收进气泡，需要的人自己去找。
+   气泡全 CSS 自绘（原生 title 延迟长、灰框样式跟界面不搭），贴着图标左下展开；
+   卡片没有 overflow 裁剪，不必用 JS 算边界。 */
+.pref-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  /* 收掉一点卡头的 10px gap：标题与感叹号读作一组，不跟右边的副标题等距 */
+  margin-left: -3px;
+  border: 1px solid color-mix(in srgb, var(--ink-subtle) 42%, transparent);
+  border-radius: 50%;
+  color: var(--ink-subtle);
+  font-size: 10px;
+  font-weight: 620;
+  line-height: 1;
+  cursor: help;
+  user-select: none;
+}
+
+.pref-tip:hover,
+.pref-tip:focus-visible {
+  border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+  color: var(--primary);
+  outline: none;
+}
+
+/* 气泡宽 272px（约四行）。`pointer-events: none` 不能省：气泡正好压在下面那行
+   药丸上，能收事件的话鼠标一进去 hover 就断了，气泡会一闪一闪。 */
+.pref-tip::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 9px);
+  left: -9px;
+  z-index: 20;
+  width: max-content;
+  max-width: 272px;
+  white-space: normal;
+  padding: 9px 11px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-raise);
+  color: var(--ink-muted);
+  font-size: var(--t-small);
+  font-weight: 400;
+  line-height: 1.6;
+  text-align: left;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition:
+    opacity 120ms var(--ease),
+    transform 120ms var(--ease);
+  pointer-events: none;
+}
+
+.pref-tip:hover::after,
+.pref-tip:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 /* ── 账户额度：用量条 ─────────────────────────────────────────────── */
 .meter {
   display: flex;

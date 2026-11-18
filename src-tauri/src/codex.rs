@@ -372,11 +372,30 @@ fn pointer_state_from_doc(doc: &DocumentMut) -> CatalogState {
 const NEUTRAL_BASE_INSTRUCTIONS: &str =
     "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
+/// 目录条目里的两个「可配置默认值」。
+///
+/// 抽成参数是为了让 [`catalog_entry`] 保持纯函数：单元测试直接给值断言，
+/// 生产路径由 [`CatalogLimits::current`] 从运行期设置（`settings`）取。
+struct CatalogLimits {
+    context_window: u32,
+    default_effort: String,
+}
+
+impl CatalogLimits {
+    fn current() -> Self {
+        Self {
+            context_window: crate::settings::context_window(),
+            default_effort: crate::settings::default_effort(),
+        }
+    }
+}
+
 /// 一条目录条目。字段是 openai/codex 新旧两个 schema 世代的超集：两个世代
 /// 各自必需的键都写上，新世代必需的 Option 槽位显式给 null —— serde 不拒未知
-/// 字段，多写不炸。推理档位只挂 low/medium/high（默认 high）：全模型通吃，
-/// Codex 侧用户选低档时代理侧的归一化也能接住。
-fn catalog_entry(slug: &str, priority: i32) -> Value {
+/// 字段，多写不炸。推理档位只挂 low/medium/high（默认取用户在 kiro2api 里选的
+/// 那一档，与代理侧补默认值同源）：全模型通吃，Codex 侧用户选低档时代理侧的
+/// 归一化也能接住。
+fn catalog_entry(slug: &str, priority: i32, limits: &CatalogLimits) -> Value {
     json!({
         "slug": slug,
         "display_name": slug,
@@ -390,7 +409,7 @@ fn catalog_entry(slug: &str, priority: i32) -> Value {
             { "effort": "medium", "description": "均衡" },
             { "effort": "high", "description": "更深入" }
         ],
-        "default_reasoning_level": "high",
+        "default_reasoning_level": &limits.default_effort,
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
@@ -400,10 +419,10 @@ fn catalog_entry(slug: &str, priority: i32) -> Value {
         "support_verbosity": false,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
-        "truncation_policy": { "mode": "tokens", "limit": 200000 },
+        "truncation_policy": { "mode": "tokens", "limit": limits.context_window },
         "experimental_supported_tools": [],
-        "context_window": 200000,
-        "max_context_window": 200000,
+        "context_window": limits.context_window,
+        "max_context_window": limits.context_window,
         "effective_context_window_percent": 95,
         "supports_image_detail_original": false,
         "supports_search_tool": false,
@@ -415,14 +434,55 @@ fn catalog_entry(slug: &str, priority: i32) -> Value {
 
 /// 目录文件内容：Codex 只认 `{ "models": [...] }`。priority 随位置递增，
 /// 让选择器按勾选顺序排。
-fn catalog_document(models: &[String]) -> Value {
+fn catalog_document(models: &[String], limits: &CatalogLimits) -> Value {
     json!({
         "models": models
             .iter()
             .enumerate()
-            .map(|(i, slug)| catalog_entry(slug, 1000 + i as i32))
+            .map(|(i, slug)| catalog_entry(slug, 1000 + i as i32, limits))
             .collect::<Vec<_>>(),
     })
+}
+
+/// 把已接管的模型目录按当前设置重写一遍（用户改默认档位 / 默认上下文时调用）。
+///
+/// 只在「顶层 `model_catalog_json` 指向我们的文件」时动手：
+/// * 指针是别家的、或者根本没有指针 → 这个 Codex 没被我们接管，一律不碰；
+/// * 目录文件读不出来、或者 slug 清单是空的 → 无法安全重建（写一份空目录等于
+///   把 Codex 的模型全抹了），放弃并留日志。
+///
+/// 返回「是否真的重写了文件」。Codex 只在启动时读一次目录，所以写完要等它下次
+/// 启动才生效 —— 这句说明写在设置卡片下面，不让用户以为改完立刻变。
+pub(crate) fn refresh_catalog_if_ours() -> Result<bool, String> {
+    // 没装 Codex 不是错误：设置照样能改，只是没有目录要同步。
+    let Ok(dir) = codex_dir() else {
+        return Ok(false);
+    };
+    let doc = read_config(&config_path(&dir))?;
+    if pointer_state_from_doc(&doc) != CatalogState::Ours {
+        return Ok(false);
+    }
+    let catalog_file = catalog_path(&dir);
+    let Ok(text) = fs::read_to_string(&catalog_file) else {
+        return Ok(false);
+    };
+    let models = match parse_catalog_text(&text) {
+        Ok(models) => models,
+        Err(error) => {
+            eprintln!("[codex] 模型目录无法解析，跳过同步: {error}");
+            return Ok(false);
+        }
+    };
+    if models.is_empty() {
+        return Ok(false);
+    }
+    let desired = serde_json::to_string_pretty(&catalog_document(&models, &CatalogLimits::current()))
+        .map_err(|e| format!("序列化模型目录失败: {e}"))?;
+    if text == desired {
+        return Ok(false);
+    }
+    write_atomic(&catalog_file, &desired)?;
+    Ok(true)
 }
 
 /// 解析目录文件文本，取出 slug 清单。缺 slug、不是 JSON 都按错误上抛；
@@ -826,7 +886,7 @@ fn import_to_dir(
     let catalog_written = if catalog_managed && !models.is_empty() {
         // 先写目录文件再写配置：指针落地时文件必已就位，中断也只会多出一个
         // 没被引用的文件，不会让 Codex 拿到悬空指针
-        let desired = serde_json::to_string_pretty(&catalog_document(models))
+        let desired = serde_json::to_string_pretty(&catalog_document(models, &CatalogLimits::current()))
             .map_err(|e| format!("序列化模型目录失败: {e}"))?;
         let differs =
             fs::read_to_string(&catalog_file).ok().as_deref() != Some(desired.as_str());
@@ -1200,17 +1260,28 @@ model = "their-pick"
         assert_eq!(basename_of("k.json"), "k.json");
     }
 
+    /// 目录条目的两个「用户可配」值必须如实写进文件；其余键是两代 schema 的并集。
     #[test]
     fn catalog_entry_covers_both_schema_generations() {
-        let entry = catalog_entry("m1", 1000);
+        let limits = CatalogLimits {
+            context_window: 500_000,
+            default_effort: "low".to_string(),
+        };
+        let entry = catalog_entry("m1", 1000, &limits);
         assert_eq!(entry["slug"], "m1");
         assert_eq!(entry["display_name"], "m1");
         assert_eq!(entry["visibility"], "list");
         assert_eq!(entry["shell_type"], "shell_command");
         assert_eq!(entry["supported_in_api"], true);
         assert_eq!(entry["priority"], 1000);
-        assert_eq!(entry["default_reasoning_level"], "high");
+        // 设置里选的档位与上下文大小要原样落到目录里，三处上下文相关键同一个值
+        assert_eq!(entry["default_reasoning_level"], "low");
         assert_eq!(entry["truncation_policy"]["mode"], "tokens");
+        assert_eq!(entry["truncation_policy"]["limit"], 500_000);
+        assert_eq!(entry["context_window"], 500_000);
+        assert_eq!(entry["max_context_window"], 500_000);
+        // 有效窗口比例不是用户可配项，固定 95%
+        assert_eq!(entry["effective_context_window_percent"], 95);
         let levels = entry["supported_reasoning_levels"].as_array().unwrap();
         assert_eq!(levels.len(), 3);
         // 旧世代必需的键在位（新版本会忽略）；base_instructions 必须是字符串
@@ -1326,10 +1397,10 @@ model = "their-pick"
 
     #[test]
     fn catalog_document_parses_as_both_codex_generations() {
-        let text = serde_json::to_string(&catalog_document(&[
-            "gpt-5.2".to_string(),
-            "gpt-5.2-codex".to_string(),
-        ]))
+        let text = serde_json::to_string(&catalog_document(
+            &["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
+            &CatalogLimits::current(),
+        ))
         .unwrap();
         let current = schema_mirror::parse::<schema_mirror::Current>(&text).unwrap();
         assert_eq!(current, 2);
@@ -1339,8 +1410,11 @@ model = "their-pick"
 
     #[test]
     fn parse_catalog_text_reads_slugs_and_rejects_junk() {
-        let text = serde_json::to_string(&catalog_document(&["m1".to_string(), "m2".to_string()]))
-            .unwrap();
+        let text = serde_json::to_string(&catalog_document(
+            &["m1".to_string(), "m2".to_string()],
+            &CatalogLimits::current(),
+        ))
+        .unwrap();
         assert_eq!(parse_catalog_text(&text).unwrap(), vec!["m1", "m2"]);
         assert!(parse_catalog_text("{}").is_err());
         assert!(parse_catalog_text(r#"{"models": []}"#).is_ok_and(|m| m.is_empty()));

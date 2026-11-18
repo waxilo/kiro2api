@@ -180,6 +180,7 @@ src-tauri/src/
   lib.rs                 应用装配：插件、命令注册、托盘、退出钩子
   main.rs                可执行入口
   prefs.rs               本地配置持久化（原子写 + 最小权限）
+  settings.rs            运行期默认值：思考级别 / 上下文大小（可配，单选）
   paths.rs               数据目录 / 凭据目录 / 日志路径
   proc_guard.rs          子进程硬超时与隐藏控制台窗口
   protocol_guard.rs      模型输出里内部协议文本的清洗

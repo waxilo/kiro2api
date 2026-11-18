@@ -15,6 +15,7 @@ import type {
   LoginMethod,
   LoginSession,
   ModelsState,
+  PreferencesState,
   ProxyAccess,
   ProxyStatus,
   RevealTarget,
@@ -117,6 +118,21 @@ export const backend = {
    * 所以调用方拿到返回值之后应当立刻重新检查一次更新，那时走的才是新线路。
    */
   setUpdateSource: (id: string) => invoke<UpdateSourceState>('k2a_update_source_set', { id }),
+
+  // ── 默认值（思考级别 / 上下文大小）────────────────────────────────────
+  /**
+   * 读两个默认值：当前选择与全部候选。选项表由后端给，前端不另存一份。
+   */
+  preferences: () => invoke<PreferencesState>('k2a_preferences_get'),
+  /**
+   * 改默认思考级别。返回值是写盘之后的状态，界面直接用它重绘。
+   * 已接管的 Codex 模型目录会跟着重写一次（Codex 下次启动生效）。
+   */
+  setDefaultEffort: (effort: string) =>
+    invoke<PreferencesState>('k2a_set_default_effort', { effort }),
+  /** 改默认上下文大小（token）。同样会同步已接管的 Codex 目录。 */
+  setContextWindow: (tokens: number) =>
+    invoke<PreferencesState>('k2a_set_context_window', { tokens }),
 
   // ── 系统 ──────────────────────────────────────────────────────────────
   reveal: (path: RevealTarget) => invoke<void>('k2a_reveal', { path }),

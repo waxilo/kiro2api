@@ -48,6 +48,13 @@ pub(crate) struct AppConfig {
     /// 其余取值是 `updater_accel` 里那份源清单的 id（`direct` 或某个镜像 id）——
     /// 认不出来的值一律按自动处理，这样将来下线某个镜像时，旧配置不会让更新彻底不可用。
     pub(crate) update_source: Option<String>,
+    /// 客户端没指定思考级别时由代理补上的那一档；`None` = 内置默认（`high`）。
+    ///
+    /// 这里只存用户选过的值，**不做校验** —— 合法档位属于 `settings` 的知识，
+    /// 两处都写一份就迟早漂移。读到不认识的档位时由 `settings` 按「没配」处理。
+    pub(crate) default_effort: Option<String>,
+    /// 写进 Codex 模型目录的上下文窗口大小（token）；`None` = 内置默认（300K）。
+    pub(crate) context_window: Option<u32>,
 }
 
 /// 额度快照 + 写入时刻。重启后先拿它渲染，再等后台静默刷新替换。
@@ -68,6 +75,8 @@ impl Default for AppConfig {
             model_rates: HashMap::new(),
             usage_cache: None,
             update_source: None,
+            default_effort: None,
+            context_window: None,
         }
     }
 }

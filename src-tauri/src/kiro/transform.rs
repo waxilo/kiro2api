@@ -5,8 +5,8 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::kiro::models::{
-    estimate_tokens, get_requested_effort, normalize_effort, resolve_model_profile, EffortPlacement,
-    ModelProfile,
+    effort_is_specified, estimate_tokens, get_requested_effort, highest_effort, normalize_effort,
+    resolve_model_profile, EffortPlacement, ModelProfile,
 };
 use crate::protocol_guard::normalize_stop_reason;
 
@@ -2125,6 +2125,47 @@ fn apply_thinking_fields(extra: &mut Map<String, Value>, thinking: &Value) {
     }
 }
 
+/// 调用方是否明确要求「别思考」。
+///
+/// 两条入站路径都看：顶层 `thinking`，以及会被原样深合并进 extra 的
+/// `additionalModelRequestFields.thinking`（驼峰与下划线两种写法都认）。
+/// 只用于决定要不要补默认 effort —— 显式档位不受影响。
+fn thinking_disabled(body: &Value) -> bool {
+    let disabled = |thinking: Option<&Value>| {
+        thinking
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str)
+            .map(|kind| kind.eq_ignore_ascii_case("disabled"))
+            .unwrap_or(false)
+    };
+    disabled(body.get("thinking"))
+        || ["additionalModelRequestFields", "additional_model_request_fields"]
+            .iter()
+            .any(|fields| disabled(body.get(*fields).and_then(|fields| fields.get("thinking"))))
+}
+
+/// 决定这次请求最终发给上游的 effort。
+///
+/// 三条分支的优先级是刻意排的：
+/// 1. 调用方写了 **且认得** → 用调用方的；
+/// 2. 调用方写了但不认得（`none`、`minimal` 这类），或者明确要求「别思考」→ **省略**。
+///    把 `none` 悄悄升成默认档比不生效更糟；`disabled` + `effort` 的矛盾也不该由代理裁决；
+/// 3. 调用方压根没提 → 补用户配的默认档（`settings`，出厂 `high`）。
+///
+/// 三条路最后都要过 `normalize_effort` 的枚举校验：模型不收 effort、或者枚举里没有
+/// 这一档，一律省略 —— 不降档、不加码，也绝不赌一个没被接受的枚举值。
+fn resolve_effort(body: &Value, profile: &ModelProfile, fallback: &str) -> Option<String> {
+    match get_requested_effort(body) {
+        Some(requested) => normalize_effort(Some(&requested), &profile.effort_levels),
+        None if effort_is_specified(body) || thinking_disabled(body) => None,
+        // 用户配的默认档不在这个模型的枚举里 → 退到它能给的最强档，而不是整块不发：
+        // 「默认要强」比「恰好是这一档」重要。空枚举（模型不收 effort）仍是 `None`，
+        // 发出去只会换回 502。
+        None => normalize_effort(Some(fallback), &profile.effort_levels)
+            .or_else(|| highest_effort(&profile.effort_levels)),
+    }
+}
+
 /// effort 取值终检：`output_config.effort` / `reasoning.effort` 里不在模型枚举内的
 /// 字面量一律不发。
 ///
@@ -2256,8 +2297,8 @@ fn build_additional_model_request_fields_with_profile(
         extra.remove("output_config");
     }
 
-    let effort = get_requested_effort(body)
-        .and_then(|effort| normalize_effort(Some(&effort), &profile.effort_levels));
+    // 调用方给了级别就按调用方的走；没给才补用户配的默认档（见 `resolve_effort`）。
+    let effort = resolve_effort(body, profile, &crate::settings::default_effort());
 
     // 3. max_tokens：仅对 schema/族允许的模型保留（Claude 且一般 ≥1024）
     if profile.allow_max_tokens {
@@ -2581,6 +2622,7 @@ pub fn anthropic_message_response_with_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::models::DEFAULT_EFFORT;
     use serde_json::json;
 
     #[test]
@@ -3755,16 +3797,160 @@ mod tests {
 
     #[test]
     fn schema_without_requested_fields_produces_no_additional() {
-        // 请求没带任何 additional 字段时，不应生成 additionalModelRequestFields。
-        let schema = json!({
-            "properties": { "reasoning": { "properties": { "effort": { "enum": ["none","low","medium","high"] } } } }
-        });
+        // 不收 effort 的模型（deepseek 这类枚举空集）即使用户什么都没给也不补
+        // 默认档：空集 = 任何取值都不许发，否则就是往上游塞它不认识的字面量。
         let body = json!({
-            "model": "gpt-5.6-luna",
+            "model": "deepseek-3.2",
             "messages": [{ "role": "user", "content": "hi" }],
         });
-        let built = build_kiro_request_with_schema(&body, "gpt-5.6-luna", Some("arn"), &schema).unwrap();
+        let built = build_kiro_request(&body, "deepseek-3.2", Some("arn")).unwrap();
         assert!(built.get("additionalModelRequestFields").is_none());
+    }
+
+    /// 调用方没提推理级别 → 代理补 [`DEFAULT_EFFORT`]，按模型落到对应容器。
+    #[test]
+    fn missing_effort_defaults_to_high() {
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        assert_eq!(
+            built["additionalModelRequestFields"]["output_config"]["effort"], DEFAULT_EFFORT,
+            "Claude 的默认档要落在 output_config.effort"
+        );
+
+        let body = json!({
+            "model": "gpt-5.6-terra",
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "gpt-5.6-terra", Some("arn")).unwrap();
+        assert_eq!(
+            built["additionalModelRequestFields"]["reasoning"]["effort"], DEFAULT_EFFORT,
+            "GPT 的默认档要落在 reasoning.effort"
+        );
+    }
+
+    /// 默认档位来自设置而不是编译期常量：把 fallback 换成 low / max，补的就是它。
+    ///
+    /// 直接测纯函数 `resolve_effort`，而不是改进程内的全局快照 —— 后者会被并行跑的
+    /// 其它用例看见（其余用例默认期望出厂值 high）。
+    #[test]
+    fn fallback_effort_comes_from_the_configured_default() {
+        let profile = resolve_model_profile("claude-opus-5.5", None);
+        let silent = json!({ "model": "claude-opus-5.5" });
+        assert_eq!(resolve_effort(&silent, &profile, "low").as_deref(), Some("low"));
+        assert_eq!(resolve_effort(&silent, &profile, "max").as_deref(), Some("max"));
+        // 出厂默认就是 high：不传 fallback 时 `build_kiro_request` 用的正是它
+        assert_eq!(resolve_effort(&silent, &profile, DEFAULT_EFFORT).as_deref(), Some(DEFAULT_EFFORT));
+
+        // 显式档位压过默认值
+        let explicit = json!({ "output_config": { "effort": "low" } });
+        assert_eq!(resolve_effort(&explicit, &profile, "max").as_deref(), Some("low"));
+
+        // 显式非法值不被升级成默认档；显式「别思考」也不补
+        let invalid = json!({ "output_config": { "effort": "none" } });
+        assert_eq!(resolve_effort(&invalid, &profile, "max"), None);
+        let disabled = json!({ "thinking": { "type": "disabled" } });
+        assert_eq!(resolve_effort(&disabled, &profile, "max"), None);
+
+        // 配的档位模型没有 → 退到它能给的最强档（「没有我选的级别就选最高级」）。
+        // schema 只认 low/medium 时，默认 high 落到 medium。
+        let narrow = resolve_model_profile(
+            "claude-opus-5.5",
+            Some(&json!({
+                "properties": { "output_config": { "properties": { "effort": { "enum": ["low", "medium"] } } } }
+            })),
+        );
+        assert_eq!(resolve_effort(&silent, &narrow, "high").as_deref(), Some("medium"));
+
+        // 反过来也一样：只认 high 的模型，默认 low 会被抬到 high
+        let only_high = resolve_model_profile(
+            "claude-opus-5.5",
+            Some(&json!({
+                "properties": { "output_config": { "properties": { "effort": { "enum": ["high"] } } } }
+            })),
+        );
+        assert_eq!(resolve_effort(&silent, &only_high, "low").as_deref(), Some("high"));
+
+        // 空枚举 = 模型压根不收 effort，没有任何「最高档」可退，只能省略
+        let no_effort = resolve_model_profile("deepseek-3.2", None);
+        assert_eq!(resolve_effort(&silent, &no_effort, "high"), None);
+
+        // 显式路径不走这条兜底：调用方自己写的不在枚举里就省略 ——
+        // 把显式 none（想关思考）悄悄升成最高档比不生效更糟
+        let explicit_unknown = json!({ "output_config": { "effort": "xhigh" } });
+        assert_eq!(resolve_effort(&explicit_unknown, &narrow, "high"), None);
+    }
+
+    /// 显式档位永远压过默认值。
+    #[test]
+    fn explicit_effort_wins_over_default() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": { "effort": "low" },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "gpt-5.6-sol", Some("arn")).unwrap();
+        assert_eq!(built["additionalModelRequestFields"]["reasoning"]["effort"], "low");
+    }
+
+    /// 显式「别思考」不补默认档，thinking 本身照原样发。
+    #[test]
+    fn disabled_thinking_suppresses_default_effort() {
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "thinking": { "type": "disabled" },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        let additional = &built["additionalModelRequestFields"];
+        assert!(
+            additional.get("output_config").is_none(),
+            "别思考时不该补 effort: {additional:?}"
+        );
+        assert_eq!(additional["thinking"]["type"], "disabled");
+
+        // 同一意图走 additionalModelRequestFields（含下划线写法）同样认。
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "additional_model_request_fields": { "thinking": { "type": "disabled" } },
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built = build_kiro_request(&body, "claude-opus-5.5", Some("arn")).unwrap();
+        let additional = &built["additionalModelRequestFields"];
+        assert!(
+            additional.get("output_config").is_none(),
+            "additional_model_request_fields 里的 disabled 也要认: {additional:?}"
+        );
+    }
+
+    /// 模型枚举里没有默认档时退到它的最高档：「默认要强」比「恰好是这一档」重要。
+    ///
+    /// 补齐的默认值仍然要过枚举校验，只是结果从「省略」变成「取最高的那一档」；
+    /// 完全不收 effort 的模型没有可退的档，仍整块不发（见 `resolve_effort` 的单测）。
+    #[test]
+    fn default_effort_falls_back_to_the_highest_level_the_model_accepts() {
+        let schema = json!({
+            "properties": {
+                "output_config": { "properties": { "effort": { "enum": ["low", "medium"] } } }
+            }
+        });
+        let body = json!({
+            "model": "claude-opus-5.5",
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let built =
+            build_kiro_request_with_schema(&body, "claude-opus-5.5", Some("arn"), &schema).unwrap();
+        let additional = built.get("additionalModelRequestFields");
+        assert_eq!(
+            additional
+                .and_then(|a| a.get("output_config"))
+                .and_then(|c| c.get("effort"))
+                .and_then(|e| e.as_str()),
+            Some("medium"),
+            "枚举无 high 时应退到 medium: {additional:?}"
+        );
     }
 
     /// 复现用户报的 502：客户端带 `output_config.effort = "none"`（想关思考），

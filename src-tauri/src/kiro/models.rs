@@ -36,6 +36,16 @@ const CLAUDE_46_EFFORT: &[&str] = &["low", "medium", "high", "max"];
 /// GPT 系列多一个 none。
 const GPT_EFFORT: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 
+/// 调用方没指定推理级别时由代理补上的档位，也是 Codex 模型目录里的默认档
+/// （见 `codex::catalog_entry`）—— 两处必须同源，否则「Codex 默认 high、
+/// 代理默认别的」会在客户端与代理之间来回打架。
+///
+/// `high` 能覆盖当前所有接受 effort 的型号：Claude 各代（`low`…`max`）、
+/// GPT 系列（多一个 `none`）都含这一档。模型枚举里没有 `high` 时，补默认值的
+/// 那条路径退到该模型的最高档（见 [`highest_effort`]）；完全不收 effort 的模型
+/// 则整块省略，交给上游自己的默认。
+pub const DEFAULT_EFFORT: &str = "high";
+
 /// 模型支持的 effort 级别（none/low/medium/high/xhigh/max）。
 ///
 /// Claude 走「按形状识别」而不是白名单：上游不定期上新（`claude-opus-5.5` 等），
@@ -150,6 +160,25 @@ pub fn normalize_effort(effort: Option<&str>, levels: &[String]) -> Option<Strin
     None
 }
 
+/// 档位的语义顺序（由弱到强）。
+///
+/// 不能拿 `levels` 的数组顺序当高低：那份 enum 直接来自上游 schema，写成什么顺序都有。
+const EFFORT_RANK: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+
+/// 模型实际支持的最高一档。
+///
+/// 用途只有一个：用户配的默认档不在这个模型的枚举里时，退到它能给的最强档
+/// （见 `transform::resolve_effort`）。`levels` 为空说明模型压根不接受 effort，
+/// 返回 `None` —— 此时发任何取值都只会换回 502，不能硬塞。
+pub fn highest_effort(levels: &[String]) -> Option<String> {
+    EFFORT_RANK
+        .iter()
+        .rev()
+        .copied()
+        .find(|rank| levels.iter().any(|level| level.as_str() == *rank))
+        .map(str::to_string)
+}
+
 pub fn normalize_effort_level(value: Option<&str>) -> Option<String> {
     let value = value?;
     let normalized: String = value
@@ -192,6 +221,40 @@ pub fn get_requested_effort(body: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// 请求里是否**出现过** effort 字段（不看取值认不认得）。
+///
+/// 用来区分「没提推理级别」和「提了但写法不认识」：前者由代理补
+/// [`DEFAULT_EFFORT`]，后者保持既有语义（整块省略）。少了这道判断，
+/// `additionalModelRequestFields.effort = "none"` 这类字面量会被当成「没提」，
+/// 于是被悄悄升级成默认档 —— 恰恰是「显式关思考反被开到 high」那种事故。
+pub fn effort_is_specified(body: &Value) -> bool {
+    fn present(body: &Value, path: &[&str]) -> bool {
+        let mut current = body;
+        for key in path {
+            match current.get(*key) {
+                Some(next) => current = next,
+                None => return false,
+            }
+        }
+        !current.is_null()
+    }
+
+    let paths: [&[&str]; 11] = [
+        &["effort"],
+        &["effort_level"],
+        &["reasoning_effort"],
+        &["reasoning", "effort"],
+        &["output_config", "effort"],
+        &["additionalModelRequestFields", "effort"],
+        &["additionalModelRequestFields", "output_config", "effort"],
+        &["additionalModelRequestFields", "reasoning", "effort"],
+        &["additional_model_request_fields", "effort"],
+        &["additional_model_request_fields", "output_config", "effort"],
+        &["additional_model_request_fields", "reasoning", "effort"],
+    ];
+    paths.iter().any(|path| present(body, path))
 }
 
 /// Kiro 的 Claude 模型命名形如 `claude-opus-5` / `claude-opus-4.8`。
@@ -572,6 +635,22 @@ mod tests {
         assert_eq!(normalize_effort(Some("none"), &gpt).as_deref(), Some("none"));
     }
 
+    /// 最高档按语义取，不信 enum 的书写顺序；空枚举没有「最高档」。
+    #[test]
+    fn highest_effort_uses_semantic_rank() {
+        let levels = |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+
+        // 乱序的 enum 也要挑出 max
+        assert_eq!(highest_effort(&levels(&["max", "low", "medium"])).as_deref(), Some("max"));
+        assert_eq!(highest_effort(&levels(&["low", "high", "medium"])).as_deref(), Some("high"));
+        assert_eq!(highest_effort(&levels(&["medium"])).as_deref(), Some("medium"));
+        // `none` 是最低档：有别的档时轮不到它
+        assert_eq!(highest_effort(&levels(&["none", "low"])).as_deref(), Some("low"));
+        assert_eq!(highest_effort(&levels(&["none"])).as_deref(), Some("none"));
+        // 模型不收 effort：没有可退的档
+        assert_eq!(highest_effort(&levels(&[])), None);
+    }
+
     #[test]
     fn profile_effort_levels_come_from_schema_when_present() {
         let schema = json!({
@@ -590,6 +669,33 @@ mod tests {
         });
         let profile = resolve_model_profile("claude-opus-5.5", Some(&schema_no_enum));
         assert_eq!(profile.effort_levels.len(), CLAUDE_EFFORT.len());
+    }
+
+    /// 「提了 effort」与「提得对不对」是两件事：前者决定要不要补默认档，
+    /// 后者由 [`normalize_effort`] 裁决。
+    #[test]
+    fn effort_is_specified_sees_every_inbound_spelling() {
+        let cases = [
+            json!({ "effort": "none" }),
+            json!({ "effort_level": "high" }),
+            json!({ "reasoning_effort": "low" }),
+            json!({ "reasoning": { "effort": "minimal" } }),
+            json!({ "output_config": { "effort": "HIGH" } }),
+            json!({ "additionalModelRequestFields": { "effort": "none" } }),
+            json!({ "additionalModelRequestFields": { "output_config": { "effort": "minimal" } } }),
+            json!({ "additionalModelRequestFields": { "reasoning": { "effort": "none" } } }),
+            json!({ "additional_model_request_fields": { "effort": "none" } }),
+            json!({ "additional_model_request_fields": { "output_config": { "effort": "none" } } }),
+            json!({ "additional_model_request_fields": { "reasoning": { "effort": "none" } } }),
+        ];
+        for body in &cases {
+            assert!(effort_is_specified(body), "该写法必须算「提过 effort」: {body}");
+        }
+
+        // 完全没提（或只有 null）才算没提 —— 这时才补默认档。
+        assert!(!effort_is_specified(&json!({ "messages": [] })));
+        assert!(!effort_is_specified(&json!({ "output_config": {} })));
+        assert!(!effort_is_specified(&json!({ "output_config": { "effort": null } })));
     }
 
     #[test]

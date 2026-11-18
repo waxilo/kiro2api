@@ -10,6 +10,7 @@ mod paths;
 mod prefs;
 mod proc_guard;
 mod protocol_guard;
+mod settings;
 mod tray;
 mod updater_accel;
 mod window;
@@ -91,6 +92,10 @@ pub fn run() {
             let handle = app.handle().clone();
             let _ = APP_HANDLE.set(handle.clone());
 
+            // 运行期默认值（思考级别 / 上下文大小）必须在任何请求进来之前就位：
+            // 代理线程与 Codex 目录都从这里取值，晚一步就会拿到内置默认。
+            settings::init_from_config(&prefs::load_config());
+
             // 本地更新清单代理：解决国内直连 GitHub 超时
             updater_accel::start_manifest_proxy();
 
@@ -136,6 +141,9 @@ pub fn run() {
             codex_restart::k2a_codex_restart,
             updater_accel::k2a_update_source_get,
             updater_accel::k2a_update_source_set,
+            settings::k2a_preferences_get,
+            settings::k2a_set_default_effort,
+            settings::k2a_set_context_window,
             window::k2a_snap_rect,
             window::k2a_diag,
             window::k2a_quit_app,

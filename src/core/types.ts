@@ -225,3 +225,30 @@ export interface UpdateState {
   /** 下载源：当前选择、可选项、本次实际走的源。读取失败时为 null。 */
   source: UpdateSourceState | null;
 }
+
+/**
+ * 一个单选组的候选项。
+ *
+ * 选项表由后端给（`settings::EFFORT_OPTIONS` / `CONTEXT_OPTIONS`）：档位与文案只在那里
+ * 存在一份，前端不抄第二份 —— 少一档、多一档、改个说法都只改一处。
+ */
+export interface PrefOption<T> {
+  value: T;
+  label: string;
+  /** 跟在中文说明后面的英文标识（思考级别的 `high` 这类）；上下文档位没有。 */
+  hint?: string | null;
+}
+
+/** 一个单选组：当前值 + 候选。 */
+export interface PrefChoice<T> {
+  value: T;
+  options: PrefOption<T>[];
+}
+
+/** `k2a_preferences_get` 的返回：代理侧的两个默认值。 */
+export interface PreferencesState {
+  /** 客户端没指定思考级别时补上的那一档。 */
+  defaultEffort: PrefChoice<string>;
+  /** 写进 Codex 模型目录的上下文大小（token）。 */
+  contextWindow: PrefChoice<number>;
+}

@@ -57,6 +57,7 @@ export const ACTION = {
   codexApply: '应用 Codex 变更',
   codexRemove: '取消 Codex 接入',
   codexRestart: '重启 Codex 应用',
+  setDefaults: '更新默认值',
   login: '发起登录',
   logout: '退出登录',
 } as const;
@@ -237,16 +238,18 @@ export function setCodexFilter(query: string): void {
  */
 export async function refresh(): Promise<void> {
   try {
-    const [status, access, models, cachedUsage] = await Promise.all([
+    const [status, access, models, cachedUsage, prefs] = await Promise.all([
       backend.status(),
       backend.access(),
       backend.models(),
       backend.cachedUsage(),
+      backend.preferences(),
     ]);
     store.set({
       status,
       access,
       models,
+      prefs,
       // 缓存只用来**填空白**，绝不覆盖已经拿到的新值：`refresh()` 会被每个动作在收尾时
       // 调用一次，而它读的是磁盘上那一份（可能比内存里的旧）。用 `??` 而不是直接赋值，
       // 语义就变成「首屏没有值时才拿缓存顶上」，不会把刚查回来的额度倒回旧数。
@@ -513,6 +516,20 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
   switch (action) {
     case 'refresh':
       await refresh();
+      return;
+
+    // 两个默认值都是「写配置」的动作：走 run() 的全局门控与其它改配置的动作排队，
+    // 返回值就是写盘之后的权威状态，直接写进 store —— 不必等收尾的整轮同步。
+    case 'set-effort':
+      await run(ACTION.setDefaults, async () => {
+        store.set({ prefs: await backend.setDefaultEffort(dataset.effort ?? '') });
+      });
+      return;
+
+    case 'set-context':
+      await run(ACTION.setDefaults, async () => {
+        store.set({ prefs: await backend.setContextWindow(Number(dataset.context ?? '')) });
+      });
       return;
 
     case 'proxy-start': {

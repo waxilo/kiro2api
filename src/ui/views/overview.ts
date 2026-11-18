@@ -3,12 +3,16 @@
 // 这一页是唯一允许汇总别处分区信息的地方 —— 它是入口，用户第一眼就在这里。
 // 因此刻意只放**结论**（跑了没有、接入地址、两个关键数字）。
 //
+// 唯一写在这里的「设置」是默认推理与上下文：它们不改任何地址，只决定每个请求
+// 有多贵、多慢，和「额度已用」是同一类读数 —— 开屏核对一眼、改完看旁边额度在动。
+//
 // 两个数字的细节不再各占一个分区，而是点开就地的弹窗（见 `ui/modals`）：
 // 「可用模型」「额度已用」本质上都是只读的、看一眼就关的东西，为它们单开页面等于让用户
 // 看完还得自己点回概览；放进弹窗，上下文（服务跑没跑、地址是什么）始终在旁边。
 import { esc, localTime, money2, percent4, remainingUntil } from '../../core/format';
+import type { PrefChoice } from '../../core/types';
 import { ACTION } from '../../state/actions';
-import { isPending, summarizeStatus } from '../../state/app-state';
+import { isPending, summarizeStatus, type AppState } from '../../state/app-state';
 import { actionAttrs, note, statTile, statusPill, kvList, kv, swapLabel } from '../shared/render';
 import { ICON } from '../shared/icons';
 import type { ViewSpec } from './types';
@@ -28,11 +32,87 @@ function endpointRow(name: string, url: string, kind: string, canCopy: boolean):
     </li>`;
 }
 
+/**
+ * 一个分段单选组（思考级别 / 上下文大小）。
+ *
+ * 复用「三方接入」页签的 `.tabs` / `.tab` 造型 —— 全局只有一种「选中」表达，
+ * 这里不另造一套。选中项不挂 `data-action`：点它没有意义，也就不必白写一次配置。
+ *
+ * 上下文有九档，窄窗口下药丸会换行（`.tabs.is-wrap`），而不是横向溢出把卡片撑破。
+ */
+function prefSeg(
+  state: AppState,
+  label: string,
+  action: 'set-effort' | 'set-context',
+  dataKey: 'effort' | 'context',
+  choice: PrefChoice<string | number>,
+): string {
+  const options = choice.options
+    .map((option) => {
+      const on = String(option.value) === String(choice.value);
+      // 英文档位名当注释：小一号灰字跟在中文说明后面，客户端里填的就是这几个字。
+      const hint = option.hint ? `<span class="tab-hint">${esc(option.hint)}</span>` : '';
+      if (on) {
+        return `<button class="tab is-active" role="radio" aria-checked="true">${esc(option.label)}${hint}</button>`;
+      }
+      return (
+        `<button class="tab" role="radio" aria-checked="false"` +
+        ` data-action="${action}" data-${dataKey}="${esc(String(option.value))}"` +
+        ` ${actionAttrs(state, ACTION.setDefaults)}>${esc(option.label)}${hint}</button>`
+      );
+    })
+    .join('');
+  return `<div class="tabs is-wrap" role="radiogroup" aria-label="${esc(label)}">${options}</div>`;
+}
+
+/**
+ * 默认值卡片。首屏还没读到值时画一颗「读取中」的占位药丸：高度与真实控件一致，
+ * 值回来时卡片不会被撑高。
+ *
+ * 它留在概览而不是某个设置分区：这两个值决定的是「接下来每个请求贵不贵、快不快」，
+ * 和「额度已用」是同一类结论 —— 用户开屏就会核对一眼，改完也立刻看到旁边额度在动。
+ *
+ * 说明文案挂在标题旁的感叹号上，不做脚注：两行控件已经把卡片填满，脚注白占一行高度，
+ * 而它只在「想搞清楚为什么」时才有人读 —— 收进悬浮提示，需要的人自己去找。
+ */
+function prefsCard(state: AppState): string {
+  const prefs = state.prefs;
+  const placeholder = '<div class="tabs is-wrap"><button class="tab" disabled>读取中</button></div>';
+  const tip =
+    '思考级别只在客户端没写 effort 时补上：某个模型没有这一档时自动取它能给的最高档，' +
+    '完全不接受 effort 的模型则不发。上下文大小写进 Codex 模型目录，重启 Codex 后生效。';
+  return `
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">默认推理与上下文</span>
+        <span class="pref-tip" tabindex="0" role="note"
+              aria-label="${esc(tip)}" data-tip="${esc(tip)}">!</span>
+        <span class="card-sub">客户端没指定时生效</span>
+      </div>
+      <div class="pref-row">
+        <span class="pref-label">思考级别</span>
+        ${
+          prefs
+            ? prefSeg(state, '默认思考级别', 'set-effort', 'effort', prefs.defaultEffort)
+            : placeholder
+        }
+      </div>
+      <div class="pref-row">
+        <span class="pref-label">上下文</span>
+        ${
+          prefs
+            ? prefSeg(state, '默认上下文大小', 'set-context', 'context', prefs.contextWindow)
+            : placeholder
+        }
+      </div>
+    </div>`;
+}
+
 export const overviewView: ViewSpec = {
   id: 'overview',
   label: '概览',
   title: '概览',
-  desc: '本地服务、凭据与接入地址的当前快照',
+  desc: '本地服务、凭据、接入地址与默认参数的当前快照',
 
   // 这一页不再有标题右侧的「刷新」。
   //
@@ -181,6 +261,7 @@ export const overviewView: ViewSpec = {
       <div class="grid-2">
         ${credentialCard}
         ${accessCard}
-      </div>`;
+      </div>
+      ${prefsCard(state)}`;
   },
 };

@@ -9,6 +9,7 @@ import type {
   LoginMethod,
   LoginSession,
   ModelsState,
+  PreferencesState,
   ProxyAccess,
   ProxyStatus,
   UpdateState,
@@ -54,6 +55,14 @@ export interface AppState {
   status: ProxyStatus | null;
   access: ProxyAccess | null;
   models: ModelsState | null;
+  /**
+   * 代理侧的两个默认值（思考级别 / 上下文大小）：当前选择 + 全部候选。
+   *
+   * 候选表由后端给 —— 档位与文案只在 Rust 的 `settings` 里存在一份，视图照着渲染就行。
+   * null = 首屏还没读到（此时单选组画成一颗「读取中」的占位，高度与真实控件一致，
+   * 免得值回来时把卡片撑高）。
+   */
+  prefs: PreferencesState | null;
   /**
    * 「可用模型」弹窗的搜索词。
    *
@@ -195,6 +204,7 @@ export const store = createStore<AppState>({
   status: null,
   access: null,
   models: null,
+  prefs: null,
   modelFilter: '',
   usage: null,
   pending: [],
