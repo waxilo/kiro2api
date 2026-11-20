@@ -297,6 +297,21 @@ fn looks_like_kiro_claude_model(model: &str) -> bool {
 }
 
 /// 归一化请求中的模型名为 Kiro 内部模型名。
+///
+/// **只做形态转换，不做任何猜测**：
+/// - `KIRO_MODEL_OVERRIDE` 环境变量优先（显式覆盖）；
+/// - `kiro:` 前缀剥离；
+/// - Anthropic 公共 ID → Kiro 私有 ID（`claude-sonnet-4-5` → `claude-sonnet-4.5`）；
+/// - **同代**的日期后缀 ID 去掉后缀（`claude-sonnet-4-5-20250929` → `claude-sonnet-4.5`）；
+/// - 空值 → `default`。
+///
+/// 认不出的名字**原样返回**：「能不能用」由调用方拿账户可用清单判定，
+/// 不可用就明确报 400（见 `server::resolve_kiro_model`）。
+///
+/// 这里曾经按关键字猜（含 `opus` → `claude-opus-5`、含 `haiku` → `claude-haiku-4.5`、
+/// 含 `sonnet`/`claude-*` → `claude-sonnet-5`、都不认 → 默认模型），那是**静默降级**的
+/// 主要来源：跨代甚至跨族换模型，请求成功、答案正常，只是花的不是你选的模型的额度。
+/// 2026-11-20 按用户要求移除，只留下同代映射（Claude Code 不配模型时会发带日期的 ID）。
 pub fn normalize_kiro_model(model: Option<&str>, default: &str) -> String {
     if let Ok(override_model) = std::env::var("KIRO_MODEL_OVERRIDE") {
         if !override_model.trim().is_empty() {
@@ -305,8 +320,8 @@ pub fn normalize_kiro_model(model: Option<&str>, default: &str) -> String {
     }
 
     let model = match model {
-        Some(model) => model,
-        None => return default.to_string(),
+        Some(model) if !model.trim().is_empty() => model,
+        _ => return default.to_string(),
     };
 
     let unprefixed = model.strip_prefix("kiro:").unwrap_or(model);
@@ -315,18 +330,45 @@ pub fn normalize_kiro_model(model: Option<&str>, default: &str) -> String {
     if is_known_kiro_model(&kiro_model) || looks_like_kiro_claude_model(&kiro_model) {
         return kiro_model;
     }
+    if let Some(same_generation) = same_generation_alias(unprefixed) {
+        return same_generation;
+    }
+    unprefixed.to_string()
+}
 
-    let lower = unprefixed.to_lowercase();
-    if lower.contains("opus") {
-        return "claude-opus-5".to_string();
+/// 把带日期后缀的 Anthropic 公共 ID 折到**同一代**的 Kiro 型号名上。
+///
+/// 存在的理由只有一条：Claude Code 没显式配模型时会发 `claude-sonnet-4-5-20250929`
+/// 这类带日期的 ID，Kiro 不认识；折成 `claude-sonnet-4.5` 才能用上。
+/// 跨代一律不折（`claude-3-5-sonnet-*` 折不出 Kiro 型号，原样返回、由调用方报 400）。
+fn same_generation_alias(model: &str) -> Option<String> {
+    let mut parts: Vec<&str> = model.split('-').collect();
+    // 尾部是日期段（6~8 位纯数字）时先剥掉，剩下的才是「代数 + 版本」
+    while parts.len() > 3 && is_date_segment(parts[parts.len() - 1]) {
+        parts.pop();
     }
-    if lower.contains("haiku") {
-        return "claude-haiku-4.5".to_string();
+    if parts.len() < 3 || parts[0] != "claude" {
+        return None;
     }
-    if lower.contains("sonnet") || lower.starts_with("claude-") {
-        return "claude-sonnet-5".to_string();
+    if !matches!(parts[1], "opus" | "sonnet" | "haiku") {
+        return None;
     }
-    default.to_string()
+    let is_short_number = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 2
+            && text.chars().all(|c| c.is_ascii_digit())
+    };
+    match parts.len() {
+        3 if is_short_number(parts[2]) => Some(format!("claude-{}-{}", parts[1], parts[2])),
+        4 if is_short_number(parts[2]) && is_short_number(parts[3]) => {
+            Some(format!("claude-{}-{}.{}", parts[1], parts[2], parts[3]))
+        }
+        _ => None,
+    }
+}
+
+fn is_date_segment(text: &str) -> bool {
+    text.len() >= 6 && text.chars().all(|c| c.is_ascii_digit())
 }
 
 /// 粗略 token 估算：字符数 / 4（与 kiro2cli 一致）。
@@ -580,21 +622,34 @@ mod tests {
         assert_eq!(normalize_kiro_model(Some("claude-haiku-4.5"), "x"), "claude-haiku-4.5");
     }
 
-    /// 带日期后缀的 Anthropic 公共 ID 是 Kiro **不认识的**模型，仍要映射到同族模型。
-    /// 若把它们也透传，上游会直接报错——那就把「能用的旧客户端」弄坏了。
+    /// 带日期后缀的 Anthropic 公共 ID 只折到**同一代**，绝不跨代。
+    ///
+    /// Claude Code 不显式配模型时会发 `claude-sonnet-4-5-20250929` 这类 ID，
+    /// 折成 `claude-sonnet-4.5` 才能用上；而 `claude-3-5-sonnet-*` 折不出 Kiro 型号，
+    /// 必须原样返回让调用方明确报 400 —— 换成 `claude-sonnet-5` 属于静默降级
+    /// （花的是另一个模型的额度），2026-11-20 已移除。
     #[test]
-    fn dated_anthropic_ids_still_fall_back_to_the_family_model() {
+    fn dated_anthropic_ids_fold_to_the_same_generation_only() {
         assert_eq!(
-            normalize_kiro_model(Some("claude-3-5-sonnet-20241022"), "x"),
-            "claude-sonnet-5"
+            normalize_kiro_model(Some("claude-sonnet-4-5-20250929"), "x"),
+            "claude-sonnet-4.5"
         );
         assert_eq!(
-            normalize_kiro_model(Some("claude-sonnet-4-20250514"), "x"),
+            normalize_kiro_model(Some("claude-sonnet-5-20260101"), "x"),
             "claude-sonnet-5"
         );
         assert_eq!(
             normalize_kiro_model(Some("claude-opus-4-1-20250805"), "x"),
-            "claude-opus-5"
+            "claude-opus-4.1"
+        );
+        assert_eq!(
+            normalize_kiro_model(Some("claude-sonnet-4-20250514"), "x"),
+            "claude-sonnet-4"
+        );
+        // 更早的写法折不出 Kiro 型号：原样透传，由清单校验拦成 400
+        assert_eq!(
+            normalize_kiro_model(Some("claude-3-5-sonnet-20241022"), "x"),
+            "claude-3-5-sonnet-20241022"
         );
     }
 
@@ -698,10 +753,24 @@ mod tests {
         assert!(!effort_is_specified(&json!({ "output_config": { "effort": null } })));
     }
 
+    /// 认不出的模型名原样透传，不再「猜一个近似的」或退回默认模型。
+    ///
+    /// 猜是静默降级的入口：客户端要 `gpt-4o`、拿回来的却是 Claude，额度与风格全不对。
+    /// 现在这类名字会被 `resolve_kiro_model` 拿账户清单判定，不在清单里就明确报 400。
     #[test]
-    fn unknown_models_fall_back_to_the_default() {
-        assert_eq!(normalize_kiro_model(Some("some-random-model"), "fallback"), "fallback");
+    fn unknown_models_pass_through_instead_of_guessing() {
+        assert_eq!(
+            normalize_kiro_model(Some("some-random-model"), "fallback"),
+            "some-random-model"
+        );
+        assert_eq!(normalize_kiro_model(Some("gpt-4o"), "fallback"), "gpt-4o");
+        assert_eq!(
+            normalize_kiro_model(Some("claude-opus-3"), "fallback"),
+            "claude-opus-3"
+        );
+        // 没给模型（或给了空串）才用默认：这不是替换，是客户端没提要求
         assert_eq!(normalize_kiro_model(None, "fallback"), "fallback");
+        assert_eq!(normalize_kiro_model(Some("   "), "fallback"), "fallback");
     }
 
     #[test]

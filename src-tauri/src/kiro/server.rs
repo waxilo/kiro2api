@@ -2259,7 +2259,6 @@ fn respond_sse_stream_fetch(
     entry: Option<Arc<DedupEntry>>,
     dedup: Arc<DedupStore>,
     active_requests: Arc<AtomicUsize>,
-    model_headers: Vec<Header>,
 ) {
     // 只有真正会打 GenerateAssistantResponse 的 leader 才占用上游并发许可。
     let Some(permit) = try_acquire_request(&active_requests, MAX_CONCURRENT_REQUESTS) else {
@@ -2412,7 +2411,6 @@ fn respond_sse_stream_fetch(
         Header::from_bytes("Connection", "keep-alive").unwrap(),
         Header::from_bytes("X-Accel-Buffering", "no").unwrap(),
     ];
-    headers.extend(model_headers);
     headers.extend(cors_headers_for(&request));
     let response = Response::new(StatusCode(200), headers, reader, None, None)
         .with_chunked_threshold(0);
@@ -2463,7 +2461,6 @@ fn respond_openai_sse_stream_fetch(
     entry: Option<Arc<DedupEntry>>,
     dedup: Arc<DedupStore>,
     active_requests: Arc<AtomicUsize>,
-    model_headers: Vec<Header>,
 ) {
     let Some(permit) = try_acquire_request(&active_requests, MAX_CONCURRENT_REQUESTS) else {
         if let Some(entry) = &entry {
@@ -2623,7 +2620,6 @@ fn respond_openai_sse_stream_fetch(
         Header::from_bytes("Connection", "keep-alive").unwrap(),
         Header::from_bytes("X-Accel-Buffering", "no").unwrap(),
     ];
-    headers.extend(model_headers);
     headers.extend(cors_headers_for(&request));
     let response = Response::new(StatusCode(200), headers, reader, None, None)
         .with_chunked_threshold(0);
@@ -2867,75 +2863,57 @@ fn resolve_profile_arn(auth: &Auth) -> Result<Option<String>, String> {
     auth.discover_profile_arn()
 }
 
-/// 一次请求最终发往上游的模型，以及它是否被替换过。
-///
-/// 为什么要把「请求的」和「实际用的」一起带着走：账户套餐里没有你点的模型时，
-/// 硬发会让整条对话以 `INVALID_MODEL_ID` 502；替换掉又能救回来，但**不能让替换悄悄发生** ——
-/// 用户以为在用 Claude、实际在花另一个模型（倍率可能翻几倍）的额度，账单和输出风格都对不上。
-/// 所以调用方拿到它之后必须落一条日志，并在响应头里告诉客户端实际用的是哪个模型。
-struct ModelChoice {
-    /// 真正发往上游的模型 ID。
-    kiro_model: String,
-    /// 调用方请求的模型（规范化后的公共 id）。
-    requested: String,
-}
-
-impl ModelChoice {
-    fn downgraded(&self) -> bool {
-        self.requested != self.kiro_model
-    }
-
-    /// 降级时给出响应头；未降级时为空（正常请求不该多出无意义的头）。
-    ///
-    /// 值来自模型名，理论上都是 ASCII；真遇到不合法的字节就跳过而不是 panic ——
-    /// 一个诊断用的响应头不值得让整条请求挂掉。
-    fn headers(&self) -> Vec<Header> {
-        if !self.downgraded() {
-            return Vec::new();
-        }
-        let pairs = [
-            ("X-Kiro-Actual-Model", self.kiro_model.as_str()),
-            ("X-Kiro-Requested-Model", self.requested.as_str()),
-        ];
-        pairs
-            .iter()
-            .filter_map(|(name, value)| Header::from_bytes(*name, *value).ok())
-            .collect()
-    }
-}
-
 /// 解析出最终发往 Kiro 的模型 ID。
 ///
-/// 账户套餐未必包含 Claude 模型（例如仅有 GPT/DeepSeek/GLM），
-/// 若请求的模型不在 `ListAvailableModels` 返回的可用列表里，
-/// 就降级到账户实际可用的默认模型（优先 Claude，否则取第一个），
-/// 避免整条对话因「Invalid model ID」直接 502。
+/// **不做任何降级**：请求的模型不在账户可用清单里时直接返回错误，由调用方回 400。
 ///
-/// 降级本身会立刻记进诊断日志（`[model-downgrade]`）：这条日志是排查
-/// 「客户端点的是 Claude、回来的却像 GPT」时唯一的地面真值。
-fn resolve_kiro_model(auth: &Auth, requested: &str, default_model: &str) -> ModelChoice {
-    let base = normalize_kiro_model(
-        if requested.is_empty() { None } else { Some(requested) },
-        default_model,
-    );
-    let kiro_model = match auth.list_available_models() {
-        Ok(models) if !models.is_empty() => {
-            if models.iter().any(|m| m == &base) {
-                base.clone()
-            } else {
-                auth.pick_available_default_model().unwrap_or_else(|| base.clone())
-            }
-        }
-        _ => base.clone(),
+/// 曾经的做法是「换成账户默认模型」把请求救回来（曾经还配了 `X-Kiro-Actual-Model`
+/// 响应头与 `[model-downgrade]` 日志来解释），但那仍然是**静默降级**：请求成功、
+/// 答案看起来正常，实际花的可能是另一个模型（甚至另一个族）的额度，倍率能差几倍，
+/// 客户端不看响应头就永远发现不了。2026-11-20 按用户要求移除，改为明确报错。
+///
+/// 清单拿不到（网络/权限问题）时无法判断，按请求原样透传 —— 这不是替换，
+/// 上游若真不认这个模型会自己报 `INVALID_MODEL_ID`。
+fn resolve_kiro_model(auth: &Auth, requested: &str, default_model: &str) -> Result<String, String> {
+    let specified = !requested.trim().is_empty();
+    let base = normalize_kiro_model(if specified { Some(requested) } else { None }, default_model);
+    let available = match auth.list_available_models() {
+        Ok(models) if !models.is_empty() => models,
+        _ => return Ok(base),
     };
-    let choice = ModelChoice { kiro_model, requested: base };
-    if choice.downgraded() {
-        diag_log(&format!(
-            "[model-downgrade] requested={} actual={}",
-            choice.requested, choice.kiro_model
-        ));
+    if available.iter().any(|model| model == &base) {
+        return Ok(base);
     }
-    choice
+    decide_against_list(base, requested, specified, &available)
+}
+
+/// 「base 不在清单里」时的定夺（纯函数，便于单测）。
+///
+/// - 调用方**没提**模型 → 用账户默认模型（没有「用户选了 A 却给 B」的问题）；
+/// - 调用方**指名**了但清单里没有 → 报错，绝不替换。
+fn decide_against_list(
+    base: String,
+    requested: &str,
+    specified: bool,
+    available: &[String],
+) -> Result<String, String> {
+    if !specified {
+        return Ok(super::auth::pick_default_model(available).unwrap_or(base));
+    }
+    Err(unavailable_model_message(requested, available))
+}
+
+/// 「这个模型不在你账户里」的错误文案：把账户真实可用的模型一并列出。
+/// 用公共 ID 展示（`claude-sonnet-4-5`），客户端配的就是这个形态。
+fn unavailable_model_message(requested: &str, available: &[String]) -> String {
+    let names: Vec<String> = available
+        .iter()
+        .map(|model| kiro_model_to_public_model_id(model))
+        .collect();
+    format!(
+        "Model \"{requested}\" is not available for this account. Available: {}.",
+        names.join(", ")
+    )
 }
 
 // ============ 路由实现 ============
@@ -3091,9 +3069,10 @@ fn handle_messages(
     }
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let choice = resolve_kiro_model(auth, model, &config.default_model);
-    let kiro_model = choice.kiro_model.clone();
-    let model_headers = choice.headers();
+    let kiro_model = match resolve_kiro_model(auth, model, &config.default_model) {
+        Ok(model) => model,
+        Err(e) => return error_response(request, 400, &e, "invalid_request_error"),
+    };
     let profile_arn = match resolve_profile_arn(auth) {
         Ok(arn) => arn,
         Err(e) => {
@@ -3141,7 +3120,6 @@ fn handle_messages(
             dedup_entry,
             dedup,
             active_requests,
-            model_headers,
         );
     }
 
@@ -3202,7 +3180,7 @@ fn handle_messages(
         &recovery_spec,
     );
     health.record_success();
-    json_response_with(request, 200, &response, model_headers);
+    json_response(request, 200, &response);
 }
 
 // ============ OpenAI 兼容入口 ============
@@ -3342,9 +3320,10 @@ fn handle_openai_chat_completions(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let choice = resolve_kiro_model(auth, requested_model, &config.default_model);
-    let kiro_model = choice.kiro_model.clone();
-    let model_headers = choice.headers();
+    let kiro_model = match resolve_kiro_model(auth, requested_model, &config.default_model) {
+        Ok(model) => model,
+        Err(e) => return openai_error_response(request, 400, &e, "invalid_request_error"),
+    };
     let profile_arn = match resolve_profile_arn(auth) {
         Ok(arn) => arn,
         Err(e) => {
@@ -3397,7 +3376,6 @@ fn handle_openai_chat_completions(
             dedup_entry,
             dedup,
             active_requests,
-            model_headers,
         );
     }
 
@@ -3481,7 +3459,7 @@ fn handle_openai_chat_completions(
         estimate_tokens(&collected.text),
     );
     health.record_success();
-    json_response_with(request, 200, &response, model_headers);
+    json_response(request, 200, &response);
 }
 
 /// `POST /openai/v1/responses` —— Responses API 兼容对话（Codex CLI 的入口）。
@@ -3554,9 +3532,10 @@ fn handle_openai_responses(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let choice = resolve_kiro_model(auth, requested_model, &config.default_model);
-    let kiro_model = choice.kiro_model.clone();
-    let model_headers = choice.headers();
+    let kiro_model = match resolve_kiro_model(auth, requested_model, &config.default_model) {
+        Ok(model) => model,
+        Err(e) => return openai_error_response(request, 400, &e, "invalid_request_error"),
+    };
     let profile_arn = match resolve_profile_arn(auth) {
         Ok(arn) => arn,
         Err(e) => {
@@ -3609,7 +3588,6 @@ fn handle_openai_responses(
             dedup_entry,
             dedup,
             active_requests,
-            model_headers,
         );
     }
 
@@ -3690,7 +3668,7 @@ fn handle_openai_responses(
         estimate_tokens(&collected.text),
     );
     health.record_success();
-    json_response_with(request, 200, &response, model_headers);
+    json_response(request, 200, &response);
 }
 
 fn respond_openai_body_error(request: Request, error: BodyReadError) {
@@ -3723,40 +3701,61 @@ mod tests {
     use super::*;
     use crate::kiro::eventstream::build_frame;
 
-    // ── 模型降级：客户端必须能看出「你点的模型没被用上」 ──
+    // ── 模型解析：只报错，不替换 ──
 
+    /// 清单拿不到时按请求原样透传：这是「无法判断」，不是替换。
+    ///
+    /// 反面对照是曾经的行为——拿不到清单就换成账户默认模型，客户端完全看不出来。
     #[test]
-    fn model_choice_reports_nothing_when_the_model_is_available() {
-        let choice = ModelChoice {
-            kiro_model: "claude-opus-5".to_string(),
-            requested: "claude-opus-5".to_string(),
-        };
-        assert!(!choice.downgraded());
-        // 正常请求不该多出无意义的头：客户端与抓包都只能看到噪音
-        assert!(choice.headers().is_empty());
+    fn model_resolution_passes_request_through_when_list_is_unavailable() {
+        let auth = Auth::new(
+            std::env::temp_dir().join(format!("k2a-no-creds-{}", Uuid::new_v4())),
+            None,
+            String::new(),
+            String::new(),
+        );
+        let resolved = resolve_kiro_model(&auth, "claude-sonnet-4-5", "auto")
+            .expect("清单不可用时不报错，按请求透传");
+        assert_eq!(resolved, "claude-sonnet-4.5");
     }
 
+    /// 不可用时的错误文案必须把账户真实可用的模型列出来，客户端才知道该改什么。
+    /// 展示的是公共 ID（`claude-sonnet-4-5`），不是上游的点号 ID。
     #[test]
-    fn model_choice_exposes_actual_model_when_downgraded() {
-        let choice = ModelChoice {
-            kiro_model: "gpt-5.6-sol".to_string(),
-            requested: "claude-opus-5".to_string(),
-        };
-        assert!(choice.downgraded());
-        let headers = choice.headers();
-        // `HeaderField::equiv` 只吃 `&'static str`，闭包签名跟着它走
-        let value = |name: &'static str| {
-            headers
-                .iter()
-                .find(|h| h.field.equiv(name))
-                .map(|h| h.value.as_str().to_string())
-        };
-        assert_eq!(value("x-kiro-actual-model").as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(
-            value("x-kiro-requested-model").as_deref(),
-            Some("claude-opus-5")
+    fn unavailable_model_message_lists_available_public_ids() {
+        let available = vec![
+            "claude-sonnet-4.5".to_string(),
+            "gpt-5.6-sol".to_string(),
+        ];
+        let message = unavailable_model_message("claude-opus-5.5", &available);
+        assert!(message.contains("claude-opus-5.5"), "{message}");
+        assert!(message.contains("claude-sonnet-4-5"), "{message}");
+        assert!(message.contains("gpt-5.6-sol"), "{message}");
+    }
+
+    /// 指名要的模型不在清单里 → 报错，不替换。
+    #[test]
+    fn specified_model_outside_the_list_is_rejected() {
+        let available = vec!["claude-sonnet-5.5".to_string(), "gpt-5.6-sol".to_string()];
+        let outcome = decide_against_list(
+            "claude-opus-3".to_string(),
+            "claude-opus-3",
+            true,
+            &available,
         );
-        assert_eq!(headers.len(), 2);
+        let message = outcome.expect_err("指名但不可用必须报错");
+        assert!(message.contains("claude-opus-3"), "{message}");
+        // 清单展示的是 /v1/models 里那个形态（5.x 本身就是点号 id）
+        assert!(message.contains("claude-sonnet-5.5"), "{message}");
+    }
+
+    /// 客户端没提模型 → 用账户默认模型，这不属于「换掉用户的选择」。
+    #[test]
+    fn unspecified_model_uses_an_available_default() {
+        let available = vec!["gpt-5.6-sol".to_string(), "claude-sonnet-5.5".to_string()];
+        let resolved = decide_against_list("auto".to_string(), "", false, &available)
+            .expect("没提模型不该报错");
+        assert_eq!(resolved, "claude-sonnet-5.5");
     }
 
     /// 把一组上游事件编成 event stream 字节后喂给真实的增量出参管道。
@@ -5064,6 +5063,66 @@ mod tests {
         );
     }
 
+    /// 临时手工验证（非 CI）：模型解析只报错、不替换，且不再带降级响应头。
+    /// 运行：cargo test -p kiro2api --lib kiro::server::tests::live_model_resolution -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires real Kiro SSO credentials"]
+    fn live_model_resolution() {
+        let config = ProxyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 5060,
+            proxy_api_key: Some("live-test-key".to_string()),
+            default_model: "auto".to_string(),
+            runtime_url: "https://runtime.us-east-1.kiro.dev/".to_string(),
+            management_url: "https://management.us-east-1.kiro.dev/".to_string(),
+            sso_cache_dir: crate::paths::kiro_sso_cache_dir(),
+            profile_arn_override: None,
+        };
+        let mut handle = start_proxy(config).expect("proxy starts");
+        let port = handle.port;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let ask = |model: &str| {
+            client
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .header("x-api-key", "live-test-key")
+                .json(&json!({
+                    "model": model,
+                    "max_tokens": 32,
+                    "messages": [{ "role": "user", "content": "只回复两个字：你好" }],
+                    "stream": false,
+                }))
+                .send()
+                .unwrap()
+        };
+
+        // 账户里没有的模型：明确 400 + 列出可用模型，绝不换成别的模型
+        let resp = ask("claude-opus-3");
+        let status = resp.status();
+        let text = resp.text().unwrap();
+        println!("[live] unknown model status={status} body={}", text.chars().take(400).collect::<String>());
+        assert_eq!(status.as_u16(), 400, "未知模型必须报 400: {text}");
+        assert!(text.contains("is not available for this account"), "{text}");
+        assert!(text.contains("claude-sonnet-5.5"), "错误文案要列出可用模型: {text}");
+
+        // 可用模型：200，且响应里不再出现降级头
+        let resp = ask("claude-sonnet-5.5");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let text = resp.text().unwrap();
+        println!("[live] available model status={status} body={}", text.chars().take(200).collect::<String>());
+        assert!(status.is_success(), "可用模型必须成功: {text}");
+        assert!(
+            headers.get("x-kiro-actual-model").is_none()
+                && headers.get("x-kiro-requested-model").is_none(),
+            "降级头已随降级逻辑一起删除"
+        );
+
+        handle.stop();
+    }
+
     /// 临时手工验证（非 CI）：使用真实 Kiro SSO 凭据走一遍完整 Anthropic 协议链路。
     /// 运行：cargo test -p kiro2api --lib kiro::server::tests::live_proxy_roundtrip -- --ignored --nocapture
     #[test]
@@ -5234,9 +5293,9 @@ mod tests {
             "second turn should return assistant text: {text}"
         );
 
-        // 5. 请求账户里不存在的 Claude 模型 → 应降级到可用模型并成功
+        // 5. 请求账户里不存在的模型 → 必须 400 且列出可用模型，绝不替换成别的模型
         let body = json!({
-            "model": "claude-opus-5",
+            "model": "claude-opus-3",
             "max_tokens": 64,
             "messages": [{ "role": "user", "content": "只回复一个字：好" }],
             "stream": false,
@@ -5249,12 +5308,16 @@ mod tests {
             .unwrap();
         let status = resp.status();
         let text = resp.text().unwrap();
-        println!("[live] /v1/messages(fallback claude-opus-5) status={}", status);
+        println!("[live] /v1/messages(unknown model) status={}", status);
         println!(
             "[live] body (truncated): {}",
             text.chars().take(800).collect::<String>()
         );
-        assert!(status.is_success(), "fallback request failed: {text}");
+        assert_eq!(status.as_u16(), 400, "未知模型必须报 400 而不是替换: {text}");
+        assert!(
+            text.contains("is not available for this account"),
+            "错误文案要说明模型不可用: {text}"
+        );
 
         // 5b. 上游新上的型号必须原样透传，不能被兜底逻辑静默降级。
         // 判据是响应里的 model 字段 —— 若被降级成 claude-opus-5，这里会看出差异。
