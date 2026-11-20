@@ -4,25 +4,31 @@
 //! `~/Library/Application Support/kiro-cli/`，Windows 在 `%LOCALAPPDATA%\Kiro-Cli\`，
 //! 见 [`crate::paths::kiro_cli_db_paths`]；另镜像一份到钥匙串）。
 //!
-//! 本模块只做两件事：
+//! 本模块做三件事：
 //! 1. [`scan`]：以只读方式打开库，把令牌与 device registration 翻译成 IDE 的文件格式，
 //!    供账号列表展示与判断可用性；
 //! 2. [`import`]：把某一条记录写进一个**独立目录**（`数据目录/accounts/cli/<hash>/`），
-//!    之后 [`super::auth::Auth`] 的读取与 IdC/social 刷新链路原样可用。
+//!    之后 [`super::auth::Auth`] 的读取与 IdC/social 刷新链路原样可用；
+//! 3. [`write_token_fields`]：把续期后的令牌**回写原库**，让 CLI 与本应用始终共用同一份。
 //!
-//! 为什么是「导入副本」而不是「就地接管」：
-//! - CLI 的库是它自己的资产，写回去要同时维护 sqlite 与钥匙串镜像，风险远大于收益；
-//! - 以前的做法是把 CLI 凭据桥接进 `~/.aws/sso/cache/kiro-auth-token.json`，
-//!   那等于覆盖 IDE 的登录 —— 两边各自刷新同一个 refreshToken 会互相顶掉。
-//! 副本的代价是：本应用续期后，CLI 侧那份 refreshToken 会失效、需要重新登录；
-//! 所以界面在 CLI 分组上如实写着这件事。CLI 一旦重新登录（库 mtime 变化），
-//! 账号模块会重新导入一次，副本自动跟上。
+//! 为什么还要副本：CLI 的库不能直接给 `Auth` 用（那是 sqlite + snake_case JSON，不是
+//! 令牌文件），而 `Auth` 的读写口径是「一个目录里的一份 kiro-auth-token.json」。
+//! 所以副本是**投影**，不是第二份凭据：续期一律以原库为准（读库判到期、续完写回库），
+//! 副本只是同一份数据在文件形态下的缓存。
+//!
+//! ⚠️ 曾经这里是「原库只读」：副本续期后 CLI 那份 refreshToken 会失效，CLI 侧得重新登录。
+//! 账号保活上线后不成立 —— 两边各持一份、谁轮换都会让对方失效，所以改成回写原库。
+//! 回写只动 `access_token` / `refresh_token` / `expires_at` 三个字段，CLI 自己读的
+//! `start_url` / `scopes` / `oauth_flow` / `telemetry_generation` 逐字保留。
+//!
+//! 仍然不做的事：把 CLI 凭据桥接进 `~/.aws/sso/cache/kiro-auth-token.json`
+//! （那等于覆盖 IDE 的登录，两边各自刷新同一个 refreshToken 会互相顶掉）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
-use rusqlite::OpenFlags;
+use rusqlite::{params, OpenFlags};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -105,7 +111,76 @@ pub(crate) fn import(cred: &CliCredential, dir: &Path) -> Result<(), String> {
     write_secret_file(&dir.join("kiro-auth-token.json"), &cred.token)
 }
 
-fn file_mtime_ms(path: &Path) -> i64 {
+/// 把续期后的令牌写回 CLI 的原库（就地更新 `auth_kv` 里那一条 JSON 的三个字段）。
+///
+/// 这是「CLI 与本应用共用一份凭据」的落地动作：只写副本的话，两边各持一个 refreshToken，
+/// 任一方轮换都会让对方失效 —— 表现为 kiro-cli 突然要求重新登录。
+///
+/// 只覆盖 `access_token` / `refresh_token` / `expires_at`；其余字段（`start_url`、
+/// `scopes`、`oauth_flow`、`telemetry_generation`、`region`…）逐字保留：它们由 CLI 自己
+/// 读取，少一个就可能让它走错分支。
+///
+/// 打开方式与并发：读写连接 + 2 秒 `busy_timeout` 的单条 UPDATE 事务。CLI 正在写库时
+/// 拿不到锁，此处直接报错，由调用方跳过本轮（不重试、不排队 —— 宁可晚 30 分钟再续）。
+pub(crate) fn write_token_fields(db: &Path, key: &str, token: &Value) -> Result<(), String> {
+    let access_token = str_field(token, "accessToken")?;
+    let refresh_token = str_field(token, "refreshToken")?;
+    let expires_at = str_field(token, "expiresAt")?;
+
+    let mut con = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| format!("打开 {} 失败：{e}", db.display()))?;
+    con.busy_timeout(Duration::from_secs(2))
+        .map_err(|e| format!("设置 {key} 的库锁等待失败：{e}"))?;
+
+    let tx = con
+        .transaction()
+        .map_err(|e| format!("开启 {key} 的写入事务失败：{e}"))?;
+    let raw: Result<String, rusqlite::Error> = tx.query_row(
+        "select value from auth_kv where key = ?1",
+        [key],
+        |row| row.get(0),
+    );
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(format!("凭据库里没有 {key} 记录"))
+        }
+        Err(e) => return Err(format!("读取 auth_kv[{key}] 失败：{e}")),
+    };
+    let mut payload: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("auth_kv[{key}] 不是合法 JSON：{e}"))?;
+    let Value::Object(_) = payload else {
+        return Err(format!("auth_kv[{key}] 不是 JSON 对象，无法回写"));
+    };
+    let obj = payload.as_object_mut().expect("刚校验过是对象");
+    obj.insert("access_token".into(), Value::String(access_token));
+    obj.insert("refresh_token".into(), Value::String(refresh_token));
+    obj.insert("expires_at".into(), Value::String(expires_at));
+
+    let serialized = serde_json::to_string(&payload)
+        .map_err(|e| format!("序列化 auth_kv[{key}] 失败：{e}"))?;
+    tx.execute(
+        "update auth_kv set value = ?1 where key = ?2",
+        params![serialized, key],
+    )
+    .map_err(|e| format!("回写 auth_kv[{key}] 失败：{e}"))?;
+    tx.commit()
+        .map_err(|e| format!("提交 auth_kv[{key}] 失败：{e}"))?;
+    Ok(())
+}
+
+/// 取一个必填的字符串字段（空串也算缺失）。读取与回写共用同一口径。
+fn str_field(value: &Value, key: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .ok_or_else(|| format!("凭据记录缺少 {key}"))
+}
+
+/// 库文件的 mtime（Unix 毫秒）。副本据此判断「CLI 是否重新登录过 / 库是否刚被回写过」。
+pub(crate) fn file_mtime_ms(path: &Path) -> i64 {
     fs::metadata(path)
         .and_then(|meta| meta.modified())
         .ok()
@@ -157,17 +232,9 @@ fn map_credentials(
     token: &Value,
     registration: Option<&Value>,
 ) -> Result<(Option<(String, Value)>, Value), String> {
-    let field = |obj: &Value, key: &str| -> Result<String, String> {
-        obj.get(key)
-            .and_then(Value::as_str)
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string())
-            .ok_or_else(|| format!("凭据记录缺少 {key}"))
-    };
-
-    let access_token = field(token, "access_token")?;
-    let refresh_token = field(token, "refresh_token")?;
-    let expires_at = field(token, "expires_at")?;
+    let access_token = str_field(token, "access_token")?;
+    let refresh_token = str_field(token, "refresh_token")?;
+    let expires_at = str_field(token, "expires_at")?;
     let region = token
         .get("region")
         .and_then(Value::as_str)
@@ -186,9 +253,9 @@ fn map_credentials(
 
     let (registration_payload, token_payload) = if is_idc {
         let reg = registration.ok_or("IdC 登录但缺少 device-registration 记录，无法支撑续期")?;
-        let client_id = field(reg, "client_id")?;
-        let client_secret = field(reg, "client_secret")?;
-        let reg_expires = field(reg, "client_secret_expires_at")?;
+        let client_id = str_field(reg, "client_id")?;
+        let client_secret = str_field(reg, "client_secret")?;
+        let reg_expires = str_field(reg, "client_secret_expires_at")?;
         // 缓存文件名沿用 AWS CLI 惯例（client_id 的 sha256），稳定且不会与 IDE 的注册文件撞名
         let hash = format!("{:x}", Sha256::digest(client_id.as_bytes()));
         let file_name = format!("{hash}.json");
@@ -331,5 +398,116 @@ mod tests {
         // 直接用不存在的路径走 read_one：不能触碰真实 %LOCALAPPDATA%
         let missing = std::env::temp_dir().join("k2a-no-such-cli-db.sqlite3");
         assert!(read_one(&missing, None).unwrap().is_none());
+    }
+
+    /// 用完即删的临时库：断言失败时靠 Drop 收走，不给机器留垃圾。
+    struct TempDb(PathBuf);
+
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "k2a-cli-bridge-{tag}-{}.sqlite3",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let con = rusqlite::Connection::open(&path).unwrap();
+            con.execute(
+                "create table auth_kv (key text primary key, value text)",
+                [],
+            )
+            .unwrap();
+            Self(path)
+        }
+
+        fn put(&self, key: &str, value: &Value) {
+            let con = rusqlite::Connection::open(&self.0).unwrap();
+            con.execute(
+                "insert or replace into auth_kv values (?1, ?2)",
+                params![key, value.to_string()],
+            )
+            .unwrap();
+        }
+
+        fn get(&self, key: &str) -> Value {
+            let con = rusqlite::Connection::open(&self.0).unwrap();
+            let raw: String = con
+                .query_row("select value from auth_kv where key = ?1", [key], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            // SQLite 的 -wal / -shm 也要一起收走
+            for suffix in ["-wal", "-shm"] {
+                let mut path = self.0.clone().into_os_string();
+                path.push(suffix);
+                let _ = fs::remove_file(PathBuf::from(path));
+            }
+        }
+    }
+
+    /// 回写只换三个字段，CLI 自己读的字段必须逐字保留。
+    #[test]
+    fn write_token_fields_updates_only_token_fields() {
+        let db = TempDb::new("write");
+        let original = json!({
+            "access_token": "OLD_AT",
+            "refresh_token": "OLD_RT",
+            "expires_at": "2026-11-20T00:00:00.000Z",
+            "region": "us-east-1",
+            "start_url": "https://d-9066710b4d.awsapps.com/start",
+            "oauth_flow": "Pkce",
+            "scopes": ["sso:account:access"],
+            "telemetry_generation": "v2",
+        });
+        db.put(TOKEN_KEYS[0], &original);
+        // 读回链路要求 IdC 记录配一份 device-registration，否则 read_one 直接判为不可用
+        db.put(
+            REGISTRATION_KEY,
+            &json!({
+                "client_id": "FAKECLIENTID123", "client_secret": "SECRET",
+                "client_secret_expires_at": "2030-01-01T00:00:00Z",
+                "region": "us-east-1",
+            }),
+        );
+
+        let refreshed = json!({
+            "accessToken": "NEW_AT",
+            "refreshToken": "NEW_RT",
+            "expiresAt": "2026-11-20T01:00:00.000Z",
+        });
+        write_token_fields(&db.0, TOKEN_KEYS[0], &refreshed).unwrap();
+
+        let after = db.get(TOKEN_KEYS[0]);
+        assert_eq!(after["access_token"], "NEW_AT");
+        assert_eq!(after["refresh_token"], "NEW_RT");
+        assert_eq!(after["expires_at"], "2026-11-20T01:00:00.000Z");
+        // 以下五个字段不能被回写抹掉
+        for key in ["region", "start_url", "oauth_flow", "scopes", "telemetry_generation"] {
+            assert_eq!(after[key], original[key], "{key} 应原样保留");
+        }
+        // 回写结果仍能被 CLI 读取链路翻译回 IDE 格式
+        let cred = read_one(&db.0, Some(TOKEN_KEYS[0])).unwrap().unwrap();
+        assert_eq!(cred.token["accessToken"], "NEW_AT");
+        assert_eq!(cred.token["refreshToken"], "NEW_RT");
+    }
+
+    /// 库里没有这条记录时明确报错，而不是凭空造一行。
+    #[test]
+    fn write_token_fields_requires_existing_record() {
+        let db = TempDb::new("missing");
+        let refreshed = json!({
+            "accessToken": "AT", "refreshToken": "RT",
+            "expiresAt": "2026-11-20T01:00:00.000Z",
+        });
+        let error = write_token_fields(&db.0, TOKEN_KEYS[0], &refreshed).unwrap_err();
+        assert!(error.contains("没有"), "错误信息应说明记录不存在：{error}");
+        assert!(write_token_fields(&db.0, TOKEN_KEYS[0], &json!({"accessToken": "AT"}))
+            .unwrap_err()
+            .contains("refreshToken"));
     }
 }

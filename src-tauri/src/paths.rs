@@ -33,7 +33,8 @@ pub(crate) fn own_credential_dir() -> PathBuf {
 ///
 /// 布局按来源分层，一个账号一个目录（目录内 = 令牌 + 注册文件 + `account.json`）：
 /// - `accounts/login/<clientId 哈希>/`：kiro2api 设备码登录，可并存多个；
-/// - `accounts/cli/<哈希>/`：从 kiro-cli 凭据库导入的**副本**（原库只读）。
+/// - `accounts/cli/<哈希>/`：从 kiro-cli 凭据库导入的**副本**（续期结果会回写原库，
+///   副本只是同一份凭据的文件形态投影）。
 ///
 /// Kiro 桌面端（IDE）的账号不在这里 —— 它就地使用 [`kiro_sso_cache_dir`]，
 /// 与 IDE 共用同一份令牌，避免两边各自续期把对方顶掉。
@@ -42,7 +43,7 @@ pub(crate) fn accounts_root() -> PathBuf {
 }
 
 /// kiro-cli 自己的凭据库候选路径，按顺序逐个试（先到先用）。
-/// 只读桥接用，见 kiro::cli_bridge。
+/// 读由 `kiro::cli_bridge` 负责；续期后回写的也是同一份库。
 ///
 /// kiro-cli 把凭据库放在**平台各自的数据目录**，位置并不统一：
 /// - macOS(实测 2.31)：`~/Library/Application Support/kiro-cli/data.sqlite3`

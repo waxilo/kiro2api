@@ -111,6 +111,9 @@ pub fn run() {
 
             // 模型列表与额度缓存的后台刷新：它是「让界面上的旧值变成新值」，不是「让代理跑起来」。
             kiro::spawn_startup_refresh();
+            // 账号保活：未选中的账号也要续，否则放久了 refreshToken 过期就得重新登录。
+            // 与代理是否运行无关（代理循环只覆盖「正在用的那一个」）。
+            accounts::spawn_keepalive();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

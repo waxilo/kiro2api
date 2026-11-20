@@ -1056,6 +1056,12 @@ export async function bindBackendEvents(): Promise<void> {
     store.set({ error: `凭据刷新失败：${event.payload}` });
   });
 
+  // 账号保活轮次真的续上了某几个账号：只有正看着账号页时才重扫一遍，
+  // 让「到期时间」自己变新。没停在账号页就不打扰（下次进入会重新拉）。
+  await listen<number>('accounts://refreshed', () => {
+    if (store.get().view === 'accounts') void loadAccounts();
+  });
+
   // 缓存被后台刷新替换：直接把新值写进 store，不重新拉一遍。
   //
   // 这是「持久化 + 静默更新」的后半截：首屏的数字来自本地缓存，这个事件把它换成最新的。

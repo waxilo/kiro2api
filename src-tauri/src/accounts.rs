@@ -6,26 +6,35 @@
 //! | 来源 | 目录 | 谁在续期 |
 //! |------|------|----------|
 //! | 登录的账号 | `数据目录/accounts/login/<hash>/`（旧版是 `数据目录/credentials/`） | 本应用 |
-//! | 本地 kiro-cli | `数据目录/accounts/cli/<hash>/`（从 CLI 库导入的副本） | 本应用 |
-//! | Kiro 桌面端 | `~/.aws/sso/cache/`（就地使用） | 本应用与 IDE 共用同一份文件 |
+//! | 本地 kiro-cli | `数据目录/accounts/cli/<hash>/` + **回写** CLI 原库 | 本应用（两边共用一份） |
+//! | Kiro 桌面端 | `~/.aws/sso/cache/`（就地使用） | IDE（本应用不代续） |
 //!
 //! 账号 = 一个凭据目录 + 一个稳定 id。选中某个账号，就是让代理去读那个目录；
 //! 切换时代理按原端口重启，并清掉属于上一个账号的模型 / 额度缓存。
 //!
+//! 续期只有一个入口 [`refresh`]：代理循环、保活巡检、手动按钮都走它，副作用完全一致。
+//! **未选中的账号也会被静默续期**（[`spawn_keepalive`]，30 分钟一轮）—— 否则它们会在
+//! 一段时间不用之后随 refreshToken / 注册文件过期，切过去就得重新登录。
+//!
 //! 三条判断规则，改代码前先看一遍：
 //! 1. **id 必须跨续期稳定**：令牌刷新会换 accessToken / refreshToken，id 只能由
 //!    目录名或 clientIdHash 这类不变的东西推导，否则「选中的账号」一刷新就丢了。
-//! 2. **桌面端绝不复制**：与 IDE 共用同一个文件，双方看到同一份刷新结果；
-//!    复制成独立副本后，任一方续期都会让另一方手里的 refreshToken 失效。
-//! 3. **CLI 原库只读**：导入副本放在自己的数据目录里，CLI 的 sqlite / 钥匙串一概不写。
+//! 2. **桌面端绝不复制、也绝不代续**：与 IDE 共用同一个文件，双方看到同一份刷新结果；
+//!    复制成独立副本或替它续期，都会让另一方手里的 refreshToken 失效。
+//! 3. **CLI 以原库为准**：判断到期读 CLI 库，续期结果写回 CLI 库，副本只是同一份数据的
+//!    文件形态投影。只动副本会让两边各持一个 refreshToken，谁轮换谁把对方顶死。
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::kiro::cli_bridge::{self, CliCredential};
 use crate::kiro::service::{self, KiroProxyState, ProxyStatus};
@@ -38,6 +47,13 @@ const TOKEN_FILE: &str = "kiro-auth-token.json";
 const META_FILE: &str = "account.json";
 /// 距过期不足这个秒数就当作「要续期了」，与 `auth` / `cli_bridge` 的口径一致。
 const USABLE_SKEW_SECS: i64 = 120;
+
+/// 保活巡检间隔：账号的 accessToken 约 1 小时，30 分钟一轮才能在它死掉之前接上。
+const KEEPALIVE_INTERVAL_SECS: u64 = 30 * 60;
+/// 首轮巡检的延迟：避开启动时那次模型 / 额度刷新（两者会争同一份凭据的刷新）。
+const KEEPALIVE_FIRST_DELAY_SECS: u64 = 60;
+/// 距过期不足这么久就续（= 巡检间隔 + 15 分钟余量：下一轮巡检时 token 仍未过期）。
+const RENEW_BEFORE_SECS: i64 = 45 * 60;
 
 /// 账号来源。序列化成 `login` / `cli` / `desktop`，前端据此分组。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -248,6 +264,302 @@ pub(crate) fn has_credential() -> bool {
         .is_some_and(|candidate| candidate.facts.usable())
 }
 
+/// 当前生效的账号 id（与 [`active_dir`] 同一口径，但不物化、不落盘）。
+pub(crate) fn active_id() -> Option<String> {
+    resolve(discover(), prefs::active_account_pref().as_deref()).1
+}
+
+// ── 续期（唯一入口） ────────────────────────────────────────────────────
+
+/// 谁在发起续期。只有「用户明确点了按钮」才无视剩余有效期。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshMode {
+    /// 代理运行中的定时续期。
+    Loop,
+    /// 账号保活巡检：未选中的账号也走这条。
+    KeepAlive,
+    /// 手动「刷新凭据」：用户要的就是现在换一份新的。
+    Manual,
+}
+
+impl RefreshMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loop => "代理循环",
+            Self::KeepAlive => "保活",
+            Self::Manual => "手动",
+        }
+    }
+
+    /// 剩余有效期还够时要不要跳过。手动必须真的发请求，否则按钮看起来「没反应」。
+    fn respects_threshold(self) -> bool {
+        !matches!(self, Self::Manual)
+    }
+}
+
+/// 跳过一次续期的原因。全部是正常情况，不是错误 —— 调用方据此决定说哪句话。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Skip {
+    /// 账号已不存在（被删、或这次扫描不到）。
+    Gone,
+    /// 没有 refreshToken：只能等用户重新登录。
+    NoRefreshToken,
+    /// IdC 的注册文件缺失或已过期：refreshToken 也刷不动。
+    NoRegistration,
+    /// 剩余有效期还超过阈值。
+    StillFresh,
+    /// 桌面端与 IDE 共用一份文件，代续会互相顶掉。
+    SharedWithIde,
+    /// 同一账号已有一轮续期在跑。
+    Concurrent,
+}
+
+impl Skip {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Gone => "账号已不存在",
+            Self::NoRefreshToken => "没有 refreshToken",
+            Self::NoRegistration => "注册文件缺失或已过期",
+            Self::StillFresh => "剩余有效期仍充足",
+            Self::SharedWithIde => "桌面端账号由 IDE 续期",
+            Self::Concurrent => "该账号正在续期",
+        }
+    }
+}
+
+/// 一次续期的结果。`Skipped` 也带着当前的到期时间，调用方刷新界面时不用再读一遍文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefreshOutcome {
+    Refreshed { expires_at: Option<String> },
+    Skipped { reason: Skip, expires_at: Option<String> },
+}
+
+impl RefreshOutcome {
+    pub(crate) fn expires_at(&self) -> Option<String> {
+        match self {
+            Self::Refreshed { expires_at } | Self::Skipped { expires_at, .. } => expires_at.clone(),
+        }
+    }
+
+    pub(crate) fn is_refreshed(&self) -> bool {
+        matches!(self, Self::Refreshed { .. })
+    }
+}
+
+/// 续期一个账号。**唯一**的续期入口：代理循环、保活巡检、手动按钮都从这里走。
+pub(crate) fn refresh(id: &str, mode: RefreshMode) -> Result<RefreshOutcome, String> {
+    let (candidates, _) = resolve(discover(), prefs::active_account_pref().as_deref());
+    let Some(candidate) = candidates.iter().find(|candidate| candidate.id == id) else {
+        return Ok(RefreshOutcome::Skipped { reason: Skip::Gone, expires_at: None });
+    };
+    refresh_candidate(candidate, mode)
+}
+
+/// 对一个已扫描到的候选账号执行续期。
+///
+/// 四层闸门，顺序不能换：
+/// 1. 桌面端直接退出（连读都不用读）；
+/// 2. 先把 CLI 副本与**原库**对齐：副本是库的投影，留着「库里新鲜、副本过期」时跳过续期，
+///    代理读的正是副本 —— 它会把一次本来能用的请求变成 401；
+/// 3. 原库 / 令牌的到期时间还够 → 不发请求；
+/// 4. 同一账号串行 + **锁内重新读一次**事实源：并发时后到的那轮看到「刚续过」自己退出，
+///    避免两轮各拿一个 refreshToken 去轮换（必然有一轮失败，还会把对方顶掉）。
+fn refresh_candidate(
+    candidate: &Candidate,
+    mode: RefreshMode,
+) -> Result<RefreshOutcome, String> {
+    if candidate.source == AccountSource::Desktop {
+        return Ok(RefreshOutcome::Skipped {
+            reason: Skip::SharedWithIde,
+            expires_at: candidate.facts.expires_at.clone(),
+        });
+    }
+
+    let dir = materialize(candidate)?;
+    let Some(facts) = source_facts(candidate)? else {
+        return Ok(RefreshOutcome::Skipped { reason: Skip::Gone, expires_at: None });
+    };
+    if let Some(reason) = renewal_gate(&facts, mode, now_ms()) {
+        return Ok(RefreshOutcome::Skipped { reason, expires_at: facts.expires_at });
+    }
+
+    let Some(_in_flight) = InFlight::acquire(&candidate.id) else {
+        return Ok(RefreshOutcome::Skipped {
+            reason: Skip::Concurrent,
+            expires_at: facts.expires_at,
+        });
+    };
+    let Some(facts) = source_facts(candidate)? else {
+        return Ok(RefreshOutcome::Skipped { reason: Skip::Gone, expires_at: None });
+    };
+    if let Some(reason) = renewal_gate(&facts, mode, now_ms()) {
+        return Ok(RefreshOutcome::Skipped { reason, expires_at: facts.expires_at });
+    }
+
+    if let Some(origin) = &candidate.cli {
+        let (_, expires_at) = service::auth_for(dir.clone()).force_refresh(mode.as_str())?;
+        // 续期结果写回 CLI 原库：两边共用一份，否则 CLI 侧那份 refreshToken 就此作废
+        let refreshed = read_json(&dir.join(TOKEN_FILE))
+            .ok_or_else(|| "续期后读不到令牌文件，请刷新后重试".to_string())?;
+        cli_bridge::write_token_fields(&origin.db, &origin.key, &refreshed)?;
+        sync_copy_meta(&dir, origin)?;
+        return Ok(RefreshOutcome::Refreshed { expires_at });
+    }
+
+    let (refreshed, expires_at) = service::auth_for(dir).force_refresh(mode.as_str())?;
+    if !refreshed {
+        return Ok(RefreshOutcome::Skipped { reason: Skip::NoRefreshToken, expires_at });
+    }
+    Ok(RefreshOutcome::Refreshed { expires_at })
+}
+
+/// 事实源里「现在这份凭据」是什么样。
+///
+/// CLI 账号以**原库**为准：副本是上一轮的投影，拿它判断会出现「库里刚续过、副本还旧」
+/// → 多续一次 → 用已轮换的 refreshToken 把 CLI 顶死。
+fn source_facts(candidate: &Candidate) -> Result<Option<TokenFacts>, String> {
+    if let Some(origin) = &candidate.cli {
+        let Some(credential) = cli_bridge::read_one(&origin.db, Some(&origin.key))? else {
+            return Ok(None);
+        };
+        return Ok(Some(TokenFacts::from_token(
+            &credential.token,
+            credential.registration.as_ref().map(|(_, value)| value),
+        )));
+    }
+    Ok(read_dir_facts(&candidate.dir))
+}
+
+/// 这一轮该不该真的发请求。`None` = 该续；`Some(reason)` = 跳过。
+///
+/// 注册文件过期也必须挡在发请求之前：IdC 续期要 clientId/clientSecret，没有它必然失败，
+/// 白白等满一次 30 秒超时 —— 保活每 30 分钟跑一轮，这种等待会一直拖住后面的账号。
+fn renewal_gate(facts: &TokenFacts, mode: RefreshMode, now_ms: i64) -> Option<Skip> {
+    if !facts.has_refresh {
+        return Some(Skip::NoRefreshToken);
+    }
+    if !facts.registration_ok {
+        return Some(Skip::NoRegistration);
+    }
+    if mode.respects_threshold() && !needs_renewal(facts.expires_at.as_deref(), now_ms) {
+        return Some(Skip::StillFresh);
+    }
+    None
+}
+
+/// 到期时间还值不值得等：剩余不足 [`RENEW_BEFORE_SECS`] 就续。
+///
+/// `expiresAt` 缺失或不可解析时返回 `true`：宁可白续一次，也不能让账号悄悄过期。
+fn needs_renewal(expires_at: Option<&str>, now_ms: i64) -> bool {
+    let Some(expires_ms) = expires_at.and_then(crate::kiro::auth::parse_expiry_ms) else {
+        return true;
+    };
+    expires_ms - now_ms <= RENEW_BEFORE_SECS * 1000
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// 正在续期的账号 id 集合：同一账号同时只允许一轮续期。
+fn in_flight() -> &'static Mutex<HashSet<String>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 续期期间的占位符；`Drop` 时自动出列（含 panic 展开），不会把账号永久锁死。
+struct InFlight(String);
+
+impl InFlight {
+    fn acquire(id: &str) -> Option<Self> {
+        let mut set = in_flight().lock().ok()?;
+        if !set.insert(id.to_string()) {
+            return None;
+        }
+        Some(Self(id.to_string()))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut set) = in_flight().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// 回写原库之后把副本的「已同步」标记刷新一遍。
+///
+/// `materialize` 靠 `db_mtime_ms` 判断要不要重新导入；不回填的话，回写改出来的新 mtime
+/// 会让下一次扫描把刚续好的副本再覆盖一遍 —— 内容相同，纯属多一轮 IO。
+fn sync_copy_meta(dir: &Path, origin: &CliOrigin) -> Result<(), String> {
+    let created_at_ms = read_meta(dir)
+        .map(|meta| meta.created_at_ms)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(now_ms);
+    write_meta(
+        dir,
+        AccountMeta {
+            created_at_ms,
+            db_path: Some(origin.db.to_string_lossy().to_string()),
+            db_mtime_ms: Some(cli_bridge::file_mtime_ms(&origin.db)),
+        },
+    )
+}
+
+/// 后台保活：每 [`KEEPALIVE_INTERVAL_SECS`] 轮一遍所有账号，把快过期的静默续上。
+///
+/// 与代理生命周期**解耦**：以前只有代理在跑时才续、而且只续选中的那一个，于是没被选中的
+/// 账号会一直放到 refreshToken / 注册文件过期，切过去就得重新登录。
+///
+/// 静默是刻意的：用户没发起这个动作，失败只写 `kiro-debug.log`；真的续上了才发一次
+/// `accounts://refreshed`，让账号页的有效期自己变新。
+pub(crate) fn spawn_keepalive() {
+    if crate::APP_HANDLE.get().is_none() {
+        return; // 单测里没有 AppHandle，不启线程
+    }
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(KEEPALIVE_FIRST_DELAY_SECS));
+        loop {
+            let renewed = keepalive_round();
+            if renewed > 0 {
+                if let Some(app) = crate::APP_HANDLE.get() {
+                    let _ = app.emit("accounts://refreshed", renewed);
+                }
+            }
+            thread::sleep(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+        }
+    });
+}
+
+/// 走一轮巡检，返回真的续上的账号数。
+fn keepalive_round() -> usize {
+    let (candidates, _) = resolve(discover(), prefs::active_account_pref().as_deref());
+    let mut renewed = 0;
+    for candidate in &candidates {
+        match refresh_candidate(candidate, RefreshMode::KeepAlive) {
+            Ok(RefreshOutcome::Refreshed { expires_at }) => {
+                renewed += 1;
+                crate::diag::log(&format!(
+                    "[keepalive] 已续期 {}，新到期 {}",
+                    candidate.id,
+                    expires_at.as_deref().unwrap_or("—")
+                ));
+            }
+            Ok(RefreshOutcome::Skipped { reason, expires_at }) => crate::diag::log(&format!(
+                "[keepalive] 跳过 {}：{}（到期 {}）",
+                candidate.id,
+                reason.as_str(),
+                expires_at.as_deref().unwrap_or("—")
+            )),
+            Err(error) => {
+                crate::diag::log(&format!("[keepalive] {} 续期失败：{error}", candidate.id))
+            }
+        }
+    }
+    renewed
+}
+
 /// 选中一个账号。会先把凭据准备好（CLI 立即导入副本），再落盘选择并清掉旧缓存。
 pub(crate) fn select(id: &str) -> Result<(), String> {
     let (candidates, _) = resolve(discover(), prefs::active_account_pref().as_deref());
@@ -427,16 +739,11 @@ fn candidates(
 }
 
 fn from_dir(source: AccountSource, id: &str, dir: &Path) -> Option<Candidate> {
-    let token = read_json(&dir.join(TOKEN_FILE))?;
-    let registration = token
-        .get("clientIdHash")
-        .and_then(Value::as_str)
-        .and_then(|hash| read_json(&dir.join(format!("{hash}.json"))));
     Some(Candidate {
         id: id.to_string(),
         source,
         dir: dir.to_path_buf(),
-        facts: TokenFacts::from_token(&token, registration.as_ref()),
+        facts: read_dir_facts(dir)?,
         cli: None,
         note: None,
     })
@@ -619,6 +926,18 @@ fn short_id(id: &str) -> Option<&str> {
 fn read_json(path: &Path) -> Option<Value> {
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// 从凭据目录里读出事实（令牌 + 它引用的注册文件）。目录里没有令牌 → `None`。
+///
+/// 扫描与续期共用这一份口径：判断「能不能续、还差多久到期」必须看同一处数据。
+fn read_dir_facts(dir: &Path) -> Option<TokenFacts> {
+    let token = read_json(&dir.join(TOKEN_FILE))?;
+    let registration = token
+        .get("clientIdHash")
+        .and_then(Value::as_str)
+        .and_then(|hash| read_json(&dir.join(format!("{hash}.json"))));
+    Some(TokenFacts::from_token(&token, registration.as_ref()))
 }
 
 fn read_meta(dir: &Path) -> Option<AccountMeta> {
@@ -962,33 +1281,45 @@ mod tests {
         assert_eq!(imported(&dir)["accessToken"], "AT2");
     }
 
-    /// 造一个最小可用的 kiro-cli 凭据库（IdC 令牌 + 注册）。
+    /// 造一个最小可用的 kiro-cli 凭据库（IdC 令牌 + 30 天有效的注册）。
     fn write_cli_db(path: &Path, access_token: &str) {
+        write_cli_db_rows(path, access_token, 60, Some(30))
+    }
+
+    /// 同上，可指定令牌到期分钟数与注册记录的有效期（`None` = 不带注册记录）。
+    fn write_cli_db_rows(
+        path: &Path,
+        access_token: &str,
+        expires_in_minutes: i64,
+        registration_days: Option<i64>,
+    ) {
         let con = rusqlite::Connection::open(path).unwrap();
         con.execute("create table if not exists auth_kv (key text primary key, value text)", [])
             .unwrap();
-        for (key, value) in [
-            (
-                "kirocli:odic:token",
-                json!({
-                    "access_token": access_token,
-                    "refresh_token": "RT",
-                    "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-                    "region": "us-east-1",
-                    "start_url": "https://d-1.awsapps.com/start"
-                })
-                .to_string(),
-            ),
-            (
+        let mut rows = vec![(
+            "kirocli:odic:token",
+            json!({
+                "access_token": access_token,
+                "refresh_token": "RT",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(expires_in_minutes))
+                    .to_rfc3339(),
+                "region": "us-east-1",
+                "start_url": "https://d-1.awsapps.com/start"
+            })
+            .to_string(),
+        )];
+        if let Some(days) = registration_days {
+            rows.push((
                 "kirocli:odic:device-registration",
                 json!({
                     "client_id": "CID", "client_secret": "SECRET",
-                    "client_secret_expires_at": (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+                    "client_secret_expires_at": (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339(),
                     "region": "us-east-1"
                 })
                 .to_string(),
-            ),
-        ] {
+            ));
+        }
+        for (key, value) in rows {
             con.execute(
                 "insert or replace into auth_kv values (?1, ?2)",
                 [key, value.as_str()],
@@ -1014,4 +1345,265 @@ mod tests {
         assert_eq!(a.len(), 12);
     }
 
+    // ── 续期 / 保活 ──────────────────────────────────────────────────────
+
+    /// 固定时间点 + 相对它的到期时间，保证边界断言与真实时钟无关。
+    fn at(minutes_from_now: i64) -> (i64, String) {
+        use chrono::TimeZone;
+        let now = 1_760_000_000_000i64;
+        let expires = now + minutes_from_now * 60_000;
+        let stamp = chrono::Utc
+            .timestamp_millis_opt(expires)
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        (now, stamp)
+    }
+
+    #[test]
+    fn needs_renewal_only_when_close_to_expiry() {
+        let cases = [
+            (120, false, "还剩 2 小时不用续"),
+            (46, false, "46 分钟仍在阈值外"),
+            (45, true, "45 分钟正好到阈值（下一轮巡检前会死）"),
+            (10, true, "只剩 10 分钟"),
+            (-5, true, "已经过期"),
+        ];
+        for (minutes, expected, hint) in cases {
+            let (now, stamp) = at(minutes);
+            assert_eq!(
+                needs_renewal(Some(&stamp), now),
+                expected,
+                "{hint}（{minutes} 分钟）"
+            );
+        }
+        let (now, _) = at(0);
+        assert!(needs_renewal(None, now), "读不到到期时间就续一次");
+        assert!(needs_renewal(Some("not-a-time"), now), "解析不了同样续一次");
+    }
+
+    /// 闸门：不可续的原因要挡住发请求；剩余充足时只有手动能强行续。
+    #[test]
+    fn renewal_gate_blocks_or_defers() {
+        let (now, _) = at(120);
+        let (_, stale) = at(10);
+
+        let usable = TokenFacts::from_token(&token("aa11", 120), Some(&registration()));
+        assert_eq!(renewal_gate(&usable, RefreshMode::Loop, now), Some(Skip::StillFresh));
+        assert_eq!(
+            renewal_gate(&usable, RefreshMode::KeepAlive, now),
+            Some(Skip::StillFresh)
+        );
+        assert_eq!(renewal_gate(&usable, RefreshMode::Manual, now), None, "手动不看阈值");
+
+        let mut expired = usable.clone();
+        expired.expires_at = Some(stale);
+        assert_eq!(renewal_gate(&expired, RefreshMode::Loop, now), None);
+
+        let mut no_refresh = usable.clone();
+        no_refresh.has_refresh = false;
+        assert_eq!(
+            renewal_gate(&no_refresh, RefreshMode::Manual, now),
+            Some(Skip::NoRefreshToken),
+            "手动也不能凭空续"
+        );
+
+        let mut no_registration = usable.clone();
+        no_registration.registration_ok = false;
+        assert_eq!(
+            renewal_gate(&no_registration, RefreshMode::Manual, now),
+            Some(Skip::NoRegistration)
+        );
+    }
+
+    /// 桌面端与 IDE 共用一份文件：连「要不要续」都不判断，直接跳过。
+    #[test]
+    fn desktop_account_is_never_refreshed() {
+        let dir = TempDir::new("desktop-skip");
+        dir.write(TOKEN_FILE, &token("aa11", -30));
+        let candidate = Candidate {
+            id: "desktop:default".into(),
+            source: AccountSource::Desktop,
+            dir: dir.path().to_path_buf(),
+            facts: read_dir_facts(dir.path()).unwrap(),
+            cli: None,
+            note: None,
+        };
+        let outcome = refresh_candidate(&candidate, RefreshMode::KeepAlive).unwrap();
+        assert_eq!(
+            outcome,
+            RefreshOutcome::Skipped {
+                reason: Skip::SharedWithIde,
+                expires_at: candidate.facts.expires_at.clone(),
+            }
+        );
+    }
+
+    /// 登录账号：剩余充足时既不发请求、也不改文件（连 mtime 都不动）。
+    #[test]
+    fn login_account_with_fresh_token_is_left_alone() {
+        let dir = TempDir::new("login-fresh");
+        let hash = "ab".repeat(32);
+        dir.write(TOKEN_FILE, &token(&hash, 120));
+        dir.write(&format!("{hash}.json"), &registration());
+        let candidate = Candidate {
+            id: "login:fresh".into(),
+            source: AccountSource::Login,
+            dir: dir.path().to_path_buf(),
+            facts: read_dir_facts(dir.path()).unwrap(),
+            cli: None,
+            note: None,
+        };
+        let before = fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap();
+
+        let outcome = refresh_candidate(&candidate, RefreshMode::KeepAlive).unwrap();
+        assert!(matches!(
+            outcome,
+            RefreshOutcome::Skipped { reason: Skip::StillFresh, .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(),
+            before,
+            "跳过的轮次不能碰令牌文件"
+        );
+    }
+
+    /// CLI 账号：**判据取原库**。库里刚续过（2 小时）时，即使副本已经过期也不该再续；
+    /// 但副本要立刻对齐库 —— 代理读的是副本，留着过期副本等于把可用请求变成 401。
+    #[test]
+    fn cli_account_judges_by_database_not_copy() {
+        let dir = TempDir::new("cli-db-fresh");
+        let db = dir.path().join("data.sqlite3");
+        write_cli_db_rows(&db, "FRESH_AT", 120, Some(30));
+
+        // 副本还停在上一轮导入的过期状态
+        let copy = dir.path().join("accounts/cli/test");
+        fs::create_dir_all(&copy).unwrap();
+        fs::write(
+            copy.join(TOKEN_FILE),
+            serde_json::to_vec(&token("cd", -30)).unwrap(),
+        )
+        .unwrap();
+
+        let candidate = cli_candidate(&db, &copy);
+        let outcome = refresh_candidate(&candidate, RefreshMode::KeepAlive).unwrap();
+        assert!(
+            matches!(outcome, RefreshOutcome::Skipped { reason: Skip::StillFresh, .. }),
+            "库里还剩 2 小时，不该因为副本旧就再续一次：{outcome:?}"
+        );
+
+        // 副本被对齐成库里那份（说明判断依据不是它，而它也不会继续过期下去）
+        let copy_token: Value =
+            serde_json::from_str(&fs::read_to_string(copy.join(TOKEN_FILE)).unwrap()).unwrap();
+        assert_eq!(copy_token["accessToken"], "FRESH_AT");
+
+        // 原库没被续期污染：access_token / refresh_token 逐字未变
+        let raw: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "select value from auth_kv where key = 'kirocli:odic:token'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored["access_token"], "FRESH_AT");
+        assert_eq!(stored["refresh_token"], "RT");
+    }
+
+    /// CLI 账号的注册记录过期后，refreshToken 也刷不动 —— 必须挡在发请求之前。
+    #[test]
+    fn cli_account_with_expired_registration_is_skipped() {
+        let dir = TempDir::new("cli-expired-reg");
+        let db = dir.path().join("data.sqlite3");
+        // 令牌过期 + 注册记录也过期：只能重新登录
+        write_cli_db_rows(&db, "AT", -30, Some(-1));
+
+        let candidate = cli_candidate(&db, &dir.path().join("copy"));
+        assert!(!candidate.facts.registration_ok, "测试数据本身要过期");
+        let outcome = refresh_candidate(&candidate, RefreshMode::KeepAlive).unwrap();
+        assert!(
+            matches!(outcome, RefreshOutcome::Skipped { reason: Skip::NoRegistration, .. }),
+            "注册记录过期时应当跳过而不是白等一次超时：{outcome:?}"
+        );
+    }
+
+    /// 同一账号同时只能有一轮续期；锁在 Drop 时释放。
+    #[test]
+    fn only_one_refresh_per_account_at_a_time() {
+        let id = format!("login:lock-{}", uuid::Uuid::new_v4().simple());
+        let first = InFlight::acquire(&id).expect("第一轮应拿到锁");
+        assert!(InFlight::acquire(&id).is_none(), "第二轮必须被挡下");
+        drop(first);
+        assert!(InFlight::acquire(&id).is_some(), "释放后可以重新拿");
+    }
+
+    /// 回写原库后要把副本的 mtime 标记同步过来，否则下一次扫描会白覆盖一遍。
+    #[test]
+    fn sync_copy_meta_keeps_copy_in_step_with_database() {
+        let dir = TempDir::new("cli-sync");
+        let db = dir.path().join("data.sqlite3");
+        write_cli_db_rows(&db, "AT2", 120, Some(30));
+        let copy = dir.path().join("accounts/cli/test");
+        fs::create_dir_all(&copy).unwrap();
+        fs::write(
+            copy.join(TOKEN_FILE),
+            serde_json::to_vec(&token("ef", 120)).unwrap(),
+        )
+        .unwrap();
+        write_meta(
+            &copy,
+            AccountMeta {
+                created_at_ms: 111,
+                db_path: Some(db.to_string_lossy().to_string()),
+                db_mtime_ms: Some(999), // 故意写一个错的值，模拟「刚回写过」
+            },
+        )
+        .unwrap();
+
+        let origin = CliOrigin {
+            db: db.clone(),
+            key: "kirocli:odic:token".to_string(),
+            mtime_ms: cli_bridge::file_mtime_ms(&db),
+        };
+        sync_copy_meta(&copy, &origin).unwrap();
+
+        let meta = read_meta(&copy).unwrap();
+        assert_eq!(meta.created_at_ms, 111, "创建时刻不能被改写");
+        assert_eq!(meta.db_mtime_ms, Some(cli_bridge::file_mtime_ms(&db)));
+
+        // 标记同步之后，materialize 认为副本是新的，不会再导一遍
+        let candidate = Candidate {
+            id: "cli:test".into(),
+            source: AccountSource::Cli,
+            dir: copy.clone(),
+            facts: read_dir_facts(&copy).unwrap(),
+            cli: Some(origin),
+            note: None,
+        };
+        materialize(&candidate).unwrap();
+        let copy_token: Value =
+            serde_json::from_str(&fs::read_to_string(copy.join(TOKEN_FILE)).unwrap()).unwrap();
+        assert_eq!(copy_token["accessToken"], "AT", "副本不应被库里的 AT2 覆盖");
+    }
+
+    /// 用 CLI 库造一个候选账号（副本目录可以还不存在）。
+    fn cli_candidate(db: &Path, copy: &Path) -> Candidate {
+        let credential = cli_bridge::read_one(db, None).unwrap().unwrap();
+        Candidate {
+            id: "cli:test".into(),
+            source: AccountSource::Cli,
+            dir: copy.to_path_buf(),
+            facts: TokenFacts::from_token(
+                &credential.token,
+                credential.registration.as_ref().map(|(_, value)| value),
+            ),
+            cli: Some(CliOrigin {
+                db: db.to_path_buf(),
+                key: credential.key.clone(),
+                mtime_ms: credential.db_mtime_ms,
+            }),
+            note: None,
+        }
+    }
 }

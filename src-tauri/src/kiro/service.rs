@@ -417,34 +417,46 @@ pub(crate) fn stop_proxy(state: &ProxyStateRef) -> Result<ProxyStatus, String> {
 
 // ── 凭据刷新 ────────────────────────────────────────────────────────────
 
-/// 刷新**当前选中账号**的凭据，写回该账号自己的目录。
-/// 返回 `(是否执行了刷新, 最新 expiresAt)`。
+/// 刷新**当前选中账号**的凭据，写回该账号自己的目录（CLI 账号还会写回 CLI 原库）。
 ///
-/// 写回哪里由 `Auth` 的目录决定，所以登录账号、CLI 副本、桌面端共享缓存各自落回原处：
-/// 桌面端与 IDE 写的是同一个文件（双方看到同一份刷新结果），另外两类是本应用的独立副本。
+/// 真正的续期动作在 [`accounts::refresh`]：这里只负责「选谁」+ 记日志。
+/// 三处调用（代理循环 / 手动 / 启动后补刷）共用它，保证副作用一致 —— 以前这里是
+/// `new_auth().force_refresh()`，CLI 账号只续副本、原库不动，保活巡检会因此拿着
+/// 已轮换的 refreshToken 去续，把 kiro-cli 侧顶死。
 ///
-/// 以前这里还会先「轻触」一次 `kiro-cli whoami`，靠它顺带把 CLI 侧会话保活。
-/// 账号管理之后不再需要 —— CLI 账号是导入的副本、由本应用续期；而轻触一个会话过期的
-/// CLI 有可能转去走登录流程并挂住，收益为零、风险不小，故整段移除。
-///
-/// `source` 标明这次刷新是谁发起的（手动 / 后台循环 / 预检恢复 / 请求重试）：
+/// `source` 标明这次刷新是谁发起的（手动 / 后台循环 / 请求重试）：
 /// 刷新耗时都会追加进 kiro-debug.log，并发刷新时靠它才分得清哪行是哪次。
-/// 日志只记耗时、端点与到期时间，不记任何令牌内容。
-pub(crate) fn refresh_credentials(source: &'static str) -> Result<(bool, Option<String>), String> {
+/// 日志只记耗时、结果与到期时间，不记任何令牌内容。
+pub(crate) fn refresh_credentials(
+    source: &'static str,
+    mode: accounts::RefreshMode,
+) -> Result<accounts::RefreshOutcome, String> {
     let started = Instant::now();
-    let result = new_auth().force_refresh(source);
+    let result = match accounts::active_id() {
+        Some(id) => accounts::refresh(&id, mode),
+        // 一个账号都扫描不到（只有环境变量鉴权）：退回按目录直接强刷，那里没有账号可谈
+        None => new_auth().force_refresh(source).map(|(refreshed, expires_at)| {
+            if refreshed {
+                accounts::RefreshOutcome::Refreshed { expires_at }
+            } else {
+                accounts::RefreshOutcome::Skipped {
+                    reason: accounts::Skip::NoRefreshToken,
+                    expires_at,
+                }
+            }
+        }),
+    };
     let total = crate::diag::secs(started.elapsed());
     match &result {
-        Ok((true, expires_at)) => crate::diag::log(&format!(
+        Ok(accounts::RefreshOutcome::Refreshed { expires_at }) => crate::diag::log(&format!(
             "[refresh:{source}] 刷新完成：{total}，新到期 {}",
             expires_at.as_deref().unwrap_or("—"),
         )),
-        Ok((false, _)) => crate::diag::log(&format!(
-            "[refresh:{source}] 无可刷新的凭据：{total}",
+        Ok(accounts::RefreshOutcome::Skipped { reason, .. }) => crate::diag::log(&format!(
+            "[refresh:{source}] 跳过：{}（{total}）",
+            reason.as_str(),
         )),
-        Err(error) => crate::diag::log(&format!(
-            "[refresh:{source}] 刷新失败：{total}：{error}",
-        )),
+        Err(error) => crate::diag::log(&format!("[refresh:{source}] 刷新失败：{total}：{error}")),
     }
     result
 }
@@ -513,8 +525,8 @@ pub(crate) fn spawn_refresh_loop(state: ProxyStateRef) {
                 break;
             }
 
-            match refresh_credentials("后台循环") {
-                Ok((true, expires_at)) => {
+            match refresh_credentials("后台循环", accounts::RefreshMode::Loop) {
+                Ok(accounts::RefreshOutcome::Refreshed { expires_at }) => {
                     eprintln!("[proxy] 共享 SSO 凭据已刷新");
                     let mut status = build_status(&state);
                     if expires_at.is_some() {
@@ -522,8 +534,8 @@ pub(crate) fn spawn_refresh_loop(state: ProxyStateRef) {
                     }
                     let _ = app.emit("proxy://token-refreshed", &status);
                 }
-                Ok((false, _)) => {
-                    eprintln!("[proxy] 跳过刷新：无 refreshToken（环境变量鉴权）");
+                Ok(accounts::RefreshOutcome::Skipped { reason, .. }) => {
+                    eprintln!("[proxy] 本轮未续期：{}", reason.as_str());
                 }
                 Err(error) => {
                     eprintln!("[proxy] 凭据刷新失败: {error}");
@@ -854,25 +866,42 @@ pub async fn k2a_usage() -> Result<super::auth::KiroUsageInfo, String> {
     Ok(stamp_usage_and_notify(info))
 }
 
-/// 手动刷新共享 SSO 凭据。
+/// 手动刷新当前账号的凭据。手动模式**不看剩余有效期**：按钮要的就是现在换一份新的。
 #[tauri::command]
 pub async fn k2a_refresh_token(app: AppHandle) -> Result<ProxyStatus, String> {
-    let (refreshed, expires_at) = tauri::async_runtime::spawn_blocking(|| refresh_credentials("手动"))
-        .await
-        .map_err(|e| format!("凭据刷新任务失败: {e}"))??;
-    if !refreshed {
-        return Err(
-            "未找到可刷新的 Kiro refreshToken，请先登录（凭据卡片「登录」/ Kiro IDE / `kiro-cli login`）"
-                .to_string(),
-        );
+    let outcome = tauri::async_runtime::spawn_blocking(|| {
+        refresh_credentials("手动", accounts::RefreshMode::Manual)
+    })
+    .await
+    .map_err(|e| format!("凭据刷新任务失败: {e}"))??;
+    if !outcome.is_refreshed() {
+        return Err(refresh_failure_message(&outcome));
     }
     let state = app.state::<ProxyStateRef>();
     let mut status = build_status(&state);
-    if let Some(exp) = expires_at {
-        status.expires_at = Some(exp);
+    if let Some(expires_at) = outcome.expires_at() {
+        status.expires_at = Some(expires_at);
     }
     let _ = app.emit("proxy://token-refreshed", &status);
     Ok(status)
+}
+
+/// 续期没成时给用户看的那句话：只写「他能做什么」，不暴露内部枚举名。
+fn refresh_failure_message(outcome: &accounts::RefreshOutcome) -> String {
+    match outcome {
+        accounts::RefreshOutcome::Refreshed { .. } => "凭据已刷新".to_string(),
+        accounts::RefreshOutcome::Skipped { reason, .. } => match reason {
+            accounts::Skip::NoRefreshToken => {
+                "未找到可刷新的 Kiro refreshToken，请先登录（凭据卡片「登录」/ Kiro IDE / `kiro-cli login`）"
+                    .to_string()
+            }
+            accounts::Skip::NoRegistration => {
+                "IdC 的注册文件已过期，无法续期，请重新登录该账号".to_string()
+            }
+            accounts::Skip::Concurrent => "该账号正在续期，请稍后再试".to_string(),
+            other => format!("未能续期：{}", other.as_str()),
+        },
+    }
 }
 
 /// 在系统文件管理器里打开配置目录或诊断日志（便于排查问题）。
