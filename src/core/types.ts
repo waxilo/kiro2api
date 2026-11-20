@@ -82,6 +82,14 @@ export interface LoginSession {
   browserOpened: boolean;
 }
 
+/** `k2a_login_sites` 的一条：登录过的企业域。 */
+export interface LoginSite {
+  /** IAM Identity Center 的 Start URL（`https://d-xxxxxxxxxx.awsapps.com/start`）。 */
+  startUrl: string;
+  /** 那次登录用的 OIDC 区域；选中时与 URL 一起填回去。 */
+  region: string;
+}
+
 /** `k2a_models` 的返回。 */
 export interface ModelsState {
   /**

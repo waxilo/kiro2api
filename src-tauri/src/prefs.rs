@@ -72,7 +72,32 @@ pub(crate) struct AppConfig {
     /// 用户真正能用来区分多账号的是邮箱，而邮箱只能联网问上游（getUsageLimits）。
     /// 缓存住之后，进账号页先画本地信息，识别过的那几个直接带名字，不必每次都等网络。
     pub(crate) account_identities: HashMap<String, AccountIdentity>,
+    /// 登录过的企业站点（最近使用的在前，见 [`LoginSite`]）。
+    pub(crate) login_sites: Vec<LoginSite>,
 }
+
+/// 登录过的企业站点：IAM Identity Center 的 Start URL + 它用的区域。
+///
+/// 为什么要记：Start URL 是 `https://d-xxxxxxxxxx.awsapps.com/start` 这样一串随机目录 id，
+/// 没人记得住 —— 重新登录、换机器、加第二个域时只能翻旧邮件或旧截图。记下来之后
+/// 登录弹窗里给一个下拉，点一下就把 URL 与区域一起填回去。
+///
+/// 只服务于输入便利：不参与账号选择，也不含任何令牌（凭据仍在 `accounts/` 下）。
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct LoginSite {
+    pub(crate) start_url: String,
+    /// 该站点用的 OIDC 区域。跟 URL 一起记，省得用户挑回旧域却忘了区域对不上。
+    pub(crate) region: String,
+    /// 最近一次登录成功的时刻（Unix 毫秒）。列表按它倒序，前端不展示。
+    pub(crate) used_at_ms: i64,
+}
+
+/// 历史站点最多记几条。
+///
+/// 上限是「够用，且下拉不至于翻半天」：一个人不会登录很多个企业域。记满之后再登录
+/// 新的，最久未用的那条让位 —— 比起无限增长，用户更可能在翻十年前的域时选错。
+const MAX_LOGIN_SITES: usize = 8;
 
 /// 一个账号的「人话身份」快照。
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -108,6 +133,7 @@ impl Default for AppConfig {
             context_window: None,
             active_account: None,
             account_identities: HashMap::new(),
+            login_sites: Vec::new(),
         }
     }
 }
@@ -335,6 +361,56 @@ pub(crate) fn clear_account_caches() -> Result<(), String> {
     })
 }
 
+// ── 登录过的域（登录弹窗的历史下拉）───────────────────────────────────
+//
+// 只做存取与去重，不校验 URL 是否可用（那是 `kiro::login::resolve_target` 的事，
+// 两处各写一份规则迟早漂移）。
+
+/// 历史站点清单（最近使用的在前）。
+pub(crate) fn login_sites() -> Vec<LoginSite> {
+    load_config().login_sites
+}
+
+/// 两个 Start URL 是否是「同一个域」。
+///
+/// 忽略大小写（主机名本就大小写不敏感）、末尾的 `#` 与 `/` —— 用户手抄时经常
+/// 多带一个斜杠，或者从浏览器地址栏复制时末尾挂着锚点。
+pub(crate) fn same_login_site(left: &str, right: &str) -> bool {
+    normalize_site_url(left) == normalize_site_url(right)
+}
+
+fn normalize_site_url(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('#')
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// 并进一条历史：同域只留一条、挪到最前、超上限丢掉最久未用的。
+fn merge_login_site(list: &mut Vec<LoginSite>, site: LoginSite, max: usize) {
+    list.retain(|existing| !same_login_site(&existing.start_url, &site.start_url));
+    list.insert(0, site);
+    list.truncate(max);
+}
+
+/// 记下一次成功的登录（由 `kiro::login` 在凭据写盘之后调用）。
+///
+/// 空值直接忽略而不是报错：这是「锦上添花」的记录，不该让一次已经成功的登录失败。
+pub(crate) fn remember_login_site(start_url: &str, region: &str) -> Result<(), String> {
+    let site = LoginSite {
+        start_url: start_url.trim().trim_end_matches('#').to_string(),
+        region: region.trim().to_ascii_lowercase(),
+        used_at_ms: now_ms(),
+    };
+    if site.start_url.is_empty() || site.region.is_empty() {
+        return Ok(());
+    }
+    update_config(|config| {
+        merge_login_site(&mut config.login_sites, site, MAX_LOGIN_SITES);
+        Ok(())
+    })
+}
+
 // ── 更新下载源 ──────────────────────────────────────────────────────────
 //
 // 取值是 `updater_accel` 那份源清单的 id。这里刻意只做存取、不做校验：
@@ -550,5 +626,63 @@ mod tests {
             ms_to_iso(-1).as_deref(),
             Some("1969-12-31T23:59:59Z")
         );
+    }
+
+    // ── 登录过的域：最近优先、同域只留一条 ──
+
+    fn site(url: &str, region: &str) -> LoginSite {
+        LoginSite {
+            start_url: url.to_string(),
+            region: region.to_string(),
+            used_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn merge_login_site_moves_a_reused_site_to_the_front() {
+        let mut list = vec![
+            site("https://a.awsapps.com/start", "us-east-1"),
+            site("https://b.awsapps.com/start", "eu-west-1"),
+        ];
+        merge_login_site(&mut list, site("https://b.awsapps.com/start", "eu-west-1"), 8);
+        // 重新用一次就排回最前：下拉的第一条应该是「上次用的那个」
+        assert_eq!(list[0].start_url, "https://b.awsapps.com/start");
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn merge_login_site_overwrites_the_region_of_the_same_site() {
+        let mut list = vec![site("https://a.awsapps.com/start", "us-east-1")];
+        merge_login_site(&mut list, site("https://a.awsapps.com/start", "ap-northeast-1"), 8);
+        // 同一个域换过区域时，最后一次成功的才对
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].region, "ap-northeast-1");
+    }
+
+    #[test]
+    fn merge_login_site_treats_case_trailing_hash_and_slash_as_the_same_site() {
+        let mut list = vec![site("https://A.awsapps.com/start/", "us-east-1")];
+        merge_login_site(&mut list, site("https://a.awsapps.com/start#", "us-east-1"), 8);
+        assert_eq!(list.len(), 1, "{}", list[0].start_url);
+    }
+
+    #[test]
+    fn merge_login_site_drops_the_least_recently_used_beyond_the_cap() {
+        let mut list: Vec<LoginSite> = (0..8)
+            .map(|i| site(&format!("https://d{i}.awsapps.com/start"), "us-east-1"))
+            .collect();
+        merge_login_site(&mut list, site("https://new.awsapps.com/start", "us-east-1"), 8);
+        assert_eq!(list.len(), 8);
+        assert_eq!(list[0].start_url, "https://new.awsapps.com/start");
+        // 最久未用的那条（列表末尾）被挤掉
+        assert!(!list.iter().any(|s| s.start_url == "https://d7.awsapps.com/start"));
+    }
+
+    /// 旧配置文件里没有 `loginSites`：读到空表，而不是解析失败把整份配置丢掉。
+    #[test]
+    fn login_sites_default_to_empty_on_old_configs() {
+        let config: AppConfig = serde_json::from_str(r#"{"port":6000}"#).unwrap();
+        assert_eq!(config.port, 6000);
+        assert!(config.login_sites.is_empty());
     }
 }

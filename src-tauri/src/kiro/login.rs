@@ -29,6 +29,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::accounts;
+use crate::prefs::{self, LoginSite};
 
 /// Builder ID 的固定入口。
 const BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
@@ -301,10 +302,66 @@ fn store_credentials(
     )?;
     super::cli_bridge::write_secret_file(&dir.join(TOKEN_FILE), &token)?;
     accounts::record_login(&dir)?;
+    // 记住这次用的域：企业 Start URL 是随机目录 id，下次再登录只能靠历史挑回来。
+    // 失败的后果仅是下拉里少一条，不该把「已经写好的凭据」判死。
+    if target.provider == "Enterprise" {
+        if let Err(e) = prefs::remember_login_site(&target.start_url, &target.region) {
+            crate::diag::log(&format!("[login] 记录登录过的域失败：{e}"));
+        }
+    }
     // 新登录默认就是「现在要用这个」：否则用户刚登完，代理还在用上一个账号，
     // 得再去账号页点一次，多一步且容易漏。
     accounts::select(&format!("login:{hash}"))?;
     Ok(())
+}
+
+/// 本机凭据里读到过的企业站点（与偏好互补，见 [`k2a_login_sites`]）。
+///
+/// 只读 `kiro-auth-token.json` 里的 `startUrl` 与 `region` —— 不碰令牌本身，
+/// 也不写任何东西。
+fn credential_sites() -> Vec<(String, String)> {
+    let mut dirs = vec![crate::paths::own_credential_dir()];
+    if let Ok(entries) = fs::read_dir(crate::paths::accounts_root().join("login")) {
+        dirs.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir()),
+        );
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for dir in dirs {
+        let Ok(text) = fs::read_to_string(dir.join(TOKEN_FILE)) else {
+            continue;
+        };
+        let Ok(token) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        // 只收企业 IdC：Builder ID 的入口是固定的，列进历史只是噪音
+        if token.get("provider").and_then(Value::as_str) != Some("Enterprise") {
+            continue;
+        }
+        let url = token
+            .get("startUrl")
+            .or_else(|| token.get("start_url"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| url.starts_with("https://"));
+        let Some(url) = url else { continue };
+        let region = token
+            .get("region")
+            .and_then(Value::as_str)
+            .unwrap_or(BUILDER_ID_REGION);
+        if out
+            .iter()
+            .any(|(known, _)| prefs::same_login_site(known, url))
+        {
+            continue;
+        }
+        out.push((url.to_string(), region.to_string()));
+    }
+    out
 }
 
 fn resolve_target(method: &str, start_url: Option<String>, region: Option<String>) -> Result<LoginTarget, String> {
@@ -346,6 +403,30 @@ fn finish_success(app: &AppHandle) {
 }
 
 // ── Tauri 命令 ──────────────────────────────────────────────────────────
+
+/// 登录弹窗的「登录过的域」：偏好里记下的（最近使用的在前），再补上现有企业凭据里
+/// 读得到、但偏好里还没有的那些。
+///
+/// 后半段是给「这个版本之前就登录过」的账号兜底 —— 升级后第一次打开登录弹窗就能
+/// 看到以前用过的域，不必翻旧邮件重抄一遍随机目录 id。
+#[tauri::command]
+pub fn k2a_login_sites() -> Vec<LoginSite> {
+    let mut sites = prefs::login_sites();
+    for (start_url, region) in credential_sites() {
+        if sites
+            .iter()
+            .any(|known| prefs::same_login_site(&known.start_url, &start_url))
+        {
+            continue;
+        }
+        sites.push(LoginSite {
+            start_url,
+            region,
+            used_at_ms: 0,
+        });
+    }
+    sites
+}
 
 /// 发起设备码登录：注册 client、拿验证码、打开浏览器，然后在后台轮询。
 /// 结果通过事件 `login://done`（载荷 ProxyStatus）/ `login://failed`（错误文本）送达。
@@ -460,8 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn idc_target_validates_url_and_region() {
-        assert!(resolve_target("idc", Some("http://x".into()), None).is_err());
+    fn idc_target_validates_url_and_region() {        assert!(resolve_target("idc", Some("http://x".into()), None).is_err());
         assert!(resolve_target("idc", Some("https://".into()), None).is_err());
         assert!(resolve_target("idc", Some("https://d-1.awsapps.com/start".into()), Some("evil.com/x".into())).is_err());
         let t = resolve_target("idc", Some(" https://d-1.awsapps.com/start#".into()), Some("EU-West-1".into())).unwrap();
@@ -470,5 +550,17 @@ mod tests {
         let t = resolve_target("idc", Some("https://d-1.awsapps.com/start".into()), None).unwrap();
         assert_eq!(t.region, "us-east-1");
         assert!(resolve_target("google", None, None).is_err());
+    }
+
+    /// 手工验证（非 CI）：把「偏好里记下的 + 现有企业凭据里读到的」打出来，
+    /// 确认升级前就登录过的域也会出现在下拉里。
+    #[test]
+    #[ignore]
+    fn live_login_sites_merge_prefs_and_existing_credentials() {
+        let sites = k2a_login_sites();
+        println!("[sites] count={}", sites.len());
+        for site in sites {
+            println!("[sites] {} ({})", site.start_url, site.region);
+        }
     }
 }

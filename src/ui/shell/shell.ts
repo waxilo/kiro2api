@@ -15,6 +15,7 @@ import { scheduler } from '../../services/scheduler';
 import { updater } from '../../services/updater';
 import {
   bindBackendEvents,
+  closeLoginSites,
   closeModal,
   dispatch,
   navigate,
@@ -260,7 +261,13 @@ function bindEvents(container: HTMLElement): void {
       return;
     }
     const action = origin?.closest<HTMLElement>('[data-action]');
-    if (action) void dispatch(action.dataset.action ?? '', action.dataset);
+    if (action) {
+      void dispatch(action.dataset.action ?? '', action.dataset);
+      return;
+    }
+    // 点在下拉浮层外面就收起它 —— 浮层菜单的通用直觉。点输入框本身不收起
+    // （光标落进去是想接着改字，不是「不要这个菜单了」）。
+    if (!origin?.closest('#login-sites')) closeLoginSites();
   });
 
   // 登录弹窗的两个输入框逐键进 store（纯内存，不写盘）：弹窗会被后台事件重绘，
@@ -299,6 +306,12 @@ function bindEvents(container: HTMLElement): void {
   // 而不是「清空下面那个搜索框」。
   container.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    // 历史下拉浮在弹窗内容之上：Esc 先收它，再退到「关弹窗」——
+    // 用户按 Esc 想的是「收起这层」，不是「连登录一起放弃」。
+    if (store.get().loginSitesOpen) {
+      closeLoginSites();
+      return;
+    }
     if (store.get().modal) {
       closeModal();
       return;

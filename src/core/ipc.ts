@@ -16,6 +16,7 @@ import type {
   CopyKind,
   LoginMethod,
   LoginSession,
+  LoginSite,
   ModelsState,
   PreferencesState,
   ProxyAccess,
@@ -72,6 +73,12 @@ export const backend = {
     }),
   loginCancel: () => invoke<void>('k2a_login_cancel'),
   loginReopen: () => invoke<void>('k2a_login_reopen'),
+  /**
+   * 登录过的企业域（最近使用的在前）。
+   *
+   * 纯本地读：偏好里记下的历史 + 现有企业凭据里读得到的，不发网络请求。
+   */
+  loginSites: () => invoke<LoginSite[]>('k2a_login_sites'),
 
   // ── 模型 ──────────────────────────────────────────────────────────────
   // 只读的账户模型清单，同步走上游控制面，**不需要**代理在运行

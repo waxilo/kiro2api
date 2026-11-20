@@ -922,6 +922,120 @@ button.modal-close:hover:not(:disabled):not([aria-disabled='true']) {
   }
 }
 
+/* ── 登录弹窗：登录过的域（Start URL 的历史下拉）───────────────────────
+   企业 IdC 的 Start URL 是一串 `d-xxxxxxxxxx` 的随机目录 id，没人记得住：登录成功
+   就记下来，下次从这里挑一条。浮层用绝对定位，**不参与布局** —— 展开前后卡片高度、
+   下方的区域字段与按钮位置都不动（尺寸稳定性）。
+
+   尺寸刻意与普通输入框对齐：32px 高、10px 圆角、同样的发丝描边与投影；
+   箭头只是框内右侧一颗 26px 的图标按钮，输入框让出等宽的内边距，长 URL 的文字
+   不会钻到箭头底下。 */
+.field-combo {
+  position: relative;
+}
+
+/* 包了一层 `.field-combo` 之后，input 不再被 `.field` 的 flex 拉伸，得自己撑满 */
+.field-combo input {
+  width: 100%;
+}
+
+.field-combo input.has-combo {
+  padding-right: 34px;
+}
+
+.field-combo .combo-toggle {
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-subtle);
+  box-shadow: none;
+}
+
+/* 通用按钮的 hover 是 (0,3,1)，写成类选择器会被压掉 —— 详见本文件头的特异性说明 */
+.field-combo .combo-toggle:hover:not([aria-disabled='true']) {
+  border: 0;
+  background: var(--surface-2);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.field-combo .combo-toggle .icon {
+  width: 13px;
+  height: 13px;
+  /* `chevron` 朝右，转成正下；展开时再转回来 */
+  transform: rotate(90deg);
+  transition: transform var(--dur) var(--ease);
+}
+
+.field-combo .combo-toggle[aria-expanded='true'] .icon {
+  transform: rotate(-90deg);
+}
+
+.combo-menu {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  /* 约 4 条可见、其余在菜单内滚：登录卡片是定高的，浮层再长就会顶到卡片边缘 */
+  max-height: 128px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-pop);
+}
+
+.combo-menu .combo-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-xs);
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  font-family: var(--font-mono);
+  font-size: var(--t-caption);
+  color: var(--ink);
+  text-align: left;
+}
+
+.combo-menu .combo-item:hover:not([aria-disabled='true']) {
+  border: 0;
+  background: var(--surface-2);
+  box-shadow: none;
+}
+
+/* URL 很长，省略号收尾；区域内名跟在后面，永远完整可见 */
+.combo-item-url {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.combo-item-region {
+  flex: none;
+  font-family: var(--font-ui);
+  color: var(--ink-tertiary);
+}
+
 /* ── 登录弹窗：等待浏览器确认时的验证码 ───────────────────────────── */
 .login-wait {
   flex: 1 1 auto;

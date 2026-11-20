@@ -139,6 +139,8 @@ export function navigate(view: ViewId): void {
  */
 export function openModal(modal: ModalId): void {
   store.set({ modal });
+  // 登录弹窗要一份「登录过的域」：本地读一次，刚登录记下的那条这次就能选到
+  if (modal === 'login') void loadLoginSites();
 }
 
 /** 关闭概览弹窗。已经是关着的时候什么都不做（避免一次无意义的重绘）。 */
@@ -148,12 +150,48 @@ export function closeModal(): void {
   // 关掉登录弹窗 = 放弃这次登录：后台轮询没有界面可汇报了，留着只会在几分钟后
   // 冒出一条「验证码已过期」。
   if (modal === 'login' && loginSession) void backend.loginCancel();
-  store.set({ modal: null, loginSession: null });
+  store.set({ modal: null, loginSession: null, loginSitesOpen: false });
 }
 
 /** 登录弹窗的输入（逐键写入 store，后台重绘不会把没提交的字弹回去）。 */
 export function setLoginField(field: 'startUrl' | 'region', value: string): void {
   store.set(field === 'startUrl' ? { loginStartUrl: value } : { loginRegion: value });
+}
+
+/**
+ * 拉取「登录过的域」。
+ *
+ * 失败按空表处理、不弹提示：这个列表只是省一次手输，读不到也算不上出错 ——
+ * 为它弹一条 toast 反而会打断用户正在填的表单。
+ */
+async function loadLoginSites(): Promise<void> {
+  try {
+    store.set({ loginSites: await backend.loginSites() });
+  } catch {
+    store.set({ loginSites: [] });
+  }
+}
+
+/** 展开 / 收起历史下拉。没有历史时什么也不做（按钮本来就不渲染）。 */
+export function toggleLoginSites(): void {
+  const { loginSites, loginSitesOpen } = store.get();
+  if (!loginSites?.length) return;
+  store.set({ loginSitesOpen: !loginSitesOpen });
+}
+
+/** 收起历史下拉（点别处、按 Escape、选中之后都走这里）。 */
+export function closeLoginSites(): void {
+  if (store.get().loginSitesOpen) store.set({ loginSitesOpen: false });
+}
+
+/**
+ * 选中一条历史：**URL 与区域一起填**。
+ *
+ * 只填 URL 的话，用户挑回一个旧域、区域仍是上一个域的写法，登录会以
+ * 「区域不对」失败 —— 两条本来就该一起变。
+ */
+export function pickLoginSite(startUrl: string, region: string): void {
+  store.set({ loginStartUrl: startUrl, loginRegion: region, loginSitesOpen: false });
 }
 
 /** 同时拉 WorkBuddy 与 Codex 的扫描（都是纯本地读盘）。单个失败不影响另一个。 */
@@ -891,7 +929,20 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
 
     case 'login-method': {
       const method = dataset.method as LoginMethod | undefined;
-      if (method && !store.get().loginSession) store.set({ loginMethod: method });
+      if (method && !store.get().loginSession) {
+        // 换方式就收起历史：Builder ID 没有域可填，留着浮层只会挡在说明文字上
+        store.set({ loginMethod: method, loginSitesOpen: false });
+      }
+      return;
+    }
+
+    case 'login-sites-toggle':
+      toggleLoginSites();
+      return;
+
+    case 'login-site-pick': {
+      const { url, region } = dataset;
+      if (url) pickLoginSite(url, region || store.get().loginRegion);
       return;
     }
 

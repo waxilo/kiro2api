@@ -135,6 +135,7 @@ pub fn run() {
             kiro::k2a_login_start,
             kiro::k2a_login_cancel,
             kiro::k2a_login_reopen,
+            kiro::k2a_login_sites,
             workbuddy::k2a_workbuddy_import,
             workbuddy::k2a_workbuddy_list,
             workbuddy::k2a_workbuddy_remove,

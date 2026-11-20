@@ -9,6 +9,7 @@ import type {
   CopyKind,
   LoginMethod,
   LoginSession,
+  LoginSite,
   ModelsState,
   PreferencesState,
   ProxyAccess,
@@ -169,6 +170,15 @@ export interface AppState {
   /** IdC 的 Start URL / 区域输入（逐键写入，后台重绘不会把没提交的字弹回去）。 */
   loginStartUrl: string;
   loginRegion: string;
+  /**
+   * 登录过的企业域（最近使用的在前），给 Start URL 做下拉。
+   *
+   * `null` = 还没拉过（打开登录弹窗时才读一次本地配置）。它只是输入便利，
+   * 拉取失败按空表处理 —— 用户仍然可以手输。
+   */
+  loginSites: LoginSite[] | null;
+  /** 历史下拉是否展开。属于界面状态，不落盘。 */
+  loginSitesOpen: boolean;
   /** 等待浏览器确认中的设备授权；null = 没有进行中的登录。 */
   loginSession: LoginSession | null;
 }
@@ -231,6 +241,8 @@ export const store = createStore<AppState>({
   loginMethod: 'builder',
   loginStartUrl: '',
   loginRegion: 'us-east-1',
+  loginSites: null,
+  loginSitesOpen: false,
   loginSession: null,
   codexRestartPrompt: null,
   copiedKind: null,

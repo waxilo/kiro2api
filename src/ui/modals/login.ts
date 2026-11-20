@@ -31,18 +31,58 @@ function methodTabs(state: AppState): string {
     </div>`;
 }
 
+/**
+ * Start URL 输入 + 「登录过的域」下拉。
+ *
+ * 企业 Start URL 是一串随机目录 id，记不住 —— 登录成功时后端会记下这条，这里给一个
+ * 下拉直接挑回来，选中时 URL 与区域一起填。浮层用绝对定位，展开前后卡片高度、
+ * 下方字段与按钮的位置都不动（尺寸稳定性）。
+ */
+function startUrlField(state: AppState): string {
+  const sites = state.loginSites ?? [];
+  const open = state.loginSitesOpen && sites.length > 0;
+  const toggle = sites.length
+    ? `<button class="combo-toggle" type="button" data-action="login-sites-toggle"
+               aria-expanded="${open}" aria-label="登录过的域" title="登录过的域">${ICON.chevron}</button>`
+    : '';
+  const menu = open
+    ? `
+      <div class="combo-menu" role="listbox" aria-label="登录过的域">
+        ${sites
+          .map(
+            (site) => `
+          <button class="combo-item" type="button" role="option" aria-selected="false"
+                  data-action="login-site-pick"
+                  data-url="${esc(site.startUrl)}" data-region="${esc(site.region)}">
+            <span class="combo-item-url" title="${esc(site.startUrl)}">${esc(site.startUrl)}</span>
+            <span class="combo-item-region">${esc(site.region)}</span>
+          </button>`,
+          )
+          .join('')}
+      </div>`
+    : '';
+
+  return `
+    <div class="field">
+      <label for="login-start-url">Start URL</label>
+      <div class="field-combo" id="login-sites">
+        <input id="login-start-url" type="text" spellcheck="false" autocomplete="off"
+               class="${sites.length ? 'has-combo' : ''}"
+               placeholder="https://d-xxxxxxxxxx.awsapps.com/start"
+               value="${esc(state.loginStartUrl)}" />
+        ${toggle}
+        ${menu}
+      </div>
+    </div>`;
+}
+
 function formBody(state: AppState): string {
   const pending = isPending(state, ACTION.login);
   const startText = swapLabel(pending ? '正在发起…' : '打开浏览器登录', pending ? '打开浏览器登录' : '正在发起…');
   const fields =
     state.loginMethod === 'idc'
       ? `
-        <label class="field">
-          <span>Start URL</span>
-          <input id="login-start-url" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="https://d-xxxxxxxxxx.awsapps.com/start"
-                 value="${esc(state.loginStartUrl)}" />
-        </label>
+        ${startUrlField(state)}
         <label class="field">
           <span>区域</span>
           <input id="login-region" type="text" spellcheck="false" autocomplete="off"
