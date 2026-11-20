@@ -624,6 +624,10 @@ impl Auth {
         Ok((false, self.get_sso_token_expiry()))
     }
 
+    /// 这个 Auth 指向的凭据目录里有什么（只描述，不做判断）。
+    ///
+    /// 账号来源（登录 / kiro-cli / 桌面端）由 `crate::accounts` 说，这一层看不到
+    /// 「目录属于谁」；它只负责两件本层才知道的事：环境变量鉴权、以及目录里那份令牌。
     pub fn describe_auth_source(&self) -> String {
         if Self::get_env_authorization().is_some() {
             return "环境变量 KIRO_AUTHORIZATION/KIRO_ACCESS_TOKEN".to_string();
@@ -637,18 +641,7 @@ impl Auth {
                     .and_then(|v| v.as_str())
                     .map(|s| format!("，过期 {s}"))
                     .unwrap_or_default();
-                if self.sso_cache_dir == crate::paths::own_credential_dir() {
-                    let who = match token.get("provider").and_then(|v| v.as_str()) {
-                        Some("BuilderId") => "Builder ID",
-                        Some("Enterprise") => "IAM Identity Center",
-                        _ => "设备码",
-                    };
-                    return format!("Kiro2API 登录（{who}）{expires}");
-                }
-                return format!(
-                    "Kiro SSO 共享缓存（IDE/CLI 共用，{}）{expires}",
-                    self.sso_token_path().display()
-                );
+                return format!("{} {expires}", self.sso_token_path().display());
             }
         }
         "未找到 Kiro 凭据".to_string()

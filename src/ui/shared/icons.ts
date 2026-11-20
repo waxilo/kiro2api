@@ -16,6 +16,11 @@ export const ICON = {
     <rect x="2.4" y="9" width="4.6" height="4.6" rx="1.3"/>
     <rect x="9" y="9" width="4.6" height="4.6" rx="1.3"/>`),
 
+  /** 账号：一个人形轮廓 —— 「上游用谁的身份出力」。 */
+  account: svg(`
+    <circle cx="8" cy="5.2" r="2.6"/>
+    <path d="M3 13.2c0-2.7 2.2-4.4 5-4.4s5 1.7 5 4.4"/>`),
+
   /** 协议接入：双向箭头，一眼看出「两套协议并存」。 */
   endpoints: svg(`
     <path d="M3 5.5h9"/><path d="m9.8 3.2 2.3 2.3-2.3 2.3"/>

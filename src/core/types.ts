@@ -9,13 +9,63 @@ export interface ProxyStatus {
   available: boolean;
   port: number | null;
   hasApiKey: boolean;
+  /** 当前凭据的一句话描述（由账号推导，含到期时间）。 */
   authSource: string;
   expiresAt: string | null;
   profileArn: string | null;
   configDir: string;
   debugLogPath: string;
-  /** 当前用的是 kiro2api 自己登录（设备码）的凭据。 */
-  ownLogin: boolean;
+  /** 当前生效账号的 id（见 `AccountsView`）；没有任何账号时为 null。 */
+  activeAccountId: string | null;
+  /** 当前账号来源；只有环境变量凭据时是 `env`，都没有是 `none`。 */
+  activeAccountSource: AccountSource | 'env' | 'none';
+  /** 当前账号展示名（识别到邮箱就是邮箱）。 */
+  activeAccountLabel: string | null;
+}
+
+/** 账号来源：本应用登录 / 本地 kiro-cli 导入 / Kiro 桌面端共享缓存。 */
+export type AccountSource = 'login' | 'cli' | 'desktop';
+
+/**
+ * 一个 Kiro 账号。
+ *
+ * 三个来源的令牌格式完全一致，区别只在「归谁管」：登录与 CLI 是本应用的独立副本，
+ * 桌面端就地使用 IDE 的共享缓存。后端不向前端暴露任何令牌内容。
+ */
+export interface AccountInfo {
+  /** 稳定 id（`login:<hash>` / `cli:<hash>` / `desktop:default`），续期后不变。 */
+  id: string;
+  source: AccountSource;
+  /** 展示主标题：识别到邮箱就是邮箱，否则是「Builder ID 账号 · 3f2a」。 */
+  label: string;
+  email: string | null;
+  /** 套餐名（上游 `subscriptionTitle`），识别过才有。 */
+  plan: string | null;
+  provider: string | null;
+  authMethod: string | null;
+  region: string | null;
+  expiresAt: string | null;
+  profileArn: string | null;
+  /** 凭据目录（CLI 账号给的是导入副本目录）。 */
+  path: string;
+  /** 当前代理正在用它。 */
+  selected: boolean;
+  /** 现在就能用（令牌未过期，或持有可续期的 refreshToken）。 */
+  usable: boolean;
+  /**
+   * 能否在本应用里退出登录。只有「登录的账号」为 true —— 桌面端归 IDE、CLI 归 kiro-cli，
+   * 在这边删目录既不会让它们退出，也会被下一次扫描原样扫回来。
+   */
+  removable: boolean;
+  /** 补充说明（如「kiro-cli 中有同一账号」）。 */
+  note: string | null;
+}
+
+/** `k2a_accounts_list` 的返回。 */
+export interface AccountsView {
+  accounts: AccountInfo[];
+  /** 实际生效的账号 id（没手动选过就是自动挑出来的那个）。 */
+  activeId: string | null;
 }
 
 /** 设备码登录方式：AWS Builder ID / 企业 IAM Identity Center。 */
@@ -43,6 +93,13 @@ export interface ModelsState {
   models: string[];
   /** 公共模型 id → 上游消耗倍率（rateMultiplier，1 = 基准，0 = 不计费）。空表 = 没同步过。 */
   rates: Record<string, number>;
+  /**
+   * 曾经同步到、这次上游不再提供的模型。
+   *
+   * 存在意义是「说清楚」而不是「藏起来」：套餐或组织权限变化后模型会整批消失，
+   * 直接不显示会让人以为程序坏了；灰态展示 + 一句「当前套餐不可用」才是可核对的。
+   */
+  unavailable: string[];
 }
 
 /** `k2a_access` 的返回。 */

@@ -59,7 +59,9 @@ export const ACTION = {
   codexRestart: '重启 Codex 应用',
   setDefaults: '更新默认值',
   login: '发起登录',
-  logout: '退出登录',
+  selectAccount: '切换账号',
+  removeAccount: '移除账号',
+  identifyAccount: '识别账号',
 } as const;
 
 /**
@@ -89,7 +91,11 @@ const ACTION_SCOPE: Record<string, Scope> = {
   [ACTION.queryUsage]: 'scoped',
   // 发起登录只等上游 OIDC 两次请求，不改配置；真正换凭据发生在后台轮询成功之后
   [ACTION.login]: 'scoped',
-  [ACTION.logout]: 'global',
+  // 切换 / 移除账号会改「代理用谁」并按原端口重启代理，属于改配置
+  [ACTION.selectAccount]: 'global',
+  [ACTION.removeAccount]: 'global',
+  // 识别只读上游一次（不落配置，除身份缓存），与查询额度同类
+  [ACTION.identifyAccount]: 'scoped',
 };
 
 /** 这个动作的占用范围。 */
@@ -121,6 +127,8 @@ export function navigate(view: ViewId): void {
   // 进入三方接入分区时拉一次扫描：两份配置用户随时可能手改，每次进分区都读一遍盘
   // （纯本地小文件），看到的一定是当下的状态。
   if (view === 'thirdparty') void loadThirdPartyScans();
+  // 账号同理：用户可能刚在 IDE / 终端里登录过，进分区就重新扫一遍
+  if (view === 'accounts') void loadAccounts();
 }
 
 /**
@@ -175,6 +183,101 @@ async function loadCodexScan(): Promise<void> {
   } catch (error) {
     store.set({ error: errorText(error) });
   }
+}
+
+/**
+ * 拉取账号清单。纯本地扫描（登录目录 / 桌面端缓存 / kiro-cli 库），失败就地提示。
+ *
+ * 拉完顺手做一轮「补身份」：缓存里没有邮箱的账号逐个问一次上游（见 `identifyMissing`）。
+ * 这是唯一一处会联网的账号操作，因此刻意放在清单落地之后 —— 界面先有东西可看，
+ * 名字再一个个补上，而不是白屏等网络。
+ */
+async function loadAccounts(): Promise<void> {
+  try {
+    store.set({ accounts: await backend.accounts() });
+    void identifyMissing();
+  } catch (error) {
+    store.set({ error: errorText(error) });
+  }
+}
+
+/** 本会话里已经试过识别的账号。失败不重试：进一次账号页就等一轮 30 秒太贵。 */
+const identified = new Set<string>();
+
+/**
+ * 给还没有邮箱的账号补一次身份（串行，避免同时打多个 getUsageLimits）。
+ *
+ * 只对「现在可用」的账号做：令牌都过期的账号问上游必然失败，白白等满 30 秒超时。
+ * 单个失败只影响那一行（继续显示「Builder ID 账号 · 3f2a」占位），不弹 toast ——
+ * 用户没有发起这个动作，弹一串失败提示只会让他以为账号坏了。
+ */
+let identifying = false;
+
+async function identifyMissing(): Promise<void> {
+  if (identifying) return;
+  identifying = true;
+  try {
+    await runIdentifyPass();
+  } finally {
+    identifying = false;
+  }
+}
+
+async function runIdentifyPass(): Promise<void> {
+  for (;;) {
+    const state = store.get();
+    if (state.view !== 'accounts') return;
+    const account = state.accounts?.accounts.find(
+      (item) => item.usable && !item.email && !identified.has(item.id),
+    );
+    if (!account) return;
+    identified.add(account.id);
+    // 只问「访问令牌仍然有效」的账号：过期但可续期的账号，getUsageLimits 会先续期，
+    // 而续期会轮换 refreshToken —— 用户只是打开账号页看一眼，不该把 CLI / IDE 那边
+    // 的登录顶掉。这类账号等用户真正选中它（或重新登录）之后再识别。
+    const fresh =
+      account.expiresAt !== null && new Date(account.expiresAt).getTime() - Date.now() > 60_000;
+    if (!fresh) continue;
+    try {
+      const info = await backend.identifyAccount(account.id);
+      const current = store.get().accounts;
+      if (!current) return;
+      store.set({
+        accounts: {
+          ...current,
+          accounts: current.accounts.map((item) => (item.id === info.id ? info : item)),
+        },
+      });
+    } catch {
+      // 静默：这一行继续用占位名，用户在需要时可以点「刷新」重来
+    }
+  }
+}
+
+/**
+ * 切换账号。后端会按原端口重启代理并清掉旧账号的模型/额度缓存，
+ * 所以收尾的整体同步正好把「空清单 + 新 token」拉回来。
+ */
+export async function selectAccount(id: string): Promise<void> {
+  await run(ACTION.selectAccount, async () => {
+    // 额度必须显式清空：`refresh()` 里的 `usage ?? 缓存` 只用于「首屏填空白」，
+    // 它会保留内存里的旧值 —— 换账号后那已经是上一个账号的数字了。
+    store.set({ status: await backend.selectAccount(id), usage: null });
+    await loadAccounts();
+    const label =
+      store.get().accounts?.accounts.find((account) => account.id === id)?.label ?? '新账号';
+    feedback.toast(`已切换到 ${label}`);
+  });
+}
+
+/** 移除账号（登录账号 / CLI 副本）。桌面端由 IDE 管理，后端会拒绝并给出原因。 */
+export async function removeAccount(id: string): Promise<void> {
+  await run(ACTION.removeAccount, async () => {
+    // 删掉的若正是当前账号，后端会清缓存并换下一条可用账号：额度同样不能留旧值
+    store.set({ status: await backend.removeAccount(id), usage: null });
+    await loadAccounts();
+    feedback.toast('已移除账号');
+  });
 }
 
 /** 扫描结果里已接入的模型 id（去重）。扫描还没回来时是空集。 */
@@ -258,6 +361,8 @@ export async function refresh(): Promise<void> {
     });
     // 正在看「三方接入」分区时，把两份扫描也带上：它们同样只读本地盘。
     if (store.get().view === 'thirdparty') await loadThirdPartyScans();
+    // 账号页同理：扫描结果里带「哪个在用」，状态一变选中标记就可能过期
+    if (store.get().view === 'accounts') await loadAccounts();
   } catch (error) {
     store.set({ error: errorText(error) });
   }
@@ -822,12 +927,17 @@ export async function dispatch(action: string, dataset: DOMStringMap): Promise<v
       }
       return;
 
-    case 'logout':
-      await run(ACTION.logout, async () => {
-        store.set({ status: await backend.logout() });
-        feedback.toast('已退出 Kiro2API 登录');
-      });
+    case 'account-select': {
+      const id = dataset.id;
+      if (id) await selectAccount(id);
       return;
+    }
+
+    case 'account-remove': {
+      const id = dataset.id;
+      if (id) await removeAccount(id);
+      return;
+    }
 
     case 'open-modal': {
       const modal = dataset.modal as ModalId | undefined;
@@ -883,7 +993,8 @@ export async function bindBackendEvents(): Promise<void> {
   }
   // 设备码登录的结果（后台轮询线程发出）
   await listen<ProxyStatus>('login://done', (event) => {
-    store.set({ status: event.payload, loginSession: null, modal: null, error: null });
+    // 新登录 = 换了账号，额度也要跟着清空（模型由后端清缓存后重新推送）
+    store.set({ status: event.payload, loginSession: null, modal: null, error: null, usage: null });
     feedback.toast('登录成功，凭据已保存');
     void refresh();
   });

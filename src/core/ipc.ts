@@ -7,6 +7,8 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import type {
+  AccountInfo,
+  AccountsView,
   CodexImportSummary,
   CodexRemoveResult,
   CodexRestartResult,
@@ -28,6 +30,11 @@ import type {
 export const backend = {
   // ── 读取 ──────────────────────────────────────────────────────────────
   status: () => invoke<ProxyStatus>('k2a_status'),
+  /**
+   * 账号清单（纯本地扫描：登录目录 / 桌面端共享缓存 / kiro-cli 凭据库）。
+   * 不含网络请求，进「账号」分区即可直接画出来。
+   */
+  accounts: () => invoke<AccountsView>('k2a_accounts_list'),
   models: () => invoke<ModelsState>('k2a_models'),
   access: () => invoke<ProxyAccess>('k2a_access'),
   usage: () => invoke<UsageInfo>('k2a_usage'),
@@ -44,6 +51,17 @@ export const backend = {
   stop: () => invoke<ProxyStatus>('k2a_stop'),
   refreshToken: () => invoke<ProxyStatus>('k2a_refresh_token'),
 
+  // ── 账号管理 ──────────────────────────────────────────────────────────
+  /**
+   * 切换账号：落盘选择 → 清掉旧账号的模型/额度缓存 → 按原端口重启代理。
+   * 返回切换后的状态；账号清单由调用方重新拉取（选中标记与可用性都可能变了）。
+   */
+  selectAccount: (id: string) => invoke<ProxyStatus>('k2a_account_select', { id }),
+  /** 移除账号（登录账号 / CLI 副本）。桌面端由 IDE 管理，后端会拒绝。 */
+  removeAccount: (id: string) => invoke<ProxyStatus>('k2a_account_remove', { id }),
+  /** 联网识别一个账号的邮箱与套餐（getUsageLimits），结果写进后端身份缓存。 */
+  identifyAccount: (id: string) => invoke<AccountInfo>('k2a_account_identify', { id }),
+
   // ── 设备码登录（凭据写进 kiro2api 自有目录，不碰 Kiro IDE / CLI 的登录）────
   /** 发起登录并打开浏览器；结果走事件 `login://done` / `login://failed`。 */
   loginStart: (method: LoginMethod, startUrl?: string, region?: string) =>
@@ -54,7 +72,6 @@ export const backend = {
     }),
   loginCancel: () => invoke<void>('k2a_login_cancel'),
   loginReopen: () => invoke<void>('k2a_login_reopen'),
-  logout: () => invoke<ProxyStatus>('k2a_logout'),
 
   // ── 模型 ──────────────────────────────────────────────────────────────
   // 只读的账户模型清单，同步走上游控制面，**不需要**代理在运行

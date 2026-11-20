@@ -196,26 +196,26 @@ export const overviewView: ViewSpec = {
 
     // 凭据这一格有两种完全不同的处境，动作也不同 —— 所以按钮跟着处境走：
     //
-    // * 凭据可用 → 「刷新凭据」，真去上游 OIDC 换一次 token（它等网络，但不锁页面）。
-    // * 凭据不可用 → 「重新检测」，只重读本地。此时「刷新凭据」必然失败（没有 refreshToken
-    //   可刷），摆在那里只会把人引到一条死路上；而人真正会做的事是去窗口外面登录一次，
-    //   再回来问「好了没」—— 这正是「重新检测」回答的问题。
-    // 「登录」打开设备码登录弹窗（data-modal 让弹窗关闭时焦点回到这颗按钮）；
-    // 已经是 Kiro2API 自己的登录时换成「退出登录」，回到读取 IDE / CLI 的凭据。
-    const loginButton = status?.ownLogin
-      ? `<button class="small" data-action="logout"${actionAttrs(state, ACTION.logout)}>退出登录</button>`
-      : `<button class="small" data-action="open-modal" data-modal="login">登录</button>`;
+    // * 凭据可用 → 「账号管理」去切换 / 移除账号，「刷新凭据」真去上游 OIDC 换 token
+    //   （等网络，但不锁页面）。登录 / 退出登录都搬到了账号分区：同一件事有两个入口，
+    //   迟早出现「在这边退出了，那边还显示在登录」。
+    // * 凭据不可用 → 「登录」打开设备码弹窗，「重新检测」只重读本地。此时「刷新凭据」
+    //   必然失败（没有 refreshToken 可刷），摆在那里只会把人引到一条死路上；
+    //   而人真正会做的事是去窗口外面登录一次，再回来问「好了没」。
     const credentialAction = !status
       ? ''
       : available
-        ? `${loginButton}<button class="small" data-action="refresh-token"
+        ? `<button class="small" data-action="goto" data-view="accounts">账号管理</button>` +
+          `<button class="small" data-action="refresh-token"
                    ${actionAttrs(state, ACTION.refreshToken)}>${refreshText}</button>`
-        : `${loginButton}<button class="small" data-action="refresh">重新检测</button>`;
+        : `<button class="small" data-action="open-modal" data-modal="login">登录</button>` +
+          `<button class="small" data-action="refresh">重新检测</button>`;
 
     const credentialBody = !status
       ? note('正在读取凭据状态…')
       : available
         ? kvList([
+            kv('账号', esc(status.activeAccountLabel ?? '—')),
             kv('来源', esc(status.authSource)),
             kv(
               '到期',
@@ -225,7 +225,7 @@ export const overviewView: ViewSpec = {
             ),
           ])
         : note(
-            '未找到凭据。点右上角「登录」用 Builder ID / IAM Identity Center 直接登录；' +
+            '未找到账号。点上方「登录」用 Builder ID / IAM Identity Center 直接登录；' +
               '也可以先登录 Kiro IDE 或执行 <code>kiro-cli login</code>，完成后点「重新检测」。',
             'warn',
           );

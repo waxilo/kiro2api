@@ -781,10 +781,21 @@ fn respond_body_error(request: Request, error: BodyReadError) {
 }
 
 fn json_response(request: Request, status: u16, body: &Value) {
+    json_response_with(request, status, body, Vec::new());
+}
+
+/// 带额外响应头的 JSON 响应。
+///
+/// 目前唯一的用途是「模型被替换」时把实际模型回给客户端（见 [`ModelChoice::headers`]）。
+/// 单独开一个入参而不是让每个调用点自己拼 Response：CORS 头与 Content-Type 只该有一处。
+fn json_response_with(request: Request, status: u16, body: &Value, extra: Vec<Header>) {
     let data = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
     let mut response = Response::from_string(data)
         .with_status_code(StatusCode(status))
         .with_header(Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap());
+    for header in extra {
+        response = response.with_header(header);
+    }
     for header in cors_headers_for(&request) {
         response = response.with_header(header);
     }
@@ -2248,6 +2259,7 @@ fn respond_sse_stream_fetch(
     entry: Option<Arc<DedupEntry>>,
     dedup: Arc<DedupStore>,
     active_requests: Arc<AtomicUsize>,
+    model_headers: Vec<Header>,
 ) {
     // 只有真正会打 GenerateAssistantResponse 的 leader 才占用上游并发许可。
     let Some(permit) = try_acquire_request(&active_requests, MAX_CONCURRENT_REQUESTS) else {
@@ -2400,6 +2412,7 @@ fn respond_sse_stream_fetch(
         Header::from_bytes("Connection", "keep-alive").unwrap(),
         Header::from_bytes("X-Accel-Buffering", "no").unwrap(),
     ];
+    headers.extend(model_headers);
     headers.extend(cors_headers_for(&request));
     let response = Response::new(StatusCode(200), headers, reader, None, None)
         .with_chunked_threshold(0);
@@ -2450,6 +2463,7 @@ fn respond_openai_sse_stream_fetch(
     entry: Option<Arc<DedupEntry>>,
     dedup: Arc<DedupStore>,
     active_requests: Arc<AtomicUsize>,
+    model_headers: Vec<Header>,
 ) {
     let Some(permit) = try_acquire_request(&active_requests, MAX_CONCURRENT_REQUESTS) else {
         if let Some(entry) = &entry {
@@ -2609,6 +2623,7 @@ fn respond_openai_sse_stream_fetch(
         Header::from_bytes("Connection", "keep-alive").unwrap(),
         Header::from_bytes("X-Accel-Buffering", "no").unwrap(),
     ];
+    headers.extend(model_headers);
     headers.extend(cors_headers_for(&request));
     let response = Response::new(StatusCode(200), headers, reader, None, None)
         .with_chunked_threshold(0);
@@ -2852,27 +2867,75 @@ fn resolve_profile_arn(auth: &Auth) -> Result<Option<String>, String> {
     auth.discover_profile_arn()
 }
 
+/// 一次请求最终发往上游的模型，以及它是否被替换过。
+///
+/// 为什么要把「请求的」和「实际用的」一起带着走：账户套餐里没有你点的模型时，
+/// 硬发会让整条对话以 `INVALID_MODEL_ID` 502；替换掉又能救回来，但**不能让替换悄悄发生** ——
+/// 用户以为在用 Claude、实际在花另一个模型（倍率可能翻几倍）的额度，账单和输出风格都对不上。
+/// 所以调用方拿到它之后必须落一条日志，并在响应头里告诉客户端实际用的是哪个模型。
+struct ModelChoice {
+    /// 真正发往上游的模型 ID。
+    kiro_model: String,
+    /// 调用方请求的模型（规范化后的公共 id）。
+    requested: String,
+}
+
+impl ModelChoice {
+    fn downgraded(&self) -> bool {
+        self.requested != self.kiro_model
+    }
+
+    /// 降级时给出响应头；未降级时为空（正常请求不该多出无意义的头）。
+    ///
+    /// 值来自模型名，理论上都是 ASCII；真遇到不合法的字节就跳过而不是 panic ——
+    /// 一个诊断用的响应头不值得让整条请求挂掉。
+    fn headers(&self) -> Vec<Header> {
+        if !self.downgraded() {
+            return Vec::new();
+        }
+        let pairs = [
+            ("X-Kiro-Actual-Model", self.kiro_model.as_str()),
+            ("X-Kiro-Requested-Model", self.requested.as_str()),
+        ];
+        pairs
+            .iter()
+            .filter_map(|(name, value)| Header::from_bytes(*name, *value).ok())
+            .collect()
+    }
+}
+
 /// 解析出最终发往 Kiro 的模型 ID。
 ///
 /// 账户套餐未必包含 Claude 模型（例如仅有 GPT/DeepSeek/GLM），
 /// 若请求的模型不在 `ListAvailableModels` 返回的可用列表里，
 /// 就降级到账户实际可用的默认模型（优先 Claude，否则取第一个），
 /// 避免整条对话因「Invalid model ID」直接 502。
-fn resolve_kiro_model(auth: &Auth, requested: &str, default_model: &str) -> String {
+///
+/// 降级本身会立刻记进诊断日志（`[model-downgrade]`）：这条日志是排查
+/// 「客户端点的是 Claude、回来的却像 GPT」时唯一的地面真值。
+fn resolve_kiro_model(auth: &Auth, requested: &str, default_model: &str) -> ModelChoice {
     let base = normalize_kiro_model(
         if requested.is_empty() { None } else { Some(requested) },
         default_model,
     );
-    match auth.list_available_models() {
+    let kiro_model = match auth.list_available_models() {
         Ok(models) if !models.is_empty() => {
             if models.iter().any(|m| m == &base) {
-                base
+                base.clone()
             } else {
-                auth.pick_available_default_model().unwrap_or(base)
+                auth.pick_available_default_model().unwrap_or_else(|| base.clone())
             }
         }
-        _ => base,
+        _ => base.clone(),
+    };
+    let choice = ModelChoice { kiro_model, requested: base };
+    if choice.downgraded() {
+        diag_log(&format!(
+            "[model-downgrade] requested={} actual={}",
+            choice.requested, choice.kiro_model
+        ));
     }
+    choice
 }
 
 // ============ 路由实现 ============
@@ -3028,7 +3091,9 @@ fn handle_messages(
     }
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let kiro_model = resolve_kiro_model(auth, model, &config.default_model);
+    let choice = resolve_kiro_model(auth, model, &config.default_model);
+    let kiro_model = choice.kiro_model.clone();
+    let model_headers = choice.headers();
     let profile_arn = match resolve_profile_arn(auth) {
         Ok(arn) => arn,
         Err(e) => {
@@ -3076,6 +3141,7 @@ fn handle_messages(
             dedup_entry,
             dedup,
             active_requests,
+            model_headers,
         );
     }
 
@@ -3136,7 +3202,7 @@ fn handle_messages(
         &recovery_spec,
     );
     health.record_success();
-    json_response(request, 200, &response);
+    json_response_with(request, 200, &response, model_headers);
 }
 
 // ============ OpenAI 兼容入口 ============
@@ -3276,7 +3342,9 @@ fn handle_openai_chat_completions(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let kiro_model = resolve_kiro_model(auth, requested_model, &config.default_model);
+    let choice = resolve_kiro_model(auth, requested_model, &config.default_model);
+    let kiro_model = choice.kiro_model.clone();
+    let model_headers = choice.headers();
     let profile_arn = match resolve_profile_arn(auth) {
         Ok(arn) => arn,
         Err(e) => {
@@ -3329,6 +3397,7 @@ fn handle_openai_chat_completions(
             dedup_entry,
             dedup,
             active_requests,
+            model_headers,
         );
     }
 
@@ -3412,7 +3481,7 @@ fn handle_openai_chat_completions(
         estimate_tokens(&collected.text),
     );
     health.record_success();
-    json_response(request, 200, &response);
+    json_response_with(request, 200, &response, model_headers);
 }
 
 /// `POST /openai/v1/responses` —— Responses API 兼容对话（Codex CLI 的入口）。
@@ -3485,7 +3554,9 @@ fn handle_openai_responses(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let kiro_model = resolve_kiro_model(auth, requested_model, &config.default_model);
+    let choice = resolve_kiro_model(auth, requested_model, &config.default_model);
+    let kiro_model = choice.kiro_model.clone();
+    let model_headers = choice.headers();
     let profile_arn = match resolve_profile_arn(auth) {
         Ok(arn) => arn,
         Err(e) => {
@@ -3538,6 +3609,7 @@ fn handle_openai_responses(
             dedup_entry,
             dedup,
             active_requests,
+            model_headers,
         );
     }
 
@@ -3618,7 +3690,7 @@ fn handle_openai_responses(
         estimate_tokens(&collected.text),
     );
     health.record_success();
-    json_response(request, 200, &response);
+    json_response_with(request, 200, &response, model_headers);
 }
 
 fn respond_openai_body_error(request: Request, error: BodyReadError) {
@@ -3650,6 +3722,42 @@ fn now_unix_secs() -> i64 {
 mod tests {
     use super::*;
     use crate::kiro::eventstream::build_frame;
+
+    // ── 模型降级：客户端必须能看出「你点的模型没被用上」 ──
+
+    #[test]
+    fn model_choice_reports_nothing_when_the_model_is_available() {
+        let choice = ModelChoice {
+            kiro_model: "claude-opus-5".to_string(),
+            requested: "claude-opus-5".to_string(),
+        };
+        assert!(!choice.downgraded());
+        // 正常请求不该多出无意义的头：客户端与抓包都只能看到噪音
+        assert!(choice.headers().is_empty());
+    }
+
+    #[test]
+    fn model_choice_exposes_actual_model_when_downgraded() {
+        let choice = ModelChoice {
+            kiro_model: "gpt-5.6-sol".to_string(),
+            requested: "claude-opus-5".to_string(),
+        };
+        assert!(choice.downgraded());
+        let headers = choice.headers();
+        // `HeaderField::equiv` 只吃 `&'static str`，闭包签名跟着它走
+        let value = |name: &'static str| {
+            headers
+                .iter()
+                .find(|h| h.field.equiv(name))
+                .map(|h| h.value.as_str().to_string())
+        };
+        assert_eq!(value("x-kiro-actual-model").as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            value("x-kiro-requested-model").as_deref(),
+            Some("claude-opus-5")
+        );
+        assert_eq!(headers.len(), 2);
+    }
 
     /// 把一组上游事件编成 event stream 字节后喂给真实的增量出参管道。
     ///

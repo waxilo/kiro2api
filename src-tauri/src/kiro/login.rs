@@ -5,10 +5,14 @@
 //! 2. `POST /device_authorization` 拿用户验证码与验证页地址，打开浏览器让用户确认；
 //! 3. 后台按 `interval` 轮询 `POST /token`（device_code 授权），用户确认后拿到令牌。
 //!
-//! 结果写进 [`crate::paths::own_credential_dir`]，文件格式与 `~/.aws/sso/cache` 一致：
+//! 结果写进 `数据目录/accounts/login/<clientId 哈希>/`，文件格式与 `~/.aws/sso/cache` 一致：
 //! 令牌文件 `kiro-auth-token.json`（`authMethod = IdC` + `clientIdHash`）与注册文件
-//! `<clientIdHash>.json`。之后的读取、到期刷新（`Auth::refresh_idc`）、额度与模型都不用改。
-//! 不写共享缓存：Kiro IDE 和这里各自刷新同一个 refreshToken 会把对方顶掉。
+//! `<clientIdHash>.json`。之后由 `crate::accounts` 统一扫描、选中与切换，
+//! `Auth` 的读取、到期刷新（`Auth::refresh_idc`）、额度与模型都不用改。
+//!
+//! 每次登录生成一个新目录（按 clientId 哈希命名），所以应用里可以并存多个账号；
+//! 同一个 client 重复登录只会覆盖它自己那一份。不写共享缓存：Kiro IDE 与这里
+//! 各自刷新同一个 refreshToken 会把对方顶掉。
 
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +28,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::paths::own_credential_dir;
+use crate::accounts;
 
 /// Builder ID 的固定入口。
 const BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
@@ -284,10 +288,9 @@ fn store_credentials(
         token["profileArn"] = Value::String(BUILDER_ID_PROFILE_ARN.to_string());
     }
 
-    let dir = own_credential_dir();
+    // 一个 client 一个目录：同一个 client 再登录就覆盖它自己，不同 client 各自并存
+    let dir = accounts::login_dir(&hash);
     fs::create_dir_all(&dir).map_err(|e| format!("创建凭据目录失败：{e}"))?;
-    // 换账号登录时，上一份注册文件就没人引用了，顺手清掉
-    remove_registration_of_current_token();
     super::cli_bridge::write_secret_file(
         &dir.join(format!("{hash}.json")),
         &json!({
@@ -296,19 +299,12 @@ fn store_credentials(
             "expiresAt": registration.expires_at,
         }),
     )?;
-    super::cli_bridge::write_secret_file(&dir.join(TOKEN_FILE), &token)
-}
-
-/// 删掉当前自有令牌引用的注册文件（只动自有凭据目录）。
-fn remove_registration_of_current_token() {
-    let dir = own_credential_dir();
-    let hash = fs::read_to_string(dir.join(TOKEN_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|token| token.get("clientIdHash").and_then(Value::as_str).map(str::to_string));
-    if let Some(hash) = hash.filter(|h| h.chars().all(|c| c.is_ascii_hexdigit())) {
-        let _ = fs::remove_file(dir.join(format!("{hash}.json")));
-    }
+    super::cli_bridge::write_secret_file(&dir.join(TOKEN_FILE), &token)?;
+    accounts::record_login(&dir)?;
+    // 新登录默认就是「现在要用这个」：否则用户刚登完，代理还在用上一个账号，
+    // 得再去账号页点一次，多一步且容易漏。
+    accounts::select(&format!("login:{hash}"))?;
+    Ok(())
 }
 
 fn resolve_target(method: &str, start_url: Option<String>, region: Option<String>) -> Result<LoginTarget, String> {
@@ -340,22 +336,9 @@ fn resolve_target(method: &str, start_url: Option<String>, region: Option<String
     }
 }
 
-/// 凭据目录变了（登录 / 退出），正在运行的代理要换成新的 Auth：按原端口重启一次。
-fn restart_proxy_if_running(app: &AppHandle) {
-    let state = app.state::<super::service::KiroProxyState>();
-    let state = (*state).clone();
-    let Ok(_op) = state.op_lock.lock() else { return };
-    if !super::service::proxy_running(&state) {
-        return;
-    }
-    let port = state.port.lock().ok().and_then(|p| *p);
-    if let Err(e) = super::service::start_proxy(&state, port) {
-        crate::diag::log(&format!("[login] 凭据切换后重启代理失败：{e}"));
-    }
-}
-
 fn finish_success(app: &AppHandle) {
-    restart_proxy_if_running(app);
+    // 登录成功后账号已由 `store_credentials` 设为选中，代理要换成新目录的 Auth
+    super::service::restart_proxy_if_running(app);
     super::service::spawn_startup_refresh();
     let state = app.state::<super::service::KiroProxyState>();
     let status = super::service::build_status(&state);
@@ -462,24 +445,6 @@ pub fn k2a_login_reopen(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("打开浏览器失败：{e}"))
-}
-
-/// 退出自有登录：只删自有凭据目录里的令牌与注册文件，不碰 Kiro IDE / CLI 的凭据。
-#[tauri::command]
-pub async fn k2a_logout(app: AppHandle) -> Result<super::service::ProxyStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        remove_registration_of_current_token();
-        let token = own_credential_dir().join(TOKEN_FILE);
-        if token.exists() {
-            fs::remove_file(&token).map_err(|e| format!("删除凭据失败：{e}"))?;
-        }
-        crate::diag::log("[login] 已退出自有登录");
-        restart_proxy_if_running(&app);
-        let state = app.state::<super::service::KiroProxyState>();
-        Ok(super::service::build_status(&state))
-    })
-    .await
-    .map_err(|e| format!("退出登录任务失败：{e}"))?
 }
 
 #[cfg(test)]

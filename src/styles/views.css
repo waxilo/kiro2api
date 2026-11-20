@@ -765,6 +765,36 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
   font-size: var(--t-caption);
 }
 
+/* 「上次同步到、这次上游不再提供」的模型：仍然占一格、仍然显示名字，但明确不可点。
+   不设 opacity —— 整块半透明会让同一答案里的两段文字深浅不一，比灰字更像渲染 bug。
+   虚线描边 + 灰字 + 一个「不可用」小标签，语义靠这三样说，不靠若隐若现。 */
+.model-card.is-unavailable {
+  border-style: dashed;
+  background: transparent;
+  color: var(--ink-subtle);
+  cursor: default;
+}
+
+.model-card-tag {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--ink-subtle);
+  font-family: var(--font-sans);
+  font-size: var(--t-caption);
+  line-height: 18px;
+}
+
+/* 灰卡不可点，悬停就不能摆出「可点」的样子。
+   特异性 (0,5,0) 压过 `.model-card-list .model-card:hover:not(:disabled)…` 的 (0,4,1)，
+   否则鼠标一上去它照样翻白 + 起投影，等于骗人点。 */
+.model-card-list .model-card.is-unavailable:hover:not(:disabled) {
+  background: transparent;
+  border-color: var(--hairline);
+  box-shadow: none;
+}
+
 .model-card .pill {
   flex: none;
 }
@@ -854,6 +884,133 @@ button.filter-clear:hover:not(:disabled):not([aria-disabled='true']) {
 /* 进度条与它下面那行说明是一组，间距比 stage 的 10px 紧一档 */
 .update-stage .progress-caption {
   margin-top: -4px;
+}
+
+/* ── 账号页 ─────────────────────────────────────────────────────────── */
+
+/* 一行账号＝一块浅灰子块，与模型卡 / 目录块同一档；
+   选中翻成主色浅底，内描边用 box-shadow 画 —— 不占布局，切换选中时
+   整行高度与宽度都不动（用户明确要求「操作不改变卡片尺寸」）。 */
+.account-list {
+  display: grid;
+  gap: var(--s-xs);
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+  padding: 11px 13px;
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+}
+
+.account-row.is-selected {
+  background: var(--primary-soft);
+  box-shadow: inset 0 0 0 1px var(--primary-ring);
+}
+
+/* 不可用但没选中的账号：只把名字压淡一档。
+   整行做灰会把「为什么不可用」也一起藏起来，而那正是用户要看的东西。 */
+.account-row.is-stale .account-label {
+  color: var(--ink-muted);
+}
+
+.account-mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--surface-1);
+  color: var(--ink-tertiary);
+}
+
+.account-row.is-selected .account-mark {
+  color: var(--primary);
+}
+
+.account-text {
+  display: grid;
+  flex: 1;
+  gap: 3px;
+  min-width: 0;
+}
+
+/* 固定行高：选中时多一颗「使用中」胶囊，它比文字行高（会撑高整行）。
+   不锁住这一行的话，切换选中会让每行上下各长/缩 ~2px —— 正是用户点名的「操作改变尺寸」。
+   胶囊本身也在这里收一档，保证它一定装得进 22px。 */
+.account-name {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  min-width: 0;
+  height: 22px;
+}
+
+.account-name .pill {
+  height: 18px;
+  padding: 0 8px;
+  line-height: 16px;
+}
+
+.account-label {
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  font-size: var(--t-caption);
+  color: var(--ink-subtle);
+}
+
+.account-meta .dot {
+  color: var(--ink-tertiary);
+}
+
+.account-note {
+  font-size: var(--t-caption);
+  color: var(--ink-subtle);
+}
+
+/* 工具区宽度锁死：选中行只剩「退出登录」、未选中行有「使用此账号」，
+   按内容撑宽会让左边的元信息换行数跟着变 —— 同一行在切换前后就差一截高度。
+   右侧对齐，空出来的那截留白，视觉上仍然是「按钮靠右」。 */
+.account-tools {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-xs);
+  min-width: 168px;
+}
+
+/* 分组卡底部的说明：一句话讲清「这组账号归谁管」，比每行重复一遍省地方 */
+.account-foot {
+  margin: 12px 0 0;
+  font-size: var(--t-caption);
+  line-height: 1.6;
+  color: var(--ink-subtle);
+}
+
+/* 窄窗口：按钮掉到第二行，别把账号名挤成省略号 */
+@media (max-width: 720px) {
+  .account-row {
+    flex-wrap: wrap;
+  }
+
+  .account-tools {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }
 
 /* ── 窄窗口：所有栅格落回单列 ─────────────────────────────────────── */

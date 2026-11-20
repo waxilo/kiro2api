@@ -1,168 +1,150 @@
-//! kiro-cli 凭据桥接：新版 kiro-cli（>= 2.31）不再写 Kiro IDE 的
+//! kiro-cli 凭据读取：新版 kiro-cli（>= 2.31）不再写 Kiro IDE 的
 //! `~/.aws/sso/cache/kiro-auth-token.json`，而是把凭据存进自己的密钥库
 //! （`data.sqlite3` 的 `auth_kv` 表，位置按平台不同 —— macOS 在
 //! `~/Library/Application Support/kiro-cli/`，Windows 在 `%LOCALAPPDATA%\Kiro-Cli\`，
 //! 见 [`crate::paths::kiro_cli_db_paths`]；另镜像一份到钥匙串）。
-//! 本模块在规范凭据文件缺失时，从该库只读取出令牌与 device registration，
-//! 按 IDE 的文件格式落盘，之后 [`super::auth::Auth`] 的读取与 IdC/social
-//! 刷新链路原样可用。
 //!
-//! 只在规范文件缺失时触发：本机可能同时存在 IDE 与 CLI 两套不同登录
-//! （client_id 不同），桥接绝不覆盖已有的 IDE 凭据。
+//! 本模块只做两件事：
+//! 1. [`scan`]：以只读方式打开库，把令牌与 device registration 翻译成 IDE 的文件格式，
+//!    供账号列表展示与判断可用性；
+//! 2. [`import`]：把某一条记录写进一个**独立目录**（`数据目录/accounts/cli/<hash>/`），
+//!    之后 [`super::auth::Auth`] 的读取与 IdC/social 刷新链路原样可用。
+//!
+//! 为什么是「导入副本」而不是「就地接管」：
+//! - CLI 的库是它自己的资产，写回去要同时维护 sqlite 与钥匙串镜像，风险远大于收益；
+//! - 以前的做法是把 CLI 凭据桥接进 `~/.aws/sso/cache/kiro-auth-token.json`，
+//!   那等于覆盖 IDE 的登录 —— 两边各自刷新同一个 refreshToken 会互相顶掉。
+//! 副本的代价是：本应用续期后，CLI 侧那份 refreshToken 会失效、需要重新登录；
+//! 所以界面在 CLI 分组上如实写着这件事。CLI 一旦重新登录（库 mtime 变化），
+//! 账号模块会重新导入一次，副本自动跟上。
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use rusqlite::OpenFlags;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::paths::{kiro_cli_db_paths, kiro_sso_cache_dir};
+use crate::paths::kiro_cli_db_paths;
 
-use super::auth::parse_expiry_ms;
-
-/// 令牌记录键：IdC 与 social/外部 IdP 两种登录各存一行
+/// 令牌记录键：IdC 与 social/外部 IdP 两种登录各存一行。
+///
+/// CLI 同时只保留一种登录方式（后登录的覆盖前一种），所以按这个顺序取**第一条**
+/// 就是它当前在用的账号；两条都列出来只会把同一个账号显示两次。
 const TOKEN_KEYS: [&str; 2] = ["kirocli:odic:token", "kirocli:external-idp:token"];
 const REGISTRATION_KEY: &str = "kirocli:odic:device-registration";
 
-/// 距过期不足这个秒数就认为「需要续期」，不必为它跳过桥接。
-const USABLE_SKEW_SECS: i64 = 120;
-
-/// 规范凭据文件是否可用：缺失、或**存在但已经怎么都用不了**时，先尝试桥接一次。
-/// 供 `has_credential_file` 等状态判定与启动路径调用，需容忍高频调用。
-///
-/// ⚠️ 这里不能只判断「文件存在」。IDE 留下的过期令牌会一直躺在
-/// `~/.aws/sso/cache/kiro-auth-token.json`，只看存在性就等于永久跳过桥接：
-/// 用户明明 `kiro-cli` 已登录，应用却每次都拿那份过期文件去续期，报
-/// `SSO client registration expired` 并要求重新登录 —— 这正是 Windows 上的
-/// 实际表现（kiro-cli v3 已不再写这份文件）。
-pub(crate) fn ensure_bridged() -> bool {
-    let canonical = kiro_sso_cache_dir().join("kiro-auth-token.json");
-    if credential_usable(&canonical) {
-        return true;
-    }
-    try_bridge(&canonical);
-    credential_usable(&canonical)
+/// 从 CLI 凭据库里读到的一条账号记录（已翻译成 IDE 的文件格式）。
+#[derive(Debug, Clone)]
+pub(crate) struct CliCredential {
+    pub db: PathBuf,
+    /// 来源键（`kirocli:odic:token` / `kirocli:external-idp:token`），用于诊断。
+    pub key: String,
+    /// 库文件的 mtime（Unix 毫秒）。副本据此判断「CLI 是否重新登录过」。
+    pub db_mtime_ms: i64,
+    /// IDE 格式令牌（含 `authMethod` / `clientIdHash`）。
+    pub token: Value,
+    /// 注册文件（文件名, 内容）；social 登录没有这一项。
+    pub registration: Option<(String, Value)>,
 }
 
-/// 现有凭据能不能用：访问令牌还没过期，**或者**过期了但续期链路完整
-/// （有 refreshToken + 对应 client 注册文件且其有效期未过）。
-///
-/// 第二种情形必须算「可用」，否则会把 IDE 那套仍可续期的登录当成废的覆盖掉。
-fn credential_usable(canonical: &Path) -> bool {
-    let Ok(raw) = fs::read_to_string(canonical) else {
-        return false;
-    };
-    let Ok(token) = serde_json::from_str::<Value>(&raw) else {
-        return false;
-    };
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let fresh = token
-        .get("expiresAt")
-        .and_then(Value::as_str)
-        .and_then(parse_expiry_ms)
-        .is_some_and(|ms| ms > now_ms + USABLE_SKEW_SECS * 1000);
-    if fresh {
-        return true;
-    }
-    let has_refresh = token
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .is_some_and(|v| !v.is_empty());
-    if !has_refresh {
-        return false;
-    }
-    let Some(hash) = token.get("clientIdHash").and_then(Value::as_str) else {
-        return false;
-    };
-    let Ok(raw) = fs::read_to_string(kiro_sso_cache_dir().join(format!("{hash}.json"))) else {
-        return false;
-    };
-    let Ok(registration) = serde_json::from_str::<Value>(&raw) else {
-        return false;
-    };
-    registration
-        .get("expiresAt")
-        .and_then(Value::as_str)
-        .and_then(parse_expiry_ms)
-        .is_some_and(|ms| ms > now_ms)
-}
-
-/// 逐个候选路径尝试桥接：kiro-cli 的凭据库位置按平台不同（见
-/// `paths::kiro_cli_db_paths`），找到一个能用的就停。
-fn try_bridge(canonical: &Path) {
+/// 扫描本机所有候选凭据库，返回其中能读出的账号（通常 0 或 1 条）。
+pub(crate) fn scan() -> Vec<CliCredential> {
+    let mut found = Vec::new();
     for db in kiro_cli_db_paths() {
-        if !db.is_file() || !should_attempt(&db) {
-            continue;
-        }
-        match bridge(canonical, &db) {
-            Ok(()) => return,
-            Err(e) => crate::diag::log(&format!(
-                "[cli-bridge] {} 桥接失败：{e}",
+        match read_one(&db, None) {
+            Ok(Some(cred)) => found.push(cred),
+            Ok(None) => {}
+            Err(error) => crate::diag::log(&format!(
+                "[cli-bridge] 读取 {} 失败：{error}",
                 db.display()
             )),
         }
     }
+    found
 }
 
-/// 桥接失败时按 db 的 mtime 节流：mtime 没变（CLI 没重新登录）就不反复重试，
-/// 状态轮询不会每次都去开 sqlite；CLI 一旦重新登录，mtime 变化自动重试。
+/// 从指定库里读一条记录：`key` 给了就读那一行，否则按 [`TOKEN_KEYS`] 取当前登录方式。
 ///
-/// 按**路径**分别记 mtime：候选路径可能不止一个，用单个全局槽位会让两个候选
-/// 每次调用交替「看起来有变化」，节流形同失效。
-fn should_attempt(db: &Path) -> bool {
-    static LAST: Mutex<Option<HashMap<PathBuf, Option<SystemTime>>>> = Mutex::new(None);
-    let mtime = fs::metadata(db).and_then(|m| m.modified()).ok();
-    let Ok(mut last) = LAST.lock() else {
-        return false;
-    };
-    let seen = last.get_or_insert_with(HashMap::new);
-    if seen.get(db).is_some_and(|known| *known == mtime) {
-        return false;
+/// 账号模块重建副本时用的是这个精确入口，而不是 `scan()` —— 用户可能有多个候选库，
+/// 不能拿「本机第一个库」去覆盖另一个库导出的账号。
+pub(crate) fn read_one(db: &Path, key: Option<&str>) -> Result<Option<CliCredential>, String> {
+    if !db.is_file() {
+        return Ok(None);
     }
-    seen.insert(db.to_path_buf(), mtime);
-    true
-}
-
-fn bridge(canonical: &Path, db: &Path) -> Result<(), String> {
-    let con = rusqlite::Connection::open_with_flags(
-        db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("打开 {db:?} 失败：{e}"))?;
-    let token = read_kv_json(&con, &TOKEN_KEYS)?
-        .ok_or_else(|| format!("{db:?} 里没有令牌记录（是否已 kiro-cli login？）"))?;
+    let con = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("打开 {} 失败：{e}", db.display()))?;
+    let (key, token) = match key {
+        Some(key) => match read_kv_raw(&con, key)? {
+            Some(value) => (key.to_string(), value),
+            None => return Ok(None),
+        },
+        None => match read_kv_first(&con, &TOKEN_KEYS)? {
+            Some((key, value)) => (key.to_string(), value),
+            None => return Ok(None),
+        },
+    };
     let registration = read_kv_json(&con, &[REGISTRATION_KEY])?;
     let (registration_payload, token_payload) = map_credentials(&token, registration.as_ref())?;
+    Ok(Some(CliCredential {
+        db: db.to_path_buf(),
+        key,
+        db_mtime_ms: file_mtime_ms(db),
+        token: token_payload,
+        registration: registration_payload,
+    }))
+}
 
-    let cache_dir = kiro_sso_cache_dir();
-    fs::create_dir_all(&cache_dir).map_err(|e| format!("创建 SSO 缓存目录失败：{e}"))?;
-    if let Some((file_name, payload)) = registration_payload {
-        write_secret_file(&cache_dir.join(file_name), &payload)?;
+/// 把一条记录写进 `dir`（创建目录、覆盖旧副本），供 `Auth` 直接读取。
+pub(crate) fn import(cred: &CliCredential, dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("创建账号目录失败：{e}"))?;
+    if let Some((file_name, payload)) = &cred.registration {
+        write_secret_file(&dir.join(file_name), payload)?;
     }
-    write_secret_file(canonical, &token_payload)?;
-    crate::diag::log(&format!("[cli-bridge] 已从 kiro-cli 凭据库桥接出 {}", canonical.display()));
-    Ok(())
+    write_secret_file(&dir.join("kiro-auth-token.json"), &cred.token)
+}
+
+fn file_mtime_ms(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn read_kv_first(
+    con: &rusqlite::Connection,
+    keys: &'static [&'static str],
+) -> Result<Option<(&'static str, Value)>, String> {
+    for key in keys {
+        if let Some(value) = read_kv_raw(con, key)? {
+            return Ok(Some((key, value)));
+        }
+    }
+    Ok(None)
+}
+
+fn read_kv_raw(con: &rusqlite::Connection, key: &str) -> Result<Option<Value>, String> {
+    let result = con.query_row(
+        "select value from auth_kv where key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|e| format!("auth_kv[{key}] 不是合法 JSON：{e}")),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("读取 auth_kv[{key}] 失败：{e}")),
+    }
 }
 
 fn read_kv_json(con: &rusqlite::Connection, keys: &[&str]) -> Result<Option<Value>, String> {
     for key in keys {
-        let result = con.query_row(
-            "select value from auth_kv where key = ?1",
-            [key],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(raw) => {
-                let value = serde_json::from_str(&raw)
-                    .map_err(|e| format!("auth_kv[{key}] 不是合法 JSON：{e}"))?;
-                return Ok(Some(value));
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-            Err(e) => return Err(format!("读取 auth_kv[{key}] 失败：{e}")),
+        if let Some(value) = read_kv_raw(con, key)? {
+            return Ok(Some(value));
         }
     }
     Ok(None)
@@ -182,6 +164,7 @@ fn map_credentials(
             .map(|v| v.to_string())
             .ok_or_else(|| format!("凭据记录缺少 {key}"))
     };
+
     let access_token = field(token, "access_token")?;
     let refresh_token = field(token, "refresh_token")?;
     let expires_at = field(token, "expires_at")?;
@@ -201,7 +184,7 @@ fn map_credentials(
     payload.insert("expiresAt".into(), Value::String(expires_at));
     payload.insert("region".into(), Value::String(region.to_string()));
 
-    let registration_payload = if is_idc {
+    let (registration_payload, token_payload) = if is_idc {
         let reg = registration.ok_or("IdC 登录但缺少 device-registration 记录，无法支撑续期")?;
         let client_id = field(reg, "client_id")?;
         let client_secret = field(reg, "client_secret")?;
@@ -212,6 +195,10 @@ fn map_credentials(
         payload.insert("authMethod".into(), Value::String("IdC".into()));
         payload.insert("provider".into(), Value::Null);
         payload.insert("clientIdHash".into(), Value::String(hash));
+        payload.insert(
+            "startUrl".into(),
+            token.get("start_url").cloned().unwrap_or(Value::Null),
+        );
         (
             Some((
                 file_name,
@@ -228,7 +215,7 @@ fn map_credentials(
         payload.insert("provider".into(), token.get("provider").cloned().unwrap_or(Value::Null));
         (None, Value::Object(payload))
     };
-    Ok(registration_payload)
+    Ok((registration_payload, token_payload))
 }
 
 /// 0600 + 原子替换，与 auth.rs 写令牌的口径一致
@@ -241,8 +228,8 @@ pub(crate) fn write_secret_file(path: &Path, payload: &Value) -> Result<(), Stri
             use std::os::unix::fs::PermissionsExt;
             let mut perms = file
                 .metadata()
-                .map(|m| m.permissions())
-                .map_err(|e| format!("stat {:?} 失败：{e}", tmp))?;
+                .map_err(|m| format!("stat {:?} 失败：{m}", tmp))?
+                .permissions();
             perms.set_mode(0o600);
             let _ = file.set_permissions(perms);
         }
@@ -276,6 +263,7 @@ mod tests {
         assert_eq!(token_payload["authMethod"], "IdC");
         assert_eq!(token_payload["accessToken"], "AT");
         assert_eq!(token_payload["expiresAt"], "2026-10-16T15:31:37.245Z");
+        assert_eq!(token_payload["startUrl"], "https://d-9066710b4d.awsapps.com/start");
         // clientIdHash 与注册文件名严格对应（auth.rs 靠它找回注册文件）
         let expected_hash: String = format!("{:x}", Sha256::digest(b"FAKECLIENTID123"));
         assert_eq!(token_payload["clientIdHash"], expected_hash);
@@ -315,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn read_kv_json_skips_missing_keys_and_rejects_bad_json() {
+    fn read_kv_skips_missing_keys_and_rejects_bad_json() {
         let con = rusqlite::Connection::open_in_memory().unwrap();
         con.execute("create table auth_kv (key text primary key, value text)", [])
             .unwrap();
@@ -325,16 +313,23 @@ mod tests {
         )
         .unwrap();
         // 第一个键不存在时继续找下一个
-        let value = read_kv_json(
-            &con,
-            &["kirocli:external-idp:token", "kirocli:odic:token"],
-        )
-        .unwrap()
-        .unwrap();
+        let (key, value) = read_kv_first(&con, &["kirocli:external-idp:token", "kirocli:odic:token"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(key, "kirocli:odic:token");
         assert_eq!(value["access_token"], "AT");
+        assert!(read_kv_first(&con, &["no-such-key"]).unwrap().is_none());
         assert!(read_kv_json(&con, &["no-such-key"]).unwrap().is_none());
         con.execute("insert into auth_kv values ('bad', 'not-json')", [])
             .unwrap();
         assert!(read_kv_json(&con, &["bad"]).is_err());
+    }
+
+    /// 对不存在的库返回空，而不是报错 —— 未装 kiro-cli 是常态。
+    #[test]
+    fn scan_ignores_missing_database() {
+        // 直接用不存在的路径走 read_one：不能触碰真实 %LOCALAPPDATA%
+        let missing = std::env::temp_dir().join("k2a-no-such-cli-db.sqlite3");
+        assert!(read_one(&missing, None).unwrap().is_none());
     }
 }

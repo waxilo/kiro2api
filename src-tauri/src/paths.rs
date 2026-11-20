@@ -20,26 +20,25 @@ pub(crate) fn kiro_sso_cache_dir() -> PathBuf {
         .join("cache")
 }
 
-/// kiro2api 自己登录（设备码流程）得到的凭据目录：`数据目录/credentials`。
-/// 文件格式与 `~/.aws/sso/cache` 完全一致（令牌文件 + `<clientIdHash>.json` 注册文件），
-/// 所以 [`crate::kiro::auth::Auth`] 的读取与刷新链路不用区分来源。
-/// 单独放一处是为了不覆盖 Kiro IDE 的登录：两边各自刷新同一个 refreshToken 会互相顶掉。
+/// kiro2api 自己登录（设备码流程）留下的**旧版**凭据目录：`数据目录/credentials`。
+///
+/// 0.11 及以前只支持一个自有登录，位置就写死在这里。账号管理上线后新登录写进
+/// [`accounts_root`] 下各自的目录；这个目录只作为「一条既有账号」被扫描与识别，
+/// 不搬文件 —— 升级不该让用户重新登录一次。
 pub(crate) fn own_credential_dir() -> PathBuf {
     get_data_path().join("credentials")
 }
 
-/// 是否有 kiro2api 自有登录。
-pub(crate) fn has_own_login() -> bool {
-    own_credential_dir().join("kiro-auth-token.json").is_file()
-}
-
-/// 当前生效的凭据目录：自有登录优先，否则用 IDE / CLI 共用的 SSO 缓存。
-pub(crate) fn active_credential_dir() -> PathBuf {
-    if has_own_login() {
-        own_credential_dir()
-    } else {
-        kiro_sso_cache_dir()
-    }
+/// 账号凭据根目录：`数据目录/accounts`。
+///
+/// 布局按来源分层，一个账号一个目录（目录内 = 令牌 + 注册文件 + `account.json`）：
+/// - `accounts/login/<clientId 哈希>/`：kiro2api 设备码登录，可并存多个；
+/// - `accounts/cli/<哈希>/`：从 kiro-cli 凭据库导入的**副本**（原库只读）。
+///
+/// Kiro 桌面端（IDE）的账号不在这里 —— 它就地使用 [`kiro_sso_cache_dir`]，
+/// 与 IDE 共用同一份令牌，避免两边各自续期把对方顶掉。
+pub(crate) fn accounts_root() -> PathBuf {
+    get_data_path().join("accounts")
 }
 
 /// kiro-cli 自己的凭据库候选路径，按顺序逐个试（先到先用）。

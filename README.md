@@ -39,27 +39,30 @@ Kiro 的接口是私有的（AWS Event Stream 二进制流），并不能直接�
 本机起一个只监听回环地址的小服务，把两套公开协议翻译成 Kiro 的私有协议并把流式响应翻回来。
 对外只暴露两套大家都认识的接口，对内复用你本机已经登录好的 Kiro 凭据。
 
-> 认证方式是读取 Kiro IDE / CLI 已经写在本机的 SSO 凭据（`~/.aws/sso/cache/kiro-auth-token.json`），
+> 认证方式是读取本机已有的 Kiro 账号凭据（本应用登录 / kiro-cli / Kiro IDE 共享缓存），
 > 并在凭据临近过期时自动续期。**应用自身不收集、不上传你的任何账号信息。**
 
 ---
 
 ## 使用
 
-### 1. 准备 Kiro 凭据
+### 1. 准备 Kiro 账号
 
-在任意一台机器上登录过 Kiro IDE，或执行过 `kiro-cli login`，本机就会有凭据文件：
+应用支持三类账号，都在左侧「账号」分区里按来源分组列出，选中哪个就用哪个：
 
-- Windows / macOS：`~/.aws/sso/cache/kiro-auth-token.json`
+| 来源 | 凭据位置 | 谁负责续期 |
+|------|----------|------------|
+| 登录的账号 | `数据目录/accounts/login/<hash>/`（旧版是 `数据目录/credentials/`） | 本应用 |
+| 本地 kiro-cli | 从 CLI 的凭据库导入副本到 `数据目录/accounts/cli/<hash>/` | 本应用（CLI 原库只读） |
+| Kiro 桌面端 | `~/.aws/sso/cache/kiro-auth-token.json` | 本应用与 IDE 共用同一份文件 |
 
-新版 kiro-cli（≥ 2.31）的登录凭据存在它自己的密钥库里
-（macOS：`~/Library/Application Support/kiro-cli/data.sqlite3`），不再写上述文件。
-应用检测不到凭据文件时会自动从该库只读桥接一份（不改动 kiro-cli 的任何数据），
-之后照常自动续期；也可以手动执行 `python3 scripts/bridge-kiro-cli-credentials.py`。
-注意：桥接后若在 kiro-cli 里重新登录，需重跑一次桥接（自动桥接会在凭据库更新时重试）。
+- 还没登录：进「账号」分区点「登录账号」，用 Builder ID 或 IAM Identity Center 走设备码登录；
+- 已登录 Kiro IDE 或执行过 `kiro-cli login`：进「账号」分区即可看到，点「使用此账号」切换；
+- kiro-cli 账号在本应用里是**导入的副本**，切换后由本应用续期，kiro-cli 侧可能需要在它那边重新登录；
+  CLI 重新登录后回到本页点「重新扫描」，副本会自动跟上；
+- Kiro 桌面端账号**就地使用** IDE 的共享缓存，不复制也不迁移，因此也不能在本应用里删除。
 
-概览页「Kiro 凭据」卡片里的「来源」会显示它读到的凭据状态。若显示未找到凭据的提示，
-先登录再回到应用点「刷新凭据」。
+概览页「Kiro 凭据」卡片显示当前账号、来源与到期时间；切换账号、退出登录都在「账号」分区。
 
 ### 2. 启动代理
 

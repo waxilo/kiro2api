@@ -1,6 +1,6 @@
-// 左侧导航：把五个分区按「运行 / 接入 / 系统」分组，分组标签给出分区之间的关系。
+// 左侧导航：把六个分区按「运行 / 接入 / 系统」分组，分组标签给出分区之间的关系。
 //
-// 分组而不是平铺五个入口，是因为这五件事的归属本来就不同：概览是「现在怎么样」，
+// 分组而不是平铺六个入口，是因为这几件事的归属本来就不同：概览是「现在怎么样」，
 // 接入两项是「谁在用、怎么接」，系统两项是「这台机器上的应用本身」。
 // 平铺会让人以为它们是同一层的东西。
 //
@@ -27,7 +27,10 @@ interface RailGroup {
 const GROUPS: RailGroup[] = [
   {
     label: '运行',
-    items: [{ id: 'overview', label: '概览', icon: ICON.overview }],
+    items: [
+      { id: 'overview', label: '概览', icon: ICON.overview },
+      { id: 'accounts', label: '账号', icon: ICON.account },
+    ],
   },
   {
     label: '接入',

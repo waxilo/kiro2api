@@ -4,6 +4,7 @@
 // 不放 HTML —— 拼 HTML 属于表现层。这样状态语义只有一个来源，
 // 状态栏、侧边栏、卡片三处显示的运行状态永远不会各说各话。
 import type {
+  AccountsView,
   CodexScan,
   CopyKind,
   LoginMethod,
@@ -21,6 +22,7 @@ import { createStore } from './store';
 /** 分区视图的标识。顺序即左侧导航的默认顺序。 */
 export const VIEW_IDS = [
   'overview',
+  'accounts',
   'endpoints',
   'thirdparty',
   'updates',
@@ -53,6 +55,14 @@ export interface AppState {
    */
   modal: ModalId | null;
   status: ProxyStatus | null;
+  /**
+   * 账号清单（登录 / kiro-cli / 桌面端三组）。
+   *
+   * null = 还没扫过（首次进入「账号」分区时拉取）。扫描是纯本地读盘，
+   * 但会读 kiro-cli 的 sqlite，所以不放进首屏那一批并发读取里 ——
+   * 不看账号页的人不该为它付代价。
+   */
+  accounts: AccountsView | null;
   access: ProxyAccess | null;
   models: ModelsState | null;
   /**
@@ -202,6 +212,7 @@ export const store = createStore<AppState>({
   view: 'overview',
   modal: null,
   status: null,
+  accounts: null,
   access: null,
   models: null,
   prefs: null,

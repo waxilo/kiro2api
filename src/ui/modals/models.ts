@@ -36,11 +36,17 @@ export const modelsModal: ModalSpec = {
   },
 
   body: (state) => {
-    const all = state.models?.models ?? [];
+    const available = state.models?.models ?? [];
+    // 上游这次没给的模型也要露出来：套餐/组织权限一变，Claude 这类模型会整批消失，
+    // 直接从清单里抹掉只会让人以为「程序把模型弄丢了」。灰态 + 「不可用」是可核对的。
+    const stale = state.models?.unavailable ?? [];
+    const all = [...available, ...stale];
     const raw = state.modelFilter;
     const query = raw.trim();
     const needle = query.toLowerCase();
     const shown = needle ? all.filter((id) => id.toLowerCase().includes(needle)) : all;
+    const usable = new Set(available);
+    const shownUsable = shown.filter((id) => usable.has(id)).length;
 
     // 清单为空时不渲染工具栏：下面没有东西可筛，摆一个搜了也没用的输入框
     // 只会让人怀疑是不是自己搜错了。空态自己会说下一步该做什么。
@@ -48,7 +54,7 @@ export const modelsModal: ModalSpec = {
       ? `
         <div class="modal-toolbar">
           ${filterBar(raw)}
-          <span class="modal-count">${countLabel(all.length, shown.length, query)}</span>
+          <span class="modal-count">${countLabel(available.length, shownUsable, query)}</span>
         </div>`
       : '';
 
@@ -56,15 +62,16 @@ export const modelsModal: ModalSpec = {
       ? `<div class="modal-foot">
            点一下模型名即可复制，再把它填在客户端的配置里（例如 Claude Code 的
            <code>ANTHROPIC_MODEL</code>）；不填则由上游按账户情况自行选择。
+           ${stale.length ? '灰底标「不可用」的是上次同步到、这次上游不再提供（套餐或组织权限变化），点不动。' : ''}
            清单以套餐为准，套餐变化后重新同步即可。
          </div>`
       : '';
 
-    return `${toolbar}${inventoryBody(shown, all.length, query, state.models?.rates ?? {})}${foot}`;
+    return `${toolbar}${inventoryBody(shown, all.length, query, state.models?.rates ?? {}, usable)}${foot}`;
   },
 };
 
-/** 右上角的计数：没搜索时是总数，搜索时是「命中 / 总数」。 */
+/** 右上角的计数：只数**可用**模型（灰卡不计入，否则「共 N 个」会跟能用的数量对不上）。 */
 function countLabel(total: number, matched: number, query: string): string {
   if (!total) return '';
   return query ? `${matched} / ${total}` : `共 ${total} 个`;
@@ -100,7 +107,13 @@ function filterBar(value: string): string {
     </div>`;
 }
 
-function inventoryBody(shown: string[], total: number, query: string, rates: Record<string, number>): string {
+function inventoryBody(
+  shown: string[],
+  total: number,
+  query: string,
+  rates: Record<string, number>,
+  usable: Set<string>,
+): string {
   if (!total) {
     return emptyState('还没有模型清单', '点击右上角「从上游同步」向 Kiro 账户读取');
   }
@@ -109,12 +122,20 @@ function inventoryBody(shown: string[], total: number, query: string, rates: Rec
   }
   return `
     <div class="model-card-list">
-      ${shown.map((id) => modelCard(id, rates[id])).join('')}
+      ${shown.map((id) => modelCard(id, rates[id], !usable.has(id))).join('')}
     </div>`;
 }
 
-/** 一张模型卡：整卡一颗按钮，这里是「点了复制名字」。 */
-function modelCard(model: string, rate: number | undefined): string {
+/** 一张模型卡：可用的整卡是一颗按钮（点了复制名字），不可用的只是一块灰牌。 */
+function modelCard(model: string, rate: number | undefined, unavailable: boolean): string {
+  if (unavailable) {
+    return (
+      `<div class="model-card is-unavailable" title="当前套餐不再提供「${esc(model)}」">` +
+      `<span class="model-card-name" title="${esc(model)}">${esc(model)}</span>` +
+      `<span class="model-card-tag">不可用</span>` +
+      `</div>`
+    );
+  }
   return (
     `<button class="model-card" type="button" data-action="copy-model"` +
     ` data-model="${esc(model)}" title="点击复制「${esc(model)}」">` +

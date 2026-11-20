@@ -10,6 +10,7 @@
 //! 模型清单且从不删除条目，该原则对其余客户端仍然成立。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,11 +19,12 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::accounts;
 use crate::kiro::models::kiro_model_to_public_model_id;
-use crate::paths::{active_credential_dir, kiro_sso_cache_dir};
+use crate::paths::kiro_sso_cache_dir;
 use crate::prefs::{
-    cached_model_rates, cached_models, cached_usage, ensure_api_key, generate_api_key, load_config,
-    mask_api_key, ms_to_iso, store_models, store_usage, update_config,
+    cached_model_rates, cached_models, cached_unavailable_models, cached_usage, ensure_api_key,
+    generate_api_key, load_config, mask_api_key, ms_to_iso, store_models, store_usage, update_config,
 };
 
 pub(crate) const KIRO_RUNTIME_URL: &str = "https://runtime.us-east-1.kiro.dev/";
@@ -96,39 +98,64 @@ fn is_proxy_running(state: &ProxyStateRef) -> bool {
         .unwrap_or(false)
 }
 
-fn new_auth() -> super::auth::Auth {
+/// 按指定凭据目录构造认证器。
+///
+/// 账号识别（`accounts::identify`）要临时指向「不是当前账号」的那份凭据，
+/// 所以目录是参数而不是全局读取。
+pub(crate) fn auth_for(dir: PathBuf) -> super::auth::Auth {
     super::auth::Auth::new(
-        active_credential_dir(),
+        dir,
         None,
         KIRO_RUNTIME_URL.to_string(),
         KIRO_MANAGEMENT_URL.to_string(),
     )
 }
 
-/// 本机是否有可用 Kiro 凭据（凭据文件或环境变量），不发网络请求。
-/// 凭据文件缺失时先尝试从 kiro-cli 的凭据库桥接一份（只读 CLI 侧数据，
-/// 且不覆盖已有文件），再按文件是否存在判定。
-pub(crate) fn has_credential_file() -> bool {
-    crate::paths::has_own_login() || super::cli_bridge::ensure_bridged()
+fn new_auth() -> super::auth::Auth {
+    // 没有可用账号时退回桌面端目录：那是历史上一直读的位置，
+    // 报错信息里的路径、环境变量鉴权都与它一致。
+    auth_for(accounts::active_dir().unwrap_or_else(kiro_sso_cache_dir))
 }
 
-/// 代理是否在运行（供登录模块判断凭据切换后要不要重启代理）。
-pub(crate) fn proxy_running(state: &ProxyStateRef) -> bool {
-    is_proxy_running(state)
+/// 本机是否有可用 Kiro 凭据（凭据文件或环境变量），不发网络请求。
+///
+/// 「可用账号」由 `accounts` 决定：登录账号 / 桌面端共享缓存 / 从 kiro-cli 导入的副本，
+/// 按「登录 > 桌面端 > CLI」挑中的那一个；CLI 副本在这里按需落地。
+pub(crate) fn has_credential_file() -> bool {
+    accounts::has_credential()
+}
+
+/// 账号 / 凭据切换后按原端口重启代理。
+///
+/// 代理线程持有的是「启动那一刻」的凭据目录，换账号不重启等于还在用旧账号出力；
+/// 但没在跑的时候也不必替用户把服务拉起来 —— 那是概览页「启动」按钮的事。
+pub(crate) fn restart_proxy_if_running(app: &AppHandle) {
+    let state = (*app.state::<KiroProxyState>()).clone();
+    let Ok(_op) = state.op_lock.lock() else { return };
+    if !is_proxy_running(&state) {
+        return;
+    }
+    let port = state.port.lock().ok().and_then(|p| *p);
+    if let Err(error) = start_proxy(&state, port) {
+        crate::diag::log(&format!("[accounts] 切换账号后重启代理失败：{error}"));
+    }
 }
 
 pub(crate) fn is_locally_available() -> bool {
     if has_credential_file() {
         return true;
     }
-    ["KIRO_AUTHORIZATION", "KIRO_ACCESS_TOKEN"]
-        .iter()
-        .any(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-        })
+    has_env_credential()
+}
+
+/// 是否只配了环境变量凭据（`KIRO_AUTHORIZATION` / `KIRO_ACCESS_TOKEN`）。
+fn has_env_credential() -> bool {
+    ["KIRO_AUTHORIZATION", "KIRO_ACCESS_TOKEN"].iter().any(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// 当前生效的代理密钥：**内存副本优先，持久化值兜底**。
@@ -168,8 +195,12 @@ pub struct ProxyStatus {
     pub profile_arn: Option<String>,
     pub config_dir: String,
     pub debug_log_path: String,
-    /// 当前用的是 kiro2api 自己登录的凭据（界面据此显示「退出登录」）。
-    pub own_login: bool,
+    /// 当前生效账号的 id（`accounts` 里的稳定标识）；没有任何账号时为 None。
+    pub active_account_id: Option<String>,
+    /// 当前账号来源：`login` / `cli` / `desktop`；只有环境变量凭据时是 `env`；都没有是 `none`。
+    pub active_account_source: String,
+    /// 当前账号的展示名（识别到邮箱就是邮箱）。
+    pub active_account_label: Option<String>,
 }
 
 pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
@@ -177,17 +208,47 @@ pub(crate) fn build_status(state: &ProxyStateRef) -> ProxyStatus {
     let port = state.port.lock().ok().and_then(|p| *p);
     let key = current_api_key(state);
     let auth = new_auth();
+    // 账号是「谁在上游出力」，凭据描述由它推导；没有账号时才回退到 Auth 自身的判断
+    // （那里兜的是环境变量鉴权与「未找到凭据」两种情形）。
+    let account = accounts::active_account();
+    // 可用性直接由账号事实推导，不再单独扫一遍账号（那会为每次状态轮询多开一次
+    // kiro-cli 的 sqlite）：令牌可用，或者只是环境变量鉴权。
+    let available =
+        running || account.as_ref().is_some_and(|account| account.usable) || has_env_credential();
+    // 只描述来源，不带到期时间：`expiresAt` 已经是一个独立字段，界面上两处各写一遍
+    // 会让同一时刻显示两次，还容易一个带时区一个不带。
+    let auth_source = match &account {
+        Some(account) => accounts::describe(account),
+        None => auth.describe_auth_source(),
+    };
     let status = ProxyStatus {
         running,
-        available: is_locally_available() || running,
+        available,
         port,
         has_api_key: key.is_some(),
-        auth_source: auth.describe_auth_source(),
-        expires_at: auth.get_sso_token_expiry(),
-        profile_arn: auth.get_sso_profile_arn(),
+        auth_source,
+        expires_at: account
+            .as_ref()
+            .and_then(|account| account.expires_at.clone())
+            .or_else(|| auth.get_sso_token_expiry()),
+        profile_arn: account
+            .as_ref()
+            .and_then(|account| account.profile_arn.clone())
+            .or_else(|| auth.get_sso_profile_arn()),
         config_dir: crate::paths::get_data_path().display().to_string(),
         debug_log_path: crate::paths::get_debug_log_path().display().to_string(),
-        own_login: crate::paths::has_own_login(),
+        active_account_id: account.as_ref().map(|account| account.id.clone()),
+        active_account_source: account
+            .as_ref()
+            .map(|account| account.source.as_str().to_string())
+            .unwrap_or_else(|| {
+                if has_env_credential() {
+                    "env".to_string()
+                } else {
+                    "none".to_string()
+                }
+            }),
+        active_account_label: account.as_ref().map(|account| account.label.clone()),
     };
     // 顺手让托盘跟上真实状态：正常启停各自会同步，这里兜住代理异常退出后的图标滞后
     crate::tray::sync_running(running, port);
@@ -206,6 +267,12 @@ pub struct ModelsState {
     /// 公共模型 id → 消耗倍率（rateMultiplier）。空表 = 上游没给过或还没同步过。
     #[serde(default)]
     pub rates: HashMap<String, f64>,
+    /// 曾经同步到、这次上游不再提供的模型（公共 id）。
+    ///
+    /// 单独给出来而不是直接丢掉：套餐/组织权限变化时模型会整批消失，
+    /// 界面需要能说「这些模型当前不可用」而不是让清单神不知鬼不觉地少一排。
+    #[serde(default)]
+    pub unavailable: Vec<String>,
 }
 
 /// 双协议接入信息。明文密钥不经过前端：这里只回传脱敏串，
@@ -273,9 +340,8 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
     let auth_ok = matches!(auth.get_authorization(), Ok(Some(_)));
     if !auth_ok {
         return Err(format!(
-            "未找到 Kiro 凭据：请在「Kiro 凭据」卡片里点「登录」，或先登录 Kiro IDE / 执行 \
-             `kiro-cli login`，确认 {} 存在后再试。",
-            kiro_sso_cache_dir().join("kiro-auth-token.json").display()
+            "未找到可用的 Kiro 账号：请到「账号」分区登录，或先登录 Kiro IDE / 执行 \
+             `kiro-cli login` 后回到「账号」分区刷新。"
         ));
     }
 
@@ -302,7 +368,7 @@ pub(crate) fn start_proxy(state: &ProxyStateRef, port: Option<u16>) -> Result<Pr
         default_model: default_model.clone(),
         runtime_url: KIRO_RUNTIME_URL.to_string(),
         management_url: KIRO_MANAGEMENT_URL.to_string(),
-        sso_cache_dir: active_credential_dir(),
+        sso_cache_dir: accounts::active_dir().unwrap_or_else(kiro_sso_cache_dir),
         profile_arn_override: None,
     };
     let handle = super::server::start_proxy(config)?;
@@ -351,80 +417,36 @@ pub(crate) fn stop_proxy(state: &ProxyStateRef) -> Result<ProxyStatus, String> {
 
 // ── 凭据刷新 ────────────────────────────────────────────────────────────
 
-/// 强制刷新共享 SSO 凭据（IDE / CLI 同一文件），写回 `~/.aws/sso/cache`。
+/// 刷新**当前选中账号**的凭据，写回该账号自己的目录。
 /// 返回 `(是否执行了刷新, 最新 expiresAt)`。
 ///
+/// 写回哪里由 `Auth` 的目录决定，所以登录账号、CLI 副本、桌面端共享缓存各自落回原处：
+/// 桌面端与 IDE 写的是同一个文件（双方看到同一份刷新结果），另外两类是本应用的独立副本。
+///
+/// 以前这里还会先「轻触」一次 `kiro-cli whoami`，靠它顺带把 CLI 侧会话保活。
+/// 账号管理之后不再需要 —— CLI 账号是导入的副本、由本应用续期；而轻触一个会话过期的
+/// CLI 有可能转去走登录流程并挂住，收益为零、风险不小，故整段移除。
+///
 /// `source` 标明这次刷新是谁发起的（手动 / 后台循环 / 预检恢复 / 请求重试）：
-/// 刷新全程的分阶段耗时都会追加进 kiro-debug.log，并发刷新时靠它才分得清哪行是哪次。
-/// 打包版没有控制台，`eprintln!` 的输出谁也看不见 —— 没有这份时间线，
-/// 「刷新凭据超时」就只能靠猜。日志只记耗时、端点与到期时间，不记任何令牌内容。
+/// 刷新耗时都会追加进 kiro-debug.log，并发刷新时靠它才分得清哪行是哪次。
+/// 日志只记耗时、端点与到期时间，不记任何令牌内容。
 pub(crate) fn refresh_credentials(source: &'static str) -> Result<(bool, Option<String>), String> {
     let started = Instant::now();
-    let touch = touch_kiro_cli(source);
     let result = new_auth().force_refresh(source);
-    let rest = started.elapsed().saturating_sub(touch);
     let total = crate::diag::secs(started.elapsed());
-    let touch_secs = crate::diag::secs(touch);
-    let rest_secs = crate::diag::secs(rest);
     match &result {
         Ok((true, expires_at)) => crate::diag::log(&format!(
-            "[refresh:{source}] 刷新完成：{total}（轻触 {touch_secs} + 刷新 {rest_secs}），新到期 {}",
+            "[refresh:{source}] 刷新完成：{total}，新到期 {}",
             expires_at.as_deref().unwrap_or("—"),
         )),
         Ok((false, _)) => crate::diag::log(&format!(
-            "[refresh:{source}] 无可刷新的凭据：{total}（轻触 {touch_secs} + 刷新 {rest_secs}）",
+            "[refresh:{source}] 无可刷新的凭据：{total}",
         )),
         Err(error) => crate::diag::log(&format!(
-            "[refresh:{source}] 刷新失败：{total}（轻触 {touch_secs} + 刷新 {rest_secs}）：{error}",
+            "[refresh:{source}] 刷新失败：{total}：{error}",
         )),
     }
     result
-}
-
-/// 每次「轻触」最多等多久。到点就终止子进程，绝不无限期等。
-const KIRO_TOUCH_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// 若本机装了 kiro-cli，轻触一次以保持 CLI 侧会话活跃（不依赖其输出）。
-///
-/// 两个坑记在这里：
-/// * **不能用 `Child::wait()`**（没有上限）。这个命令可能是整个 Electron 运行时的包装
-///   （本机 `kiro` 就是 `Kiro\bin\kiro.cmd` → `Kiro.exe cli.js`），也可能在会话过期时
-///   转去走登录流程而挂住。一旦它不退出，`refresh_credentials` 就永远不返回，前端的
-///   `busy` 永久不解除 —— 整个界面锁死、只能重启。故一律走 `wait_with_timeout`。
-/// * **Rust 的 `Command::new` 在 Windows 上不做 PATHEXT 解析**，所以这里传 `"kiro"`
-///   匹配不到 `kiro.cmd`，会直接返回 NotFound（`kiro-cli` 同理）。也就是说在只有
-///   `.cmd` 启动器的机器上，这个函数是空操作 —— 这是有意留着的：装上真正的
-///   `kiro-cli.exe` 后它会自动生效，而空操作不会带来任何副作用。
-/// 返回这段「轻触」花了多久（两个二进制都不可用时 ≈ 0，总账里看得见）。
-fn touch_kiro_cli(source: &'static str) -> Duration {
-    let started = Instant::now();
-    for bin in ["kiro-cli", "kiro"] {
-        let mut cmd = std::process::Command::new(bin);
-        crate::proc_guard::suppress_console_window(&mut cmd);
-        let Ok(mut child) = cmd
-            .arg("whoami")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        else {
-            continue;
-        };
-        match crate::proc_guard::wait_with_timeout(&mut child, KIRO_TOUCH_TIMEOUT) {
-            Some(status) if status.success() => {
-                crate::diag::log(&format!(
-                    "[refresh:{source}] 轻触 `{bin} whoami`：{}，成功",
-                    crate::diag::secs(started.elapsed())
-                ));
-                return started.elapsed();
-            }
-            Some(_) => {}
-            None => crate::diag::log(&format!(
-                "[refresh:{source}] 轻触 `{bin} whoami`：{} 未退出，已终止（不影响本次刷新）",
-                crate::diag::secs(KIRO_TOUCH_TIMEOUT)
-            )),
-        }
-    }
-    started.elapsed()
 }
 
 fn next_refresh_delay(expires_at: Option<&str>) -> Duration {
@@ -527,7 +549,7 @@ pub(crate) fn spawn_refresh_loop(state: ProxyStateRef) {
 /// 也能同步；顺带让启动时的后台刷新不依赖代理是否被自动拉起。
 ///
 /// 唯一的前置条件是本机有 Kiro 凭据 —— 那是「能不能问上游」的前提，不是「代理有没有跑」。
-pub(crate) fn sync_models_from_upstream() -> Result<(Vec<String>, HashMap<String, f64>), String> {
+pub(crate) fn sync_models_from_upstream() -> Result<ModelsState, String> {
     let auth = new_auth();
     let ids = auth.list_available_models()?;
     let upstream_rates = auth.model_rates();
@@ -551,16 +573,23 @@ pub(crate) fn sync_models_from_upstream() -> Result<(Vec<String>, HashMap<String
         }
     }
     rates.retain(|public, _| models.contains(public));
-    store_models(&models, &rates)?;
-    Ok((models, rates))
+    let unavailable = store_models(&models, &rates)?;
+    if !unavailable.is_empty() {
+        eprintln!(
+            "[proxy] 上游不再提供 {} 个模型：{}",
+            unavailable.len(),
+            unavailable.join(", ")
+        );
+    }
+    Ok(ModelsState { models, rates, unavailable })
 }
 
 /// 同步模型并通知前端；失败只记日志（供后台刷新与代理启动后调用）。
 pub(crate) fn refresh_models_and_notify() {
     match sync_models_from_upstream() {
-        Ok((models, rates)) => {
-            eprintln!("[proxy] 模型列表已同步: {} 个", models.len());
-            notify("proxy://models-updated", ModelsState { models, rates });
+        Ok(state) => {
+            eprintln!("[proxy] 模型列表已同步: {} 个", state.models.len());
+            notify("proxy://models-updated", state);
         }
         Err(error) => eprintln!("[proxy] 同步模型列表失败: {error}"),
     }
@@ -690,6 +719,7 @@ pub fn k2a_models() -> ModelsState {
     ModelsState {
         models: cached_models(),
         rates: cached_model_rates(),
+        unavailable: cached_unavailable_models(),
     }
 }
 
@@ -736,11 +766,9 @@ pub async fn k2a_stop(state: State<'_, ProxyStateRef>) -> Result<ProxyStatus, St
 /// 就要占端口、就要替用户向上游发请求，代价远大于收益。现在直接问上游控制面。
 #[tauri::command]
 pub async fn k2a_sync_models() -> Result<ModelsState, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        sync_models_from_upstream().map(|(models, rates)| ModelsState { models, rates })
-    })
-    .await
-    .map_err(|e| format!("同步任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(sync_models_from_upstream)
+        .await
+        .map_err(|e| format!("同步任务失败: {e}"))?
 }
 
 /// 读取缓存的账户额度（纯本地读取，不发网络请求）。
@@ -853,7 +881,9 @@ pub fn k2a_reveal(path: String) -> Result<(), String> {
     let target = match path.as_str() {
         "config" => crate::paths::get_data_path(),
         "log" => crate::paths::get_debug_log_path(),
-        "sso" => active_credential_dir(),
+        // 打开「当前账号实际在用」的那份凭据目录：以前固定是共享缓存，
+        // 账号管理之后它可能是自有登录目录或 CLI 副本。
+        "sso" => accounts::active_dir().unwrap_or_else(kiro_sso_cache_dir),
         other => return Err(format!("未知的路径类型: {other}")),
     };
     crate::reveal_in_file_manager(&target)

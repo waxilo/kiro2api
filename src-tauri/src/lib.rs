@@ -18,6 +18,7 @@ mod workbuddy;
 mod codex;
 mod codex_restart;
 
+mod accounts;
 mod kiro;
 
 use kiro::KiroProxyState;
@@ -114,6 +115,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             kiro::k2a_status,
+            accounts::k2a_accounts_list,
+            accounts::k2a_account_select,
+            accounts::k2a_account_identify,
+            accounts::k2a_account_remove,
             kiro::k2a_models,
             kiro::k2a_access,
             kiro::k2a_start,
@@ -130,7 +135,6 @@ pub fn run() {
             kiro::k2a_login_start,
             kiro::k2a_login_cancel,
             kiro::k2a_login_reopen,
-            kiro::k2a_logout,
             workbuddy::k2a_workbuddy_import,
             workbuddy::k2a_workbuddy_list,
             workbuddy::k2a_workbuddy_remove,

@@ -40,6 +40,12 @@ pub(crate) struct AppConfig {
     /// 与 `models` 同一次同步落盘（见 `store_models`），保证两份数据出自同一时刻；
     /// 空表 = 上游没给过或还没同步过，界面不显示倍率。
     pub(crate) model_rates: HashMap<String, f64>,
+    /// 曾经在清单里、这次同步却不在的模型（公共 id）。
+    ///
+    /// 上游把某个模型从账户清单里撤掉时，直接把它从 `models` 删掉会让界面凭空少一排，
+    /// 用户只会以为「程序坏了 / 名字记错了」。留着这份名单，界面才能把「当前套餐不再提供」
+    /// 讲明白，而不是静默消失。模型重新出现时同名条目会被自动清掉。
+    pub(crate) unavailable_models: Vec<String>,
     /// 上一次查询到的账户额度快照。
     pub(crate) usage_cache: Option<UsageCache>,
     /// 应用内更新的下载源。
@@ -55,6 +61,28 @@ pub(crate) struct AppConfig {
     pub(crate) default_effort: Option<String>,
     /// 写进 Codex 模型目录的上下文窗口大小（token）；`None` = 内置默认（300K）。
     pub(crate) context_window: Option<u32>,
+    /// 当前选中的 Kiro 账号 id（见 `crate::accounts`）。
+    ///
+    /// `None` 就是「自动」：按「登录的账号 > Kiro 桌面端 > 本地 kiro-cli」挑第一个可用的。
+    /// 这里只存 id，不存路径 —— 路径是账号扫描的产物，换个位置（CLI 副本重建、
+    /// 旧版凭据目录）时 id 仍然指得回同一个人。
+    pub(crate) active_account: Option<String>,
+    /// 账号身份缓存：账号 id → 邮箱 / 套餐。
+    ///
+    /// 用户真正能用来区分多账号的是邮箱，而邮箱只能联网问上游（getUsageLimits）。
+    /// 缓存住之后，进账号页先画本地信息，识别过的那几个直接带名字，不必每次都等网络。
+    pub(crate) account_identities: HashMap<String, AccountIdentity>,
+}
+
+/// 一个账号的「人话身份」快照。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct AccountIdentity {
+    pub(crate) email: Option<String>,
+    /// 套餐名（上游 `subscriptionTitle`，如 `Kiro Pro`）。
+    pub(crate) plan: Option<String>,
+    /// 取得时刻（Unix 毫秒）。
+    pub(crate) fetched_at_ms: i64,
 }
 
 /// 额度快照 + 写入时刻。重启后先拿它渲染，再等后台静默刷新替换。
@@ -73,10 +101,13 @@ impl Default for AppConfig {
             proxy_api_key: None,
             models: Vec::new(),
             model_rates: HashMap::new(),
+            unavailable_models: Vec::new(),
             usage_cache: None,
             update_source: None,
             default_effort: None,
             context_window: None,
+            active_account: None,
+            account_identities: HashMap::new(),
         }
     }
 }
@@ -177,13 +208,45 @@ pub(crate) fn cached_model_rates() -> HashMap<String, f64> {
     load_config().model_rates
 }
 
+/// 读取「曾经有、这次没有」的模型名单（纯本地读取）。
+pub(crate) fn cached_unavailable_models() -> Vec<String> {
+    load_config().unavailable_models
+}
+
+/// 算出「曾经有、这次没有」的模型集合：`上次清单 ∪ 上次灰名单 − 这次清单`。
+///
+/// 三处细节都是有意的：
+/// - 并入上次的灰名单，是因为模型一旦被撤下就会持续缺席 —— 只看单次 diff 的话，
+///   第二次同步就会把它忘掉，界面上的灰卡跟着消失；
+/// - 减去这次清单，模型回来时灰态自动消失；
+/// - 排序去重，避免上游顺序变化让同一份名单在配置里反复改写成不同顺序。
+fn stale_models(previous: &[String], hidden: &[String], current: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = previous
+        .iter()
+        .chain(hidden.iter())
+        .filter(|id| !current.iter().any(|shown| shown == *id))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// 写入模型缓存：清单与倍率同一次落盘，保证两份数据出自同一次同步。
-pub(crate) fn store_models(models: &[String], rates: &HashMap<String, f64>) -> Result<(), String> {
+///
+/// 顺带维护 [`AppConfig::unavailable_models`]，并把这份名单返回给调用方
+/// （要一起推给界面，见 `ModelsState::unavailable`）。
+pub(crate) fn store_models(models: &[String], rates: &HashMap<String, f64>) -> Result<Vec<String>, String> {
+    let mut unavailable: Vec<String> = Vec::new();
     update_config(|config| {
+        let stale = stale_models(&config.models, &config.unavailable_models, models);
+        unavailable = stale.clone();
         config.models = models.to_vec();
         config.model_rates = rates.clone();
+        config.unavailable_models = stale;
         Ok(())
-    })
+    })?;
+    Ok(unavailable)
 }
 
 /// 读取缓存的额度快照（纯本地读取）。从未查询过时为 `None`。
@@ -215,6 +278,61 @@ pub(crate) fn store_usage(info: &KiroUsageInfo) -> Result<i64, String> {
 pub(crate) fn ms_to_iso(ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+// ── 账号选择与身份缓存 ──────────────────────────────────────────────────
+
+/// 读取手动选中的账号 id；`None` 表示按优先级自动挑（见 `crate::accounts`）。
+pub(crate) fn active_account_pref() -> Option<String> {
+    load_config().active_account
+}
+
+/// 写入 / 清空手动选中的账号 id。
+pub(crate) fn store_active_account(id: Option<&str>) -> Result<(), String> {
+    update_config(|config| {
+        config.active_account = id.map(str::to_string);
+        Ok(())
+    })
+}
+
+/// 全部账号的身份缓存（纯本地读取）。
+pub(crate) fn account_identities() -> HashMap<String, AccountIdentity> {
+    load_config().account_identities
+}
+
+/// 记下一个账号识别出的邮箱与套餐。
+pub(crate) fn store_account_identity(
+    id: &str,
+    email: Option<&str>,
+    plan: Option<&str>,
+) -> Result<(), String> {
+    update_config(|config| {
+        config.account_identities.insert(
+            id.to_string(),
+            AccountIdentity {
+                email: email.map(str::to_string),
+                plan: plan.map(str::to_string),
+                fetched_at_ms: now_ms(),
+            },
+        );
+        Ok(())
+    })
+}
+
+/// 清掉属于「某一个账号」的缓存：模型清单、倍率、额度快照。
+///
+/// 三份数据都随账号而变 —— 换了账号还留着上一个的模型与额度，用户会以为新账号
+/// 已经同步过了。切换账号时由 `accounts::select` 调用。
+pub(crate) fn clear_account_caches() -> Result<(), String> {
+    update_config(|config| {
+        config.models.clear();
+        config.model_rates.clear();
+        // 换账号就换了一份套餐：上一个账号「不再提供」的名单对新账号毫无意义，
+        // 留着只会在新账号的清单里挂一串无主的灰卡。
+        config.unavailable_models.clear();
+        config.usage_cache = None;
+        Ok(())
+    })
 }
 
 // ── 更新下载源 ──────────────────────────────────────────────────────────
@@ -318,6 +436,62 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.port, DEFAULT_PORT);
         assert!(config.proxy_api_key.is_none());
+        assert!(config.unavailable_models.is_empty());
+    }
+
+    // ── 模型灰名单：`stale_models` 是纯函数，直接喂三份清单验算 ──
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn stale_models_is_empty_on_first_sync() {
+        // 首次同步：没有「上次」，不该凭空造出一串灰卡
+        assert!(stale_models(&[], &[], &ids(&["gpt-5"])).is_empty());
+    }
+
+    #[test]
+    fn stale_models_records_models_that_left_the_catalog() {
+        let previous = ids(&["claude-opus-5", "gpt-5"]);
+        assert_eq!(
+            stale_models(&previous, &[], &ids(&["gpt-5"])),
+            ids(&["claude-opus-5"])
+        );
+    }
+
+    #[test]
+    fn stale_models_keeps_remembering_across_repeated_syncs() {
+        // 第二次同步时「上次清单」已经不含 claude 了；只看单次 diff 会把它忘掉，
+        // 所以必须并上上一次的灰名单。
+        assert_eq!(
+            stale_models(&ids(&["gpt-5"]), &ids(&["claude-opus-5"]), &ids(&["gpt-5"])),
+            ids(&["claude-opus-5"])
+        );
+    }
+
+    #[test]
+    fn stale_models_forgets_a_model_once_it_returns() {
+        assert!(stale_models(
+            &ids(&["gpt-5"]),
+            &ids(&["claude-opus-5"]),
+            &ids(&["gpt-5", "claude-opus-5"])
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn stale_models_is_sorted_and_deduped() {
+        // 同一模型既在旧清单又在旧灰名单里（重名时）只留一条，且顺序稳定，
+        // 否则同一份名单会每次都写回不同的 key 顺序，配置文件反复变动。
+        assert_eq!(
+            stale_models(
+                &ids(&["b-model", "a-model"]),
+                &ids(&["a-model", "c-model"]),
+                &ids(&["gpt-5"])
+            ),
+            ids(&["a-model", "b-model", "c-model"])
+        );
     }
 
     #[test]
