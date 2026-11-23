@@ -3,6 +3,7 @@
 //! - `auth`：Kiro IDE SSO 凭据读取 + OIDC token 刷新 + 账户模型/额度查询
 //! - `login`：设备码登录（Builder ID / IdC），凭据写进 kiro2api 自有目录
 //! - `eventstream`：AWS Event Stream 二进制帧解析
+//! - `media`：公网图片 URL 归一化（下载转 base64，SSRF 收口）
 //! - `models`：模型名映射 / effort 归一化 / token 估算 / 模型能力 schema
 //! - `transform`：Anthropic ↔ Kiro 请求响应转换
 //! - `openai`：OpenAI Chat Completions 兼容层（入参归一化 + 出参翻译）
@@ -17,6 +18,7 @@ pub mod auth;
 pub mod cli_bridge;
 pub mod eventstream;
 pub mod login;
+pub mod media;
 pub mod models;
 pub mod net;
 pub mod openai;

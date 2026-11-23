@@ -17,6 +17,9 @@ use crate::protocol_guard::normalize_stop_reason;
 pub struct KiroContent {
     pub text: String,
     pub images: Vec<Value>,
+    /// 文档附件（PDF 等）。上游是否接受 `documents` 字段由实测决定，
+    /// 不支持时这条链路会被降级成正文里的占位说明。
+    pub documents: Vec<Value>,
 }
 
 // ============ 通用声明约束工具恢复 ============
@@ -1852,11 +1855,149 @@ fn media_type_to_format(media_type: &str) -> String {
         .to_lowercase()
 }
 
-fn parse_data_url(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_data_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(';')?;
     let data = data.strip_prefix("base64,")?;
     Some((meta.to_string(), data.to_string()))
+}
+
+/// 单个附件解码后的上限。base64 每 4 字符还原 3 字节，4 MB 留出余量，
+/// 免得「一张大图 + 一份 PDF」直接把 8 MiB 的请求体限制撑爆。
+const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// `document` 块 → (内联正文, Kiro documents 元素)。
+///
+/// 实测（gpt-5.6-terra，runtime.us-east-1.kiro.dev）：
+/// - PDF 走 `documents` 字段 **能被上游解析**，模型能准确复述 PDF 正文；
+/// - `format: "txt"` 的 documents 上游不解析（模型只回 NO-ATTACHMENT）；
+/// - `name` 只允许 `[A-Za-z0-9 _-()\[\]]`，带 `.` 会被 400 拒绝。
+///
+/// 因此文本类附件解码后直接拼进正文，二进制附件（PDF）交给 `documents`；
+/// 拿不到数据时统一降级成占位说明，让模型和用户都知道「有附件但读不到」，
+/// 而不是像以前那样静默消失。
+fn document_to_kiro(block: &Value) -> (Option<String>, Option<Value>) {
+    let source = block.get("source").unwrap_or(&Value::Null);
+    let media_type = source
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("application/pdf");
+    let title = block
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let display = match title {
+        Some(title) => title.to_string(),
+        None => format!("attachment.{}", document_format(media_type)),
+    };
+    // 上游的 name 字段校验严格，占位文本里仍用原名（中文/点号都留着更易读）
+    let name = match title {
+        Some(title) => document_name(title, media_type),
+        None => format!("attachment_{}", document_format(media_type)),
+    };
+
+    let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    if data.is_empty() {
+        return (
+            Some(document_placeholder(
+                &display,
+                "代理拿不到文件内容，只有 file_id、外部链接或空数据",
+            )),
+            None,
+        );
+    }
+    if data.len() / 4 * 3 > MAX_DOCUMENT_BYTES {
+        return (
+            Some(document_placeholder(&display, "文件超过代理 4 MB 上限")),
+            None,
+        );
+    }
+
+    // 文本类附件内联：上游对 text/* 的 documents 不解析（实测返回 NO-ATTACHMENT），
+    // 直接拼进正文反而一定读得到。PDF 走上面的 documents 字段（实测上游会解析）。
+    if media_type.starts_with("text/") || media_type == "application/json" {
+        if let Some(text) = decode_base64_text(data) {
+            return (Some(format!("[附件：{display}]\n{text}")), None);
+        }
+    }
+
+    (
+        None,
+        Some(json!({
+            "name": name,
+            "format": document_format(media_type),
+            "source": { "bytes": data },
+        })),
+    )
+}
+
+fn document_placeholder(name: &str, reason: &str) -> String {
+    format!("[附件：{name}，代理无法解析该文档内容（{reason}）]")
+}
+
+/// Kiro 对 `documents[].name` 的校验比想象中严：1-200 字符，只允许字母数字、
+/// 空格与 `- _ ( ) [ ]`，且不能有连续空白。文件名里的 `.` 会直接 400
+/// （实测报错原文：Document name is invalid）。
+///
+/// 因此这里把 `.` 换成 `_`、其它字符换成 `_`、压缩连续空白；清洗后几乎不剩
+/// 字母数字（例如纯中文文件名）就退回成 `attachment_pdf` 这类安全名。
+fn document_name(raw: &str, media_type: &str) -> String {
+    let fallback = || format!("attachment_{}", document_format(media_type));
+    // 非 ASCII 名字（中文等）洗出来是一片下划线，没有信息量，直接用兜底名
+    if !raw.is_ascii() {
+        return fallback();
+    }
+    let mut cleaned = String::new();
+    let mut last_was_space = false;
+    for ch in raw.chars() {
+        let mapped = match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '(' | ')' | '[' | ']' => ch,
+            '.' => '_',
+            other if other.is_whitespace() => ' ',
+            _ => '_',
+        };
+        if mapped == ' ' {
+            if last_was_space || cleaned.is_empty() {
+                continue;
+            }
+            last_was_space = true;
+        } else {
+            last_was_space = false;
+        }
+        cleaned.push(mapped);
+    }
+    let cleaned = cleaned.trim();
+    if cleaned.chars().filter(char::is_ascii_alphanumeric).count() < 2 {
+        return fallback();
+    }
+    cleaned.chars().take(200).collect()
+}
+
+fn decode_base64_text(data: &str) -> Option<String> {
+    use base64::Engine as _;
+    let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Kiro documents 里的 `format` 段：MIME 子类型对不上文件扩展名，这里单独映射。
+fn document_format(media_type: &str) -> String {
+    let media_type = media_type.to_lowercase();
+    if media_type.starts_with("application/vnd.openxmlformats-officedocument.wordprocessingml") {
+        return "docx".to_string();
+    }
+    if media_type.starts_with("application/msword") {
+        return "doc".to_string();
+    }
+    match media_type.split('/').nth(1).unwrap_or("") {
+        "" => "txt".to_string(),
+        "plain" => "txt".to_string(),
+        "markdown" | "x-markdown" => "md".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// 单条工具结果摊平文本的最大长度。避免大输出（如读大文件 / 命令长输出 / 大 JSON）撑爆模型上下文
@@ -1895,22 +2036,38 @@ fn tool_result_to_text(content: &Value) -> String {
     truncate_to_limit(&text, MAX_TOOL_RESULT_TEXT_CHARS)
 }
 
+/// 把图片 / 文档挂到 Kiro 的 userInputMessage 上（两者都是可选的顶层字段）。
+fn attach_media(message: &mut Value, images: Vec<Value>, documents: Vec<Value>) {
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    if !images.is_empty() {
+        object.insert("images".to_string(), Value::Array(images));
+    }
+    if !documents.is_empty() {
+        object.insert("documents".to_string(), Value::Array(documents));
+    }
+}
+
 fn anthropic_content_to_kiro(content: &Value) -> Result<KiroContent, String> {
     if let Some(s) = content.as_str() {
         return Ok(KiroContent {
             text: s.to_string(),
             images: Vec::new(),
+            documents: Vec::new(),
         });
     }
     let Some(blocks) = content.as_array() else {
         return Ok(KiroContent {
             text: content.as_str().unwrap_or("").to_string(),
             images: Vec::new(),
+            documents: Vec::new(),
         });
     };
 
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
 
     for block in blocks {
         if block.is_null() {
@@ -1938,13 +2095,24 @@ fn anthropic_content_to_kiro(content: &Value) -> Result<KiroContent, String> {
                         Some("url") => {
                             let url = source.get("url").and_then(|v| v.as_str()).unwrap_or("");
                             let (media_type, data) = parse_data_url(url)
-                                .ok_or_else(|| "Only base64 image sources and data: URLs are supported.".to_string())?;
+                                .ok_or_else(|| "图片地址不受支持：只接受 base64 或 data: 内联图片。".to_string())?;
                             images.push(json!({
                                 "format": media_type_to_format(&media_type),
                                 "source": { "bytes": data },
                             }));
                         }
                         _ => {}
+                    }
+                }
+                // 文档附件：文本类直接内联进正文（不依赖上游能力），二进制转 documents 字段。
+                // 无论哪种都保证模型能看到「这里有个附件」，不再静默消失。
+                "document" => {
+                    let (inline_text, document) = document_to_kiro(block);
+                    if let Some(inline_text) = inline_text {
+                        text_parts.push(inline_text);
+                    }
+                    if let Some(document) = document {
+                        documents.push(document);
                     }
                 }
                 // 工具结果摊平为文本（Kiro 不接受结构化 toolResults）：
@@ -1973,6 +2141,7 @@ fn anthropic_content_to_kiro(content: &Value) -> Result<KiroContent, String> {
     Ok(KiroContent {
         text: text_parts.join("\n"),
         images,
+        documents,
     })
 }
 
@@ -2430,9 +2599,7 @@ fn build_kiro_request_with_profile(
                 "origin": "KIRO_CLI",
                 "modelId": kiro_model,
             });
-            if !parsed.images.is_empty() {
-                msg.as_object_mut().unwrap().insert("images".to_string(), Value::Array(parsed.images));
-            }
+            attach_media(&mut msg, parsed.images, parsed.documents);
             history.push(json!({ "userInputMessage": msg }));
         } else if role == "assistant" {
             history.push(json!({
@@ -2460,12 +2627,11 @@ fn build_kiro_request_with_profile(
         "modelId": kiro_model,
         "origin": "KIRO_CLI",
     });
-    if !current_parsed.images.is_empty() {
-        current_message
-            .as_object_mut()
-            .unwrap()
-            .insert("images".to_string(), Value::Array(current_parsed.images));
-    }
+    attach_media(
+        &mut current_message,
+        current_parsed.images,
+        current_parsed.documents,
+    );
     // 只附加结构化工具定义（Kiro 接受），工具结果/调用已摊平进 content（Kiro 不接受 toolResults/toolUses）
     attach_user_context(&mut current_message, &kiro_tools, &[]);
 
@@ -2662,6 +2828,121 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[1]["assistantResponseMessage"]["content"], "pong");
         assert_eq!(built["conversationState"]["currentMessage"]["userInputMessage"]["content"], "again");
+    }
+
+    fn base64_of(text: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+    }
+
+    #[test]
+    fn document_text_is_inlined_into_content() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "总结附件" },
+                { "type": "document", "title": "notes.txt",
+                  "source": { "type": "base64", "media_type": "text/plain", "data": base64_of("营收增长 12%") } }
+            ]}]
+        });
+        let built = build_kiro_request(&body, "gpt-5.6-terra", None).unwrap();
+        let current = &built["conversationState"]["currentMessage"]["userInputMessage"];
+        let content = current["content"].as_str().unwrap();
+        assert!(content.contains("[附件：notes.txt]"), "{content}");
+        assert!(content.contains("营收增长 12%"), "{content}");
+        // 文本附件已经内联，不该再占 documents 字段
+        assert!(current.get("documents").is_none());
+    }
+
+    #[test]
+    fn document_pdf_goes_into_documents() {
+        let data = base64_of("%PDF-1.7 fake");
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "document", "title": "history.pdf",
+                      "source": { "type": "base64", "media_type": "application/pdf", "data": data } }
+                ]},
+                { "role": "assistant", "content": "好的" },
+                { "role": "user", "content": [
+                    { "type": "document", "title": "manual.pdf",
+                      "source": { "type": "base64", "media_type": "application/pdf", "data": data } }
+                ]}
+            ]
+        });
+        let built = build_kiro_request(&body, "gpt-5.6-terra", None).unwrap();
+        let state = &built["conversationState"];
+        let current = &state["currentMessage"]["userInputMessage"];
+        let documents = current["documents"].as_array().unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0]["name"], "manual_pdf");
+        assert_eq!(documents[0]["format"], "pdf");
+        assert_eq!(documents[0]["source"]["bytes"], data);
+        // 历史消息里的文档同样要带上
+        let history_doc = &state["history"][0]["userInputMessage"]["documents"];
+        assert_eq!(history_doc.as_array().unwrap().len(), 1, "{state}");
+        assert_eq!(history_doc[0]["name"], "history_pdf");
+    }
+
+    #[test]
+    fn document_without_data_becomes_placeholder() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "document", "title": "contract.pdf",
+                  "source": { "type": "file", "file_id": "file_123" } }
+            ]}]
+        });
+        let built = build_kiro_request(&body, "gpt-5.6-terra", None).unwrap();
+        let current = &built["conversationState"]["currentMessage"]["userInputMessage"];
+        let content = current["content"].as_str().unwrap();
+        assert!(content.contains("contract.pdf"), "{content}");
+        assert!(content.contains("代理无法解析"), "{content}");
+        assert!(current.get("documents").is_none());
+    }
+
+    #[test]
+    fn oversized_document_becomes_placeholder() {
+        // 5.6M 字符 base64 ≈ 4.2 MB 解码后，超过 4 MB 上限
+        let data = "A".repeat(5_600_000);
+        let body = json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "document", "title": "big.pdf",
+                  "source": { "type": "base64", "media_type": "application/pdf", "data": data } }
+            ]}]
+        });
+        let built = build_kiro_request(&body, "gpt-5.6-terra", None).unwrap();
+        let current = &built["conversationState"]["currentMessage"]["userInputMessage"];
+        let content = current["content"].as_str().unwrap();
+        assert!(content.contains("4 MB"), "{content}");
+        assert!(current.get("documents").is_none());
+    }
+
+    #[test]
+    fn document_format_maps_mime_subtypes() {
+        assert_eq!(document_format("application/pdf"), "pdf");
+        assert_eq!(document_format("text/plain"), "txt");
+        assert_eq!(document_format("text/markdown"), "md");
+        assert_eq!(
+            document_format("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            "docx"
+        );
+        assert_eq!(document_format("application/octet-stream"), "octet-stream");
+    }
+
+    #[test]
+    fn document_name_is_sanitized_for_upstream() {
+        // 上游只认 [A-Za-z0-9 _-()[]]，`.` 会被直接 400（Document name is invalid）
+        assert_eq!(document_name("report.pdf", "application/pdf"), "report_pdf");
+        assert_eq!(
+            document_name("Q3 report v2.md", "text/markdown"),
+            "Q3 report v2_md"
+        );
+        assert_eq!(document_name("a(b)[c]-d_e", "application/pdf"), "a(b)[c]-d_e");
+        // 非 ASCII 与「洗不出字母数字」的名字走兜底，避免一串下划线
+        assert_eq!(
+            document_name("季度报告.pdf", "application/pdf"),
+            "attachment_pdf"
+        );
+        assert_eq!(document_name("  ...  ", "application/pdf"), "attachment_pdf");
     }
 
     fn recovery_spec() -> ToolRecoverySpec {

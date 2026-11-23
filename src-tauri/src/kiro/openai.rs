@@ -245,15 +245,42 @@ fn openai_content_to_blocks(content: &Value) -> Vec<Value> {
                     blocks.push(json!({ "type": "image", "source": source }));
                 }
             }
+            // 附件（PDF / 文本文件）。以前落进 `_ => {}` 直接消失，
+            // 现在转成 Anthropic document 块，由 transform 决定内联还是透传。
+            "file" => {
+                let file = part.get("file").unwrap_or(part);
+                blocks.push(openai_file_to_document(file));
+            }
             _ => {}
         }
     }
     blocks
 }
 
+/// Chat `file` part → Anthropic `document` 块。
+///
+/// 常见形态是 `{"filename": "a.pdf", "file_data": "data:application/pdf;base64,..."}`。
+/// 只有 `file_id` 时没有内容可读（文件在调用方上传过、代理够不着），
+/// 这里仍然产出 document 块，让 transform 统一降级成「有附件但读不到」的占位文本。
+fn openai_file_to_document(file: &Value) -> Value {
+    let title = file
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("attachment");
+    let source = file
+        .get("file_data")
+        .and_then(Value::as_str)
+        .and_then(crate::kiro::transform::parse_data_url)
+        .map(|(media_type, data)| {
+            json!({ "type": "base64", "media_type": media_type, "data": data })
+        })
+        .unwrap_or_else(|| json!({ "type": "unavailable" }));
+    json!({ "type": "document", "title": title, "source": source })
+}
+
 /// OpenAI 的图片既可能是 `data:` URL（内联 base64），也可能是公网 URL。
-/// Anthropic 的 image 块只认 base64 / 已下载内容，而 Kiro 上游同样只接受 bytes，
-/// 因此这里只透传 data: URL；公网 URL 会被忽略（下游也无法拉取）。
+/// 公网 URL 已在 `server::normalize_media` 阶段下载并替换成 data URL
+/// （Kiro 上游只接受 bytes），这里只负责 data URL → Anthropic image 块。
 fn openai_image_source(url: &str) -> Option<Value> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(';')?;
@@ -638,6 +665,47 @@ mod tests {
         assert_eq!(out["messages"][0]["content"][1]["type"], "image");
         assert_eq!(out["messages"][0]["content"][1]["source"]["media_type"], "image/png");
         assert_eq!(out["messages"][0]["content"][1]["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn converts_file_part_to_document() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "总结这份 PDF" },
+                    { "type": "file", "file": {
+                        "filename": "report.pdf",
+                        "file_data": "data:application/pdf;base64,JVBERi0="
+                    }}
+                ]
+            }]
+        });
+        let out = openai_request_to_anthropic(&body).unwrap();
+        let document = &out["messages"][0]["content"][1];
+        assert_eq!(document["type"], "document");
+        assert_eq!(document["title"], "report.pdf");
+        assert_eq!(document["source"]["media_type"], "application/pdf");
+        assert_eq!(document["source"]["data"], "JVBERi0=");
+    }
+
+    #[test]
+    fn file_part_without_data_keeps_a_placeholder_document() {
+        // 只有 file_id：代理拿不到内容，但仍要留个 document 块，
+        // 好让 transform 生成「有附件读不到」的占位，而不是无声消失。
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "file", "file": { "filename": "a.pdf", "file_id": "file-1" } }
+                ]
+            }]
+        });
+        let out = openai_request_to_anthropic(&body).unwrap();
+        let document = &out["messages"][0]["content"][0];
+        assert_eq!(document["type"], "document");
+        assert_eq!(document["title"], "a.pdf");
+        assert_eq!(document["source"]["type"], "unavailable");
     }
 
     #[test]

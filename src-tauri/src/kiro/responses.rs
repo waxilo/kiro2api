@@ -212,6 +212,20 @@ fn responses_content_to_chat_parts(content: &Value) -> Value {
                     out.push(json!({ "type": "image_url", "image_url": { "url": url } }));
                 }
             }
+            // 附件：转成 Chat 的 `file` part，复用同一条 document 归一化链路。
+            // 只有 file_id 时也照样下发，由下游给出「有附件但读不到」的占位说明。
+            "input_file" => {
+                let mut file = json!({
+                    "filename": part
+                        .get("filename")
+                        .and_then(Value::as_str)
+                        .unwrap_or("attachment"),
+                });
+                if let Some(data) = part.get("file_data").and_then(Value::as_str) {
+                    file["file_data"] = json!(data);
+                }
+                out.push(json!({ "type": "file", "file": file }));
+            }
             _ => {}
         }
     }
@@ -738,6 +752,32 @@ mod tests {
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["source"]["data"], "AAAA");
         assert_eq!(content[2]["source"]["media_type"], "image/jpeg");
+    }
+
+    #[test]
+    fn converts_input_file_into_document() {
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "读一下附件" },
+                    { "type": "input_file", "filename": "spec.pdf",
+                      "file_data": "data:application/pdf;base64,JVBERi0=" },
+                    { "type": "input_file", "filename": "note.txt", "file_id": "file-9" },
+                ],
+            }],
+        });
+        let out = responses_request_to_anthropic(&body).unwrap();
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[1]["type"], "document");
+        assert_eq!(content[1]["title"], "spec.pdf");
+        assert_eq!(content[1]["source"]["data"], "JVBERi0=");
+        // 只有 file_id 时仍留 document 块，交给下游降级成占位
+        assert_eq!(content[2]["type"], "document");
+        assert_eq!(content[2]["source"]["type"], "unavailable");
     }
 
     #[test]

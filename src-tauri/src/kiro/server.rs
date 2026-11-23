@@ -43,6 +43,7 @@ use crate::kiro::eventstream::{
     collect_kiro_text, extract_reasoning_parts, parse_event_stream_checked, IncrementalEventStream,
     KiroEvent,
 };
+use crate::kiro::media::{normalize_image_urls, HttpImageFetcher};
 use crate::kiro::models::{
     estimate_tokens, get_supported_effort_levels, kiro_model_to_public_model_id, normalize_kiro_model,
     public_display_name,
@@ -3017,6 +3018,21 @@ fn handle_count_tokens(mut request: Request, config: &ProxyConfig) {
     json_response(request, 200, &json!({ "input_tokens": estimate_tokens(&text) }));
 }
 
+/// 图片下载客户端只建一次：连接池跨请求复用，避免每个带图请求都重新握手。
+static MEDIA_FETCHER: std::sync::OnceLock<Result<HttpImageFetcher, String>> =
+    std::sync::OnceLock::new();
+
+/// 把请求体里的公网图片 URL 换成 `data:` 内联，返回替换个数。
+///
+/// 三条协议统一在这里收口：以前 Anthropic 路径遇到 http 图片直接 400、OpenAI 路径
+/// 静默丢图，同一个请求换个协议结果就不一样。现在要么下载成功、要么给出明确原因，
+/// 下游 transform 也只需要认识 base64 一种形态。
+fn normalize_media(body: &mut Value) -> Result<usize, String> {
+    let fetcher = MEDIA_FETCHER.get_or_init(HttpImageFetcher::new);
+    let fetcher = fetcher.as_ref().map_err(|reason| reason.clone())?;
+    normalize_image_urls(body, fetcher)
+}
+
 fn handle_messages(
     mut request: Request,
     config: &ProxyConfig,
@@ -3029,7 +3045,7 @@ fn handle_messages(
         return error_response(request, 401, "Invalid proxy API key.", "authentication_error");
     }
 
-    let body = match read_json_body(&mut request) {
+    let mut body = match read_json_body(&mut request) {
         Ok(body) => body,
         Err(error) => return respond_body_error(request, error),
     };
@@ -3066,6 +3082,14 @@ fn handle_messages(
     // 检测到连续失败（Claude Code 重试风暴）时，leader 再自检/恢复代理状态。
     if health.needs_preflight() {
         health.run_preflight_recovery(auth);
+    }
+
+    // 公网图片下载放在去重之后：follower 直接重放 leader 的结果，不必重复出网。
+    if let Err(e) = normalize_media(&mut body) {
+        if let Some(entry) = &dedup_entry {
+            dedup.mark_failed(entry);
+        }
+        return error_response(request, 400, &e, "invalid_request_error");
     }
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -3269,10 +3293,16 @@ fn handle_openai_chat_completions(
         return openai_error_response(request, 401, "Invalid proxy API key.", "authentication_error");
     }
 
-    let raw_body = match read_json_body(&mut request) {
+    let mut raw_body = match read_json_body(&mut request) {
         Ok(body) => body,
         Err(error) => return respond_openai_body_error(request, error),
     };
+
+    // 必须在转换前归一化：OpenAI 的 image_url 转换层只认 data: URL，
+    // 公网 URL 到那里会被丢掉（就是以前的静默丢图）。
+    if let Err(e) = normalize_media(&mut raw_body) {
+        return openai_error_response(request, 400, &e, "invalid_request_error");
+    }
 
     let body = match openai_request_to_anthropic(&raw_body) {
         Ok(body) => body,
@@ -3482,10 +3512,15 @@ fn handle_openai_responses(
         return openai_error_response(request, 401, "Invalid proxy API key.", "authentication_error");
     }
 
-    let raw_body = match read_json_body(&mut request) {
+    let mut raw_body = match read_json_body(&mut request) {
         Ok(body) => body,
         Err(error) => return respond_openai_body_error(request, error),
     };
+
+    // 同 Chat 路径：`input_image` 的公网 URL 必须在转换前落成 base64。
+    if let Err(e) = normalize_media(&mut raw_body) {
+        return openai_error_response(request, 400, &e, "invalid_request_error");
+    }
 
     let body = match responses_request_to_anthropic(&raw_body) {
         Ok(body) => body,
