@@ -2033,6 +2033,10 @@ fn pipe_kiro_body_to_responses_sse(
                 // 思考增量 → reasoning item 的 summary 通道。空正文（只带签名的
                 // reasoningContentEvent）不在这里开 item，交给 push_reasoning 忽略。
                 "reasoningContentEvent" if emit_reasoning => {
+                    // ⚠️ 2026-11-23 实测：上游会把思考改成**加密**下发
+                    // （payload 只有 `redactedContent`，约 7KB 密文，没有明文文本）。
+                    // 这种事件在 Anthropic 侧对应 `redacted_thinking`，设计上不给用户看，
+                    // 所以解析出空文本时这里什么都不发 —— 不是丢数据，是无内容可发。
                     let (text, _signature) = extract_reasoning_parts(&event.payload);
                     emitter.push_reasoning(&mut send, &text);
                 }
@@ -6592,24 +6596,70 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut any_thinking = false;
-        for model in ["claude-opus-5", "gpt-5.6-luna"] {
-            let resp = client
-                .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
-                .header("authorization", "Bearer live-test-key")
-                .json(&json!({
-                    "model": model,
+        // 三种请求形状各跑一遍：上游是否产思考可能取决于请求形状（有无 instructions、
+        // 有无 tools）。这是排查「测试能出思考、真机不出」的唯一手段。
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "full",
+                json!({
+                    "model": "gpt-5.6-luna",
                     "stream": true,
-                    // Codex 默认就是 auto，这里显式写出来，确保走的是「要摘要」那条
                     "reasoning": { "effort": "high", "summary": "auto" },
                     "instructions": "你是严谨的助手，先推理再作答。",
                     "input": "笼子里鸡兔共 35 个头、94 只脚，各几只？先算清再给结论。",
-                }))
+                }),
+            ),
+            (
+                "claude-opus-5",
+                json!({
+                    "model": "claude-opus-5",
+                    "stream": true,
+                    "reasoning": { "effort": "high", "summary": "auto" },
+                    "instructions": "你是严谨的助手，先推理再作答。",
+                    "input": "笼子里鸡兔共 35 个头、94 只脚，各几只？先算清再给结论。",
+                }),
+            ),
+            (
+                "bare",
+                json!({
+                    "model": "gpt-5.6-luna",
+                    "stream": true,
+                    "input": "笼子里鸡兔共 35 个头、94 只脚，各几只？先算清再给结论。",
+                }),
+            ),
+            (
+                "codex-like",
+                json!({
+                    "model": "gpt-5.6-luna",
+                    "stream": true,
+                    "reasoning": { "effort": "high", "summary": "auto" },
+                    "instructions": "You are Codex, a coding agent.",
+                    "input": "看看当前目录下有什么文件。",
+                    "tools": [{
+                        "type": "function",
+                        "name": "shell",
+                        "description": "run a shell command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "command": { "type": "string" } },
+                            "required": ["command"],
+                        },
+                    }],
+                }),
+            ),
+        ];
+
+        let mut total_deltas = 0usize;
+        for (label, body) in cases {
+            let resp = client
+                .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+                .header("authorization", "Bearer live-test-key")
+                .json(&body)
                 .send()
                 .unwrap();
             let status = resp.status();
             if status != 200 {
-                println!("[live] {model} status={status}（跳过）");
+                println!("[live] {label} status={status}（跳过）");
                 continue;
             }
             let mut resp = resp;
@@ -6626,21 +6676,92 @@ mod tests {
                 .matches("event: response.reasoning_summary_text.delta")
                 .count();
             let has_item = raw.contains("\"type\":\"reasoning\"");
-            println!("[live] {model} reasoning_deltas={deltas} has_item={has_item}");
+            println!("[live] {label} reasoning_deltas={deltas} has_item={has_item}");
             if deltas > 0 {
-                any_thinking = true;
+                total_deltas += deltas;
             }
             assert!(
                 raw.contains("event: response.completed"),
-                "{model} 的流没有正常收尾: {}",
+                "{label} 的流没有正常收尾: {}",
                 raw.chars().take(400).collect::<String>()
             );
         }
 
         handle.stop();
-        assert!(
-            any_thinking,
-            "上游没有产出任何思考增量 —— 代理侧补齐也变不出内容"
+        // 不硬断言「必须出明文」：上游会把思考改成加密下发（`redactedContent`），
+        // 那时任何客户端都看不到文字，断言会让这个探针长期假红。断言放在
+        // 「流正常收尾」上，明文数量只作为观测输出。
+        println!(
+            "[live] 明文思考增量合计={total_deltas}（为 0 时多半是上游改发 redactedContent）"
         );
+    }
+
+    /// 临时手工验证（非 CI）：直连上游，看 `GenerateAssistantResponse` 到底发了哪些事件类型。
+    ///
+    /// 用于区分「代理把思考丢了」与「上游这次根本没发思考」——前者修代码，后者改不动。
+    ///
+    /// 运行：cargo test -p kiro2api --lib kiro::server::tests::live_upstream_event_types -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires real Kiro SSO credentials"]
+    fn live_upstream_event_types() {
+        use std::collections::BTreeMap;
+
+        let config = ProxyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 5055,
+            proxy_api_key: None,
+            default_model: "claude-opus-5".to_string(),
+            runtime_url: "https://runtime.us-east-1.kiro.dev/".to_string(),
+            management_url: "https://management.us-east-1.kiro.dev/".to_string(),
+            sso_cache_dir: crate::paths::kiro_sso_cache_dir(),
+            profile_arn_override: None,
+        };
+        let auth = Auth::new(
+            config.sso_cache_dir.clone(),
+            None,
+            config.runtime_url.clone(),
+            config.management_url.clone(),
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+
+        for effort in ["high", "medium"] {
+            // 走与代理完全相同的入参链（Responses → Anthropic → Kiro），
+            // 手写 Anthropic body 会被上游判成 Improperly formed request。
+            let responses_body = json!({
+                "model": "gpt-5.6-luna",
+                "stream": true,
+                "reasoning": { "effort": effort, "summary": "auto" },
+                "instructions": "你是严谨的助手，先推理再作答。",
+                "input": "笼子里鸡兔共 35 个头、94 只脚，各几只？先算清再给结论。",
+            });
+            let anthropic_body = responses_request_to_anthropic(&responses_body).unwrap();
+            let built = match auth.model_schema("gpt-5.6-luna") {
+                Some(schema) => build_kiro_request_with_schema(
+                    &anthropic_body,
+                    "gpt-5.6-luna",
+                    None,
+                    &schema,
+                ),
+                None => build_kiro_request(&anthropic_body, "gpt-5.6-luna", None),
+            }
+            .unwrap();
+            println!(
+                "[live] effort={effort} built={}",
+                truncate_for_log(&serde_json::to_string(&built).unwrap_or_default(), 400)
+            );
+            match call_kiro_generate(&client, &auth, &config, &built) {
+                Ok(events) => {
+                    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+                    for event in &events {
+                        *counts.entry(event.event_type.clone()).or_insert(0) += 1;
+                    }
+                    println!("[live] effort={effort} events={counts:?}");
+                }
+                Err(e) => println!("[live] effort={effort} error={e}"),
+            }
+        }
     }
 }
