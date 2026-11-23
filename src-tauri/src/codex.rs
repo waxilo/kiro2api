@@ -407,7 +407,11 @@ fn catalog_entry(
         "display_name": slug,
         "description": format!("kiro2api 本地代理 · {slug}"),
         "base_instructions": NEUTRAL_BASE_INSTRUCTIONS,
-        "supports_reasoning_summaries": false,
+        // 代理已经把 Kiro 的思考事件翻成 reasoning item（summary 通道），所以对
+        // Codex 声明「支持思考摘要」——否则它不会请求 summary，也不会渲染思考块。
+        // 注意这只影响「要不要思考摘要」，思考本身由 `supported_reasoning_levels`
+        // 与请求里的 effort 决定。
+        "supports_reasoning_summaries": true,
         "supports_parallel_tool_calls": false,
         // 两个世代都必需的键
         "supported_reasoning_levels": [
@@ -1335,7 +1339,7 @@ model = "their-pick"
         assert_eq!(levels.len(), 3);
         // 旧世代必需的键在位（新版本会忽略）；base_instructions 必须是字符串
         assert_eq!(entry["base_instructions"].as_str(), Some(NEUTRAL_BASE_INSTRUCTIONS));
-        assert_eq!(entry["supports_reasoning_summaries"], false);
+        assert_eq!(entry["supports_reasoning_summaries"], true);
         assert_eq!(entry["supports_parallel_tool_calls"], false);
         // 新世代必需的键在位（老版本会忽略）
         assert!(entry.get("availability_nux").is_some());

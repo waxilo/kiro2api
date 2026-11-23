@@ -56,7 +56,7 @@ use crate::kiro::openai::{
 };
 use crate::kiro::responses::{
     build_responses_output, finish_responses_after_error, responses_completed_response,
-    responses_request_to_anthropic, responses_usage, ResponsesEmitter,
+    responses_request_to_anthropic, responses_usage, wants_reasoning_summary, ResponsesEmitter,
 };
 use crate::kiro::transform::{
     anthropic_message_response_with_tools, build_kiro_request, build_kiro_request_with_schema,
@@ -1982,8 +1982,10 @@ impl OpenAiToolBlock {
 ///
 /// 与 `pipe_kiro_body_to_openai_sse` 同构：同一套协议守护、文本工具恢复与工具
 /// schema 校验，只是出参形状换成 Responses 事件（见 `kiro::responses`）。两处刻意
-/// 的差异：思维链增量不进 Responses 流（需要 reasoning item 信封，本期不做）；
-/// 读流失败发 `response.failed` 而不是伪造正文 —— Codex 对失败事件有专门处理，
+/// 的差异：思维链走 reasoning item 的 summary 信封（Codex 只认
+/// `reasoning_summary_text.*` 这一路）；`emit_reasoning = false`（请求里
+/// `reasoning.summary = "none"`）时整轮不发 reasoning item。读流失败发
+/// `response.failed` 而不是伪造正文 —— Codex 对失败事件有专门处理，
 /// 比假装成功更诚实。同理，上游在事件之间**干净断流**（读到了 EOF、没报错，但整轮
 /// 没出现 `metadataEvent`）时按截断收尾：`incomplete_details = max_tokens` + 诊断
 /// 日志，不把半截正文伪装成完整回答 —— 正常结束的流必带 metadataEvent（见
@@ -1993,6 +1995,7 @@ fn pipe_kiro_body_to_responses_sse(
     recovery_spec: ToolRecoverySpec,
     response_id: &str,
     response_model: &str,
+    emit_reasoning: bool,
     mut send: impl FnMut(String),
 ) -> bool {
     let mut emitter = ResponsesEmitter::new(response_id, response_model);
@@ -2017,6 +2020,7 @@ fn pipe_kiro_body_to_responses_sse(
             Ok(n) => n,
             Err(e) => {
                 let msg = format!("读取 Kiro 流失败: {e}");
+                emitter.close_reasoning(&mut send);
                 emitter.close_message(&mut send);
                 emitter.close_function_call(&mut send);
                 send(emitter.event_failed("upstream_error", &msg));
@@ -2026,7 +2030,12 @@ fn pipe_kiro_body_to_responses_sse(
 
         for event in parser.push(&read_buf[..n]) {
             match event.event_type.as_str() {
-                // 思维链本期不产出：Responses 侧需要 reasoning item / summary 事件信封
+                // 思考增量 → reasoning item 的 summary 通道。空正文（只带签名的
+                // reasoningContentEvent）不在这里开 item，交给 push_reasoning 忽略。
+                "reasoningContentEvent" if emit_reasoning => {
+                    let (text, _signature) = extract_reasoning_parts(&event.payload);
+                    emitter.push_reasoning(&mut send, &text);
+                }
                 "reasoningContentEvent" => {}
                 "assistantResponseEvent" => {
                     let Some(raw_chunk) = event.payload.get("content").and_then(|v| v.as_str()) else {
@@ -2237,6 +2246,7 @@ fn pipe_kiro_body_to_responses_sse(
 
     let normalized =
         normalize_stop_reason(final_stop, emitted_any_tool_call, protocol_guard.detected());
+    emitter.close_reasoning(&mut send);
     emitter.close_function_call(&mut send);
     emitter.close_message(&mut send);
     let incomplete = (normalized == "max_tokens").then_some("max_tokens");
@@ -2446,7 +2456,8 @@ enum SseFlavor {
     /// OpenAI Chat Completions（`chat.completion.chunk` + `data: [DONE]`）。
     Chat,
     /// OpenAI Responses API（带 type 的事件对象，无 `[DONE]`，见 `kiro::responses`）。
-    Responses,
+    /// `emit_reasoning` 由请求的 `reasoning.summary` 决定（`"none"` 才是关）。
+    Responses { emit_reasoning: bool },
 }
 
 fn respond_openai_sse_stream_fetch(
@@ -2541,7 +2552,7 @@ fn respond_openai_sse_stream_fetch(
                     SseFlavor::Chat => {
                         finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &message)
                     }
-                    SseFlavor::Responses => {
+                    SseFlavor::Responses { .. } => {
                         finish_responses_after_error(&mut send, &chat_id, &response_model, &message)
                     }
                 }
@@ -2561,7 +2572,7 @@ fn respond_openai_sse_stream_fetch(
                     SseFlavor::Chat => {
                         finish_openai_sse_after_error(&mut send, &chat_id, &response_model, &e)
                     }
-                    SseFlavor::Responses => {
+                    SseFlavor::Responses { .. } => {
                         finish_responses_after_error(&mut send, &chat_id, &response_model, &e)
                     }
                 }
@@ -2586,11 +2597,12 @@ fn respond_openai_sse_stream_fetch(
                 &response_model,
                 send,
             ),
-            SseFlavor::Responses => pipe_kiro_body_to_responses_sse(
+            SseFlavor::Responses { emit_reasoning } => pipe_kiro_body_to_responses_sse(
                 reader,
                 recovery_spec,
                 &chat_id,
                 &response_model,
+                emit_reasoning,
                 send,
             ),
         };
@@ -3533,8 +3545,18 @@ fn handle_openai_responses(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // 思考展示开关只影响出参形状，不影响上游请求，所以不进 `body` 的指纹 ——
+    // 但两条「同一个 body、一个关思考一个不关」的流不能互相重放，故把开关
+    // 并进协议标签：`responses` / `responses+reasoning` 是两个不同的缓冲。
+    let emit_reasoning = wants_reasoning_summary(&raw_body);
+    let dedup_label = if emit_reasoning {
+        "responses+reasoning"
+    } else {
+        "responses"
+    };
+
     let dedup_entry = if is_stream {
-        let key = DedupStore::fingerprint(&body, "responses");
+        let key = DedupStore::fingerprint(&body, dedup_label);
         match dedup.acquire(key) {
             DedupAcquire::Leader(entry) => Some(entry),
             DedupAcquire::Replay(bytes) => return respond_replayed_sse(request, bytes),
@@ -3614,7 +3636,7 @@ fn handle_openai_responses(
             request,
             id,
             response_model,
-            SseFlavor::Responses,
+            SseFlavor::Responses { emit_reasoning },
             Arc::clone(auth),
             config.runtime_url.clone(),
             built,
@@ -3695,7 +3717,7 @@ fn handle_openai_responses(
         .cloned()
         .unwrap_or_default();
 
-    let output = build_responses_output(&content);
+    let output = build_responses_output(&content, emit_reasoning);
     let response = responses_completed_response(
         &id,
         &response_model,
@@ -4853,6 +4875,7 @@ mod tests {
             ToolRecoverySpec::default(),
             "resp_trunc",
             "gpt-5.2-codex",
+            true,
             |frame| frames.push(frame),
         );
 
@@ -4886,6 +4909,7 @@ mod tests {
             ToolRecoverySpec::default(),
             "resp_ok",
             "gpt-5.2-codex",
+            true,
             |frame| frames.push(frame),
         );
 
@@ -4896,6 +4920,99 @@ mod tests {
             snapshot["response"]["incomplete_details"].is_null(),
             "带 metadataEvent 的正常完成不得标截断: {snapshot}"
         );
+    }
+
+    /// 上游的 reasoningContentEvent 必须变成 reasoning item 的 summary 事件 ——
+    /// Codex 只认 `reasoning_summary_text.*` 这一路，丢掉就看不到思考过程。
+    #[test]
+    fn responses_pipe_emits_reasoning_summary() {
+        use crate::kiro::eventstream::build_frame;
+
+        let mut body = build_frame(
+            "reasoningContentEvent",
+            &json!({ "reasoningText": { "text": "先看一眼目录。" } }),
+        );
+        body.extend(build_frame(
+            "assistantResponseEvent",
+            &json!({ "content": "看完了" }),
+        ));
+        body.extend(build_frame("metadataEvent", &json!({ "stopReason": "END_TURN" })));
+        let url = serve_bytes_once(body);
+
+        let response = reqwest::blocking::get(&url).unwrap();
+        let mut frames = Vec::new();
+        let clean = pipe_kiro_body_to_responses_sse(
+            response,
+            ToolRecoverySpec::default(),
+            "resp_think",
+            "gpt-5.2-codex",
+            true,
+            |frame| frames.push(frame),
+        );
+
+        assert!(clean);
+        let delta = frames
+            .iter()
+            .find(|f| f.starts_with("event: response.reasoning_summary_text.delta"))
+            .expect("思考增量必须外发");
+        assert!(delta.contains("先看一眼目录。"), "{delta}");
+
+        let snapshot = completed_snapshot(&frames);
+        let output = snapshot["response"]["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning", "{snapshot}");
+        assert_eq!(output[0]["summary"][0]["text"], "先看一眼目录。");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "看完了");
+
+        // 思考 item 的 output_index 必须是 0，正文接在 1：顺序错了 Codex 会把
+        // 正文渲染在思考之前（它是按 index 顺序拼 output 的）
+        let reasoning_added = frames
+            .iter()
+            .find(|f| f.contains("\"type\":\"reasoning\""))
+            .expect("reasoning item 必须开出来");
+        assert!(reasoning_added.contains("\"output_index\":0"), "{reasoning_added}");
+    }
+
+    /// `reasoning.summary = "none"` 是用户显式关掉思考展示：整轮不发 reasoning item，
+    /// 正文与工具调用照常。
+    #[test]
+    fn responses_pipe_respects_reasoning_none() {
+        use crate::kiro::eventstream::build_frame;
+
+        let mut body = build_frame(
+            "reasoningContentEvent",
+            &json!({ "reasoningText": { "text": "这段不该出现。" } }),
+        );
+        body.extend(build_frame(
+            "assistantResponseEvent",
+            &json!({ "content": "看完了" }),
+        ));
+        body.extend(build_frame("metadataEvent", &json!({ "stopReason": "END_TURN" })));
+        let url = serve_bytes_once(body);
+
+        let response = reqwest::blocking::get(&url).unwrap();
+        let mut frames = Vec::new();
+        let clean = pipe_kiro_body_to_responses_sse(
+            response,
+            ToolRecoverySpec::default(),
+            "resp_think_off",
+            "gpt-5.2-codex",
+            false,
+            |frame| frames.push(frame),
+        );
+
+        assert!(clean);
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f.starts_with("event: response.reasoning")),
+            "关闭时不得出现任何 reasoning 事件"
+        );
+        let snapshot = completed_snapshot(&frames);
+        let output = snapshot["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "看完了");
     }
 
     /// 第一次连接直接掐断（模拟建连后上游断流），第二次回完整事件流。
@@ -4953,6 +5070,7 @@ mod tests {
             ToolRecoverySpec::default(),
             "resp_retry",
             "gpt-5.2-codex",
+            true,
             |frame| frames.push(frame),
         );
         assert!(clean);
@@ -5019,6 +5137,7 @@ mod tests {
             spec,
             "resp_guard_text",
             "gpt-5.2-codex",
+            true,
             |frame| frames.push(frame),
         );
 
@@ -6444,5 +6563,84 @@ mod tests {
         assert!(resp.headers().get("access-control-allow-origin").is_none());
 
         handle.stop();
+    }
+
+    /// 临时手工验证（非 CI）：Responses 入口是否把上游思考**真的**翻成 reasoning item。
+    ///
+    /// 只回答一个问题：Codex 看不到思考，是代理丢的还是上游根本没给。这里对真实
+    /// Kiro 走一遍 `/openai/v1/responses`，数 `reasoning_summary_text.delta` 事件。
+    /// 一个模型都没产出 → 上游不发思考事件，代理补不出东西来。
+    ///
+    /// 运行：cargo test -p kiro2api --lib kiro::server::tests::live_responses_reasoning_summary -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires real Kiro SSO credentials"]
+    fn live_responses_reasoning_summary() {
+        let config = ProxyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 5053,
+            proxy_api_key: Some("live-test-key".to_string()),
+            default_model: "claude-opus-5".to_string(),
+            runtime_url: "https://runtime.us-east-1.kiro.dev/".to_string(),
+            management_url: "https://management.us-east-1.kiro.dev/".to_string(),
+            sso_cache_dir: crate::paths::kiro_sso_cache_dir(),
+            profile_arn_override: None,
+        };
+        let mut handle = start_proxy(config).expect("proxy starts");
+        let port = handle.port;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .unwrap();
+
+        let mut any_thinking = false;
+        for model in ["claude-opus-5", "gpt-5.6-luna"] {
+            let resp = client
+                .post(format!("http://127.0.0.1:{port}/openai/v1/responses"))
+                .header("authorization", "Bearer live-test-key")
+                .json(&json!({
+                    "model": model,
+                    "stream": true,
+                    // Codex 默认就是 auto，这里显式写出来，确保走的是「要摘要」那条
+                    "reasoning": { "effort": "high", "summary": "auto" },
+                    "instructions": "你是严谨的助手，先推理再作答。",
+                    "input": "笼子里鸡兔共 35 个头、94 只脚，各几只？先算清再给结论。",
+                }))
+                .send()
+                .unwrap();
+            let status = resp.status();
+            if status != 200 {
+                println!("[live] {model} status={status}（跳过）");
+                continue;
+            }
+            let mut resp = resp;
+            let mut raw = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = resp.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            let deltas = raw
+                .matches("event: response.reasoning_summary_text.delta")
+                .count();
+            let has_item = raw.contains("\"type\":\"reasoning\"");
+            println!("[live] {model} reasoning_deltas={deltas} has_item={has_item}");
+            if deltas > 0 {
+                any_thinking = true;
+            }
+            assert!(
+                raw.contains("event: response.completed"),
+                "{model} 的流没有正常收尾: {}",
+                raw.chars().take(400).collect::<String>()
+            );
+        }
+
+        handle.stop();
+        assert!(
+            any_thinking,
+            "上游没有产出任何思考增量 —— 代理侧补齐也变不出内容"
+        );
     }
 }

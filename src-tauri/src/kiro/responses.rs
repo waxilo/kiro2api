@@ -19,9 +19,16 @@
 //! 下游逻辑（system 合并、tool schema 校验、antml 泄漏恢复）原样生效。
 //!
 //! 出参方向是真正的协议翻译：Responses 的流是「事件 = 带 type 的 JSON 对象」，
-//! 正文按 output item 组织（message / function_call）。思维链（reasoningContentEvent）
-//! 本期不产出 —— Responses 侧需要 reasoning item / summary 事件信封，先不做；
-//! Codex 拿到纯文本与工具调用即可正常工作。
+//! 正文按 output item 组织（message / function_call）。思维链
+//! （reasoningContentEvent）走 reasoning item 的信封：`output_item.added`
+//! （type=reasoning）→ `reasoning_summary_part.added` →
+//! `reasoning_summary_text.delta`×N → `.done` → `part.done` → `output_item.done`。
+//! Codex 消费的是 summary 通道（它的解析器只认 `reasoning_summary_text.*`），
+//! 所以上游的原始思考文本直接借 `summary_text` 这层壳送出。
+//!
+//! 开关在请求侧：`reasoning.summary = "none"`（Codex 的
+//! `model_reasoning_summary` 就落在这个字段）表示用户显式关掉思考展示，
+//! 此时整轮不发 reasoning item —— 见 [`wants_reasoning_summary`]。
 //!
 //! 与 Chat 流的另一点差异：Responses 官方**不发** `data: [DONE]`，以
 //! `response.completed` 事件收尾，连接自然关闭。
@@ -32,6 +39,20 @@ use uuid::Uuid;
 use crate::kiro::openai::openai_request_to_anthropic;
 
 // ============ 入参：Responses → Anthropic ============
+
+/// 本轮是否要发思考摘要。`reasoning.summary = "none"` 是用户显式关闭
+/// （Codex 的 `model_reasoning_summary = "none"` 原样落在这个字段上），
+/// 其余写法（字段缺失 / `auto` / `concise` / `detailed`）都按「要」处理。
+///
+/// 判据留在本模块而不是 server：这是 Responses 协议语义，两条出参路径
+/// （流式管道 / 非流式对象）必须用同一把尺，否则同一个请求换个 stream
+/// 参数就会忽然多出或少掉思考。
+pub fn wants_reasoning_summary(body: &Value) -> bool {
+    match body.get("reasoning").and_then(|r| r.get("summary")) {
+        Some(Value::String(value)) => !value.eq_ignore_ascii_case("none"),
+        _ => true,
+    }
+}
 
 /// 把 Responses 请求体翻译成 Anthropic Messages 请求体。
 ///
@@ -334,6 +355,7 @@ pub struct ResponsesEmitter {
     output: Vec<Value>,
     message: Option<OpenMessage>,
     function_call: Option<OpenFunctionCall>,
+    reasoning: Option<OpenReasoning>,
 }
 
 struct OpenMessage {
@@ -350,6 +372,14 @@ struct OpenFunctionCall {
     arguments: String,
 }
 
+/// 一条进行中的 reasoning item。`text` 只是累积器 —— 上游的思考增量
+/// 逐条外发，收口时再拼成 `summary[0].text` 给 `output_item.done` 与快照。
+struct OpenReasoning {
+    id: String,
+    output_index: usize,
+    text: String,
+}
+
 impl ResponsesEmitter {
     pub fn new(response_id: &str, model: &str) -> Self {
         Self {
@@ -359,6 +389,7 @@ impl ResponsesEmitter {
             output: Vec::new(),
             message: None,
             function_call: None,
+            reasoning: None,
         }
     }
 
@@ -406,10 +437,112 @@ impl ResponsesEmitter {
         self.frame("response.in_progress", json!({ "response": self.snapshot("in_progress") }))
     }
 
+    /// 开启 reasoning item（思考第一个非空增量到达时）。正文 / 工具若正开着先收口：
+    /// output 是「按 output_index 排列的 item 序列」，同一时刻只能有一个 open item，
+    /// 否则两个 item 会抢同一个 index。
+    pub fn open_reasoning(&mut self, send: &mut impl FnMut(String)) {
+        self.close_message(send);
+        self.close_function_call(send);
+        if self.reasoning.is_some() {
+            return;
+        }
+        let id = format!("rs_{}", Uuid::new_v4().simple());
+        let output_index = self.output.len();
+        self.reasoning = Some(OpenReasoning {
+            id: id.clone(),
+            output_index,
+            text: String::new(),
+        });
+        send(self.frame(
+            "response.output_item.added",
+            json!({
+                "output_index": output_index,
+                "item": { "id": id, "type": "reasoning", "summary": [] },
+            }),
+        ));
+        send(self.frame(
+            "response.reasoning_summary_part.added",
+            json!({
+                "item_id": id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": "" },
+            }),
+        ));
+    }
+
+    /// 思考增量。空串直接忽略 —— `reasoningContentEvent` 有时只带签名不带正文，
+    /// 那种事件不该凭空开出一条空 reasoning item（Codex 会渲染成一个空的思考块）。
+    pub fn push_reasoning(&mut self, send: &mut impl FnMut(String), delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.reasoning.is_none() {
+            self.open_reasoning(send);
+        }
+        let (item_id, output_index) = {
+            let Some(reasoning) = self.reasoning.as_mut() else {
+                return;
+            };
+            reasoning.text.push_str(delta);
+            (reasoning.id.clone(), reasoning.output_index)
+        };
+        send(self.frame(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "delta": delta,
+            }),
+        ));
+    }
+
+    /// 收口 reasoning item；没有 open 的思考时为空操作（幂等）。
+    pub fn close_reasoning(&mut self, send: &mut impl FnMut(String)) {
+        let Some(reasoning) = self.reasoning.take() else {
+            return;
+        };
+        let OpenReasoning {
+            id,
+            output_index,
+            text,
+        } = reasoning;
+        send(self.frame(
+            "response.reasoning_summary_text.done",
+            json!({
+                "item_id": id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "text": text,
+            }),
+        ));
+        send(self.frame(
+            "response.reasoning_summary_part.done",
+            json!({
+                "item_id": id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": text },
+            }),
+        ));
+        let item = json!({
+            "id": id,
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": text }],
+        });
+        send(self.frame(
+            "response.output_item.done",
+            json!({ "output_index": output_index, "item": item }),
+        ));
+        self.output.push(item);
+    }
+
     /// 开启 message item（幂等：已开着则什么都不发）。
     /// 若有 open 中的 function_call 先收口它 —— 同一时刻至多一个 open item，
     /// 否则两个 item 会争用同一个 output_index。
     pub fn open_message(&mut self, send: &mut impl FnMut(String)) {
+        self.close_reasoning(send);
         self.close_function_call(send);
         if self.message.is_some() {
             return;
@@ -497,8 +630,9 @@ impl ResponsesEmitter {
         self.output.push(item);
     }
 
-    /// 开启 function_call item；文本先行时先收口 message。
+    /// 开启 function_call item；文本 / 思考先行时先收口它们。
     pub fn open_function_call(&mut self, send: &mut impl FnMut(String), call_id: &str, name: &str) {
+        self.close_reasoning(send);
         self.close_message(send);
         let id = format!("fc_{}", Uuid::new_v4().simple());
         let output_index = self.output.len();
@@ -604,8 +738,12 @@ impl ResponsesEmitter {
 // ============ 出参：非流式响应 ============
 
 /// Anthropic `content[]` 块 → Responses 的 output items。
-/// 文本块合并进一个 message item；`tool_use` 块逐个变成 function_call item。
-pub fn build_responses_output(content: &[Value]) -> Vec<Value> {
+/// 文本块合并进一个 message item；`tool_use` 块逐个变成 function_call item；
+/// `thinking` 块（`include_reasoning` 时才处理）变成 reasoning item。
+///
+/// 顺序必须跟着 content 走：thinking 块在 Anthropic 形状里排最前，所以 reasoning
+/// item 也落在 output 首位 —— 与流式路径「先收口思考再开正文」的结果一致。
+pub fn build_responses_output(content: &[Value], include_reasoning: bool) -> Vec<Value> {
     let mut output: Vec<Value> = Vec::new();
     let mut text = String::new();
     let flush_text = |output: &mut Vec<Value>, text: &mut String| {
@@ -623,7 +761,22 @@ pub fn build_responses_output(content: &[Value]) -> Vec<Value> {
     };
     for block in content {
         match block.get("type").and_then(Value::as_str) {
-            // thinking 块不进 output：Responses 侧需要独立的 reasoning item 信封
+            Some("thinking") => {
+                if !include_reasoning {
+                    continue;
+                }
+                // 只带 signature 的空思考块：不开 reasoning item（同流式路径的取舍）
+                let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                if thinking.is_empty() {
+                    continue;
+                }
+                flush_text(&mut output, &mut text);
+                output.push(json!({
+                    "id": format!("rs_{}", Uuid::new_v4().simple()),
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": thinking }],
+                }));
+            }
             Some("text") => {
                 if let Some(part) = block.get("text").and_then(Value::as_str) {
                     text.push_str(part);
@@ -685,6 +838,175 @@ pub fn finish_responses_after_error(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 每帧的 `data:` 载荷解析成 JSON，按发出顺序排列。
+    fn parse_frames(frames: &[String]) -> Vec<Value> {
+        frames
+            .iter()
+            .map(|frame| {
+                let data = frame
+                    .split_once("\ndata: ")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or("");
+                serde_json::from_str::<Value>(data.trim_end()).expect("每帧都应带 JSON data")
+            })
+            .collect()
+    }
+
+    fn frame_types(parsed: &[Value]) -> Vec<String> {
+        parsed
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn streams_reasoning_summary_before_message() {
+        let mut emitter = ResponsesEmitter::new("resp_1", "m");
+        let mut frames: Vec<String> = Vec::new();
+        {
+            let mut send = |frame: String| frames.push(frame);
+            emitter.push_reasoning(&mut send, "先想");
+            emitter.push_reasoning(&mut send, "一下");
+            emitter.open_message(&mut send);
+            emitter.push_text(&mut send, "答案");
+            emitter.close_message(&mut send);
+        }
+        frames.push(emitter.event_completed(responses_usage(3), None));
+
+        let parsed = parse_frames(&frames);
+        assert_eq!(
+            frame_types(&parsed),
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "reasoning 必须先开、先收，正文才接在后面"
+        );
+        assert_eq!(parsed[0]["item"]["type"], "reasoning");
+        assert_eq!(parsed[0]["item"]["summary"], json!([]));
+        assert_eq!(parsed[0]["output_index"], 0);
+        // 正文 item 的 output_index 必须排在思考之后
+        assert_eq!(parsed[7]["output_index"], 1);
+
+        let output = parsed.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["type"], "summary_text");
+        assert_eq!(output[0]["summary"][0]["text"], "先想一下");
+        assert_eq!(output[1]["type"], "message");
+    }
+
+    #[test]
+    fn reasoning_after_text_opens_a_new_item() {
+        let mut emitter = ResponsesEmitter::new("resp_1", "m");
+        let mut frames: Vec<String> = Vec::new();
+        {
+            let mut send = |frame: String| frames.push(frame);
+            emitter.push_reasoning(&mut send, "第一个想法");
+            emitter.open_message(&mut send);
+            emitter.push_text(&mut send, "答案");
+            // 正文已经外发过，思考再出现只能另起一条 item —— 不能回头改写 output 顺序
+            emitter.push_reasoning(&mut send, "第二个想法");
+            emitter.close_reasoning(&mut send);
+            emitter.close_message(&mut send);
+        }
+        frames.push(emitter.event_completed(responses_usage(3), None));
+
+        let parsed = parse_frames(&frames);
+        let output = parsed.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[2]["type"], "reasoning");
+        assert_eq!(output[2]["summary"][0]["text"], "第二个想法");
+
+        // 第二条 reasoning 的 output_item.added 带着新 index
+        let added: Vec<&Value> = parsed
+            .iter()
+            .filter(|frame| frame["type"] == "response.output_item.added")
+            .collect();
+        assert_eq!(added.len(), 3);
+        assert_eq!(added[2]["output_index"], 2);
+    }
+
+    #[test]
+    fn empty_reasoning_opens_no_item() {
+        let mut emitter = ResponsesEmitter::new("resp_1", "m");
+        let mut frames: Vec<String> = Vec::new();
+        {
+            let mut send = |frame: String| frames.push(frame);
+            // 只带签名的 reasoningContentEvent 解析出来就是空串
+            emitter.push_reasoning(&mut send, "");
+            emitter.close_reasoning(&mut send);
+        }
+        assert!(frames.is_empty(), "空思考不得产出任何事件: {frames:?}");
+    }
+
+    #[test]
+    fn reasoning_closes_before_function_call() {
+        let mut emitter = ResponsesEmitter::new("resp_1", "m");
+        let mut frames: Vec<String> = Vec::new();
+        {
+            let mut send = |frame: String| frames.push(frame);
+            emitter.push_reasoning(&mut send, "要不要调工具");
+            emitter.open_function_call(&mut send, "call_1", "Read");
+            emitter.push_function_arguments(&mut send, "{}");
+            emitter.close_function_call(&mut send);
+        }
+        let parsed = parse_frames(&frames);
+        let reasoning_done = parsed
+            .iter()
+            .position(|frame| frame["type"] == "response.reasoning_summary_text.done")
+            .expect("思考必须先收口");
+        let call_added = parsed
+            .iter()
+            .position(|frame| {
+                frame["type"] == "response.output_item.added"
+                    && frame["item"]["type"] == "function_call"
+            })
+            .expect("工具 item 必须开出来");
+        assert!(reasoning_done < call_added);
+        assert_eq!(parsed[call_added]["item"]["type"], "function_call");
+        assert_eq!(parsed[call_added]["output_index"], 1);
+
+        let completed = emitter.event_completed(responses_usage(1), None);
+        let snapshot: Value =
+            serde_json::from_str(completed.split_once("\ndata: ").unwrap().1.trim_end()).unwrap();
+        assert_eq!(snapshot["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(snapshot["response"]["output"][1]["type"], "function_call");
+    }
+
+    #[test]
+    fn wants_reasoning_summary_only_skips_explicit_none() {
+        assert!(wants_reasoning_summary(&json!({})));
+        assert!(wants_reasoning_summary(&json!({ "reasoning": { "effort": "high" } })));
+        assert!(wants_reasoning_summary(&json!({ "reasoning": { "summary": "auto" } })));
+        assert!(wants_reasoning_summary(&json!({ "reasoning": { "summary": "detailed" } })));
+        assert!(wants_reasoning_summary(
+            &json!({ "reasoning": { "summary": "concise" } })
+        ));
+        assert!(!wants_reasoning_summary(&json!({ "reasoning": { "summary": "none" } })));
+        assert!(!wants_reasoning_summary(
+            &json!({ "reasoning": { "summary": "NONE" } })
+        ));
+    }
 
     #[test]
     fn converts_instructions_and_string_input() {
@@ -941,19 +1263,45 @@ mod tests {
             json!({ "type": "text", "text": "checking" }),
             json!({ "type": "tool_use", "id": "call_1", "name": "Read", "input": { "path": "a.txt" } }),
         ];
-        let output = build_responses_output(&content);
-        assert_eq!(output.len(), 2);
-        assert_eq!(output[0]["type"], "message");
-        assert_eq!(output[0]["content"][0]["text"], "checking");
-        assert_eq!(output[1]["type"], "function_call");
-        assert_eq!(output[1]["call_id"], "call_1");
-        let arguments = output[1]["arguments"].as_str().unwrap();
+        let output = build_responses_output(&content, true);
+        assert_eq!(output.len(), 3);
+        // 思考块在 Anthropic 形状里排最前，reasoning item 也必须排最前
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "hmm");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "checking");
+        assert_eq!(output[2]["type"], "function_call");
+        assert_eq!(output[2]["call_id"], "call_1");
+        let arguments = output[2]["arguments"].as_str().unwrap();
         assert_eq!(serde_json::from_str::<Value>(arguments).unwrap()["path"], "a.txt");
     }
 
     #[test]
+    fn non_stream_output_drops_reasoning_when_disabled() {
+        let content = vec![
+            json!({ "type": "thinking", "thinking": "hmm" }),
+            json!({ "type": "text", "text": "checking" }),
+        ];
+        let output = build_responses_output(&content, false);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "message");
+    }
+
+    #[test]
+    fn non_stream_output_skips_empty_thinking_block() {
+        // 只有签名的思考块不该产出一条空 reasoning item
+        let content = vec![
+            json!({ "type": "thinking", "thinking": "", "signature": "sig" }),
+            json!({ "type": "text", "text": "hi" }),
+        ];
+        let output = build_responses_output(&content, true);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "message");
+    }
+
+    #[test]
     fn non_stream_response_is_completed_with_usage() {
-        let output = build_responses_output(&[json!({ "type": "text", "text": "hi" })]);
+        let output = build_responses_output(&[json!({ "type": "text", "text": "hi" })], false);
         let response = responses_completed_response("resp_1", "m", output, 3);
         assert_eq!(response["object"], "response");
         assert_eq!(response["status"], "completed");
