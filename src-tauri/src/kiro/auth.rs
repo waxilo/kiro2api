@@ -30,6 +30,9 @@ struct AuthCache {
     cached_model_schemas: Option<HashMap<String, Value>>,
     /// modelId → 消耗倍率（rateMultiplier，上游计价倍数，如 1.3 = 1.3x credit）
     cached_model_rates: Option<HashMap<String, f64>>,
+    /// modelId → 输入模态（上游 `supportedInputTypes` 的小写值，如 ["text","image"]）。
+    /// Codex 模型目录的 `input_modalities` 由它生成 —— 写死 ["text"] 会让客户端禁止发图。
+    cached_model_input_types: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Kiro 账户额度快照（来自 getUsageLimits）。
@@ -70,10 +73,23 @@ pub struct Auth {
 ///
 /// 倍率取每个模型条目的 `rateMultiplier`（上游计价倍数，1 = 基准，0 = 不计费）；
 /// 缺失或不是数字的条目不进表 —— 上层按「未知」处理，界面不显示倍率。
-fn parse_available_models(data: &Value) -> (Vec<String>, HashMap<String, Value>, HashMap<String, f64>) {
+/// `ListAvailableModels` 的解析结果。
+///
+/// 四份数据出自同一次响应、同一次缓存写入：清单决定界面上有哪些模型，
+/// schema 决定请求侧字段净化，倍率决定计价展示，输入模态决定 Codex 目录里
+/// 允不允许发图。拆成四个独立请求只会让它们互相漂移。
+struct AvailableModels {
+    ids: Vec<String>,
+    schemas: HashMap<String, Value>,
+    rates: HashMap<String, f64>,
+    input_types: HashMap<String, Vec<String>>,
+}
+
+fn parse_available_models(data: &Value) -> AvailableModels {
     let mut ids: Vec<String> = Vec::new();
     let mut schemas: HashMap<String, Value> = HashMap::new();
     let mut rates: HashMap<String, f64> = HashMap::new();
+    let mut input_types: HashMap<String, Vec<String>> = HashMap::new();
     if let Some(models) = data.get("models").and_then(|v| v.as_array()) {
         for model in models {
             let Some(id) = model.get("modelId").and_then(|v| v.as_str()) else {
@@ -88,9 +104,28 @@ fn parse_available_models(data: &Value) -> (Vec<String>, HashMap<String, Value>,
             if let Some(rate) = model.get("rateMultiplier").and_then(Value::as_f64) {
                 rates.insert(id.to_string(), rate);
             }
+            // 上游用大写字面量（TEXT / IMAGE），统一小写：这是 `input_modalities`
+            // 在 Codex 目录里的书写形状，也方便下游直接比较。
+            if let Some(types) = model.get("supportedInputTypes").and_then(Value::as_array) {
+                let mut list: Vec<String> = Vec::new();
+                for kind in types.iter().filter_map(Value::as_str) {
+                    let kind = kind.to_lowercase();
+                    if !list.contains(&kind) {
+                        list.push(kind);
+                    }
+                }
+                if !list.is_empty() {
+                    input_types.insert(id.to_string(), list);
+                }
+            }
         }
     }
-    (ids, schemas, rates)
+    AvailableModels {
+        ids,
+        schemas,
+        rates,
+        input_types,
+    }
 }
 
 impl Auth {
@@ -709,14 +744,15 @@ impl Auth {
         if !status.is_success() {
             return Err(format!("ListAvailableModels failed: {status}"));
         }
-        let (ids, schemas, rates) = parse_available_models(&data);
-        if !ids.is_empty() {
+        let parsed = parse_available_models(&data);
+        if !parsed.ids.is_empty() {
             if let Ok(mut cache) = self.cache.lock() {
-                cache.cached_model_schemas = Some(schemas);
-                cache.cached_model_rates = Some(rates);
+                cache.cached_model_schemas = Some(parsed.schemas);
+                cache.cached_model_rates = Some(parsed.rates);
+                cache.cached_model_input_types = Some(parsed.input_types);
             }
         }
-        Ok(ids)
+        Ok(parsed.ids)
     }
 
     /// modelId → 消耗倍率（rateMultiplier）整表。未枚举过模型时先触发一次
@@ -735,6 +771,27 @@ impl Auth {
             .lock()
             .ok()
             .and_then(|c| c.cached_model_rates.clone())
+            .unwrap_or_default()
+    }
+
+    /// modelId → 输入模态（上游 `supportedInputTypes` 的小写值，如 `["text","image"]`）。
+    ///
+    /// 未枚举过模型时先触发一次 ListAvailableModels 缓存；旧缓存里没有这个字段时返回空表
+    /// —— 调用方按模型家族兜底（见 [`crate::kiro::models::default_input_modalities`]）。
+    pub fn model_input_types(&self) -> HashMap<String, Vec<String>> {
+        if self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|c| c.cached_model_input_types.clone())
+            .is_none()
+        {
+            let _ = self.list_available_models();
+        }
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|c| c.cached_model_input_types.clone())
             .unwrap_or_default()
     }
 
@@ -1030,35 +1087,49 @@ mod tests {
                     "rateUnit": "Credit",
                     "tokenLimits": { "maxInputTokens": 200_000, "maxOutputTokens": 64_000 }
                 },
-                { "modelId": "gpt-5.6-terra", "rateMultiplier": 1.3 },
+                { "modelId": "gpt-5.6-terra", "rateMultiplier": 1.3, "supportedInputTypes": ["TEXT", "IMAGE"] },
                 // 没给倍率 / 倍率不是数字：不进倍率表，但不影响 id 与 schema
-                { "modelId": "deepseek-v3", "rateMultiplier": "free" },
+                { "modelId": "deepseek-v3", "rateMultiplier": "free", "supportedInputTypes": ["TEXT"] },
                 { "modelId": "mystery-model" }
             ]
         });
-        let (ids, schemas, rates) = parse_available_models(&data);
-        assert_eq!(ids, vec!["claude-sonnet-5", "gpt-5.6-terra", "deepseek-v3", "mystery-model"]);
-        assert_eq!(schemas.len(), 1);
-        assert!(schemas.contains_key("claude-sonnet-5"));
-        assert_eq!(rates.get("claude-sonnet-5"), Some(&1.0));
-        assert_eq!(rates.get("gpt-5.6-terra"), Some(&1.3));
-        assert!(!rates.contains_key("deepseek-v3"));
-        assert!(!rates.contains_key("mystery-model"));
+        let parsed = parse_available_models(&data);
+        assert_eq!(parsed.ids, vec!["claude-sonnet-5", "gpt-5.6-terra", "deepseek-v3", "mystery-model"]);
+        assert_eq!(parsed.schemas.len(), 1);
+        assert!(parsed.schemas.contains_key("claude-sonnet-5"));
+        assert_eq!(parsed.rates.get("claude-sonnet-5"), Some(&1.0));
+        assert_eq!(parsed.rates.get("gpt-5.6-terra"), Some(&1.3));
+        assert!(!parsed.rates.contains_key("deepseek-v3"));
+        assert!(!parsed.rates.contains_key("mystery-model"));
+        // 模态一律小写：这是 Codex 目录 input_modalities 的书写形状
+        assert_eq!(
+            parsed.input_types.get("gpt-5.6-terra"),
+            Some(&vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(parsed.input_types.get("deepseek-v3"), Some(&vec!["text".to_string()]));
+        // 上游没给 supportedInputTypes 时不编造：由调用方按家族兜底
+        assert!(!parsed.input_types.contains_key("mystery-model"));
     }
 
     #[test]
     fn parse_available_models_tolerates_junk_and_dedups_ids() {
-        let (ids, schemas, rates) = parse_available_models(&json!({}));
-        assert!(ids.is_empty() && schemas.is_empty() && rates.is_empty());
-        let (ids, _, rates) = parse_available_models(&json!({
+        let parsed = parse_available_models(&json!({}));
+        assert!(parsed.ids.is_empty() && parsed.schemas.is_empty() && parsed.rates.is_empty());
+        assert!(parsed.input_types.is_empty());
+        let parsed = parse_available_models(&json!({
             "models": [
-                { "modelId": "gpt-5", "rateMultiplier": 0 },
+                { "modelId": "gpt-5", "rateMultiplier": 0, "supportedInputTypes": ["TEXT", "IMAGE", "image"] },
                 { "modelId": "gpt-5", "rateMultiplier": 9 }
             ]
         }));
         // 重复 id 只留首见；倍率随最后一个同名条目覆盖（与 schema 表同口径）
-        assert_eq!(ids, vec!["gpt-5"]);
-        assert_eq!(rates.get("gpt-5"), Some(&9.0));
+        assert_eq!(parsed.ids, vec!["gpt-5"]);
+        assert_eq!(parsed.rates.get("gpt-5"), Some(&9.0));
+        // 同一条目里重复的模态去重保序
+        assert_eq!(
+            parsed.input_types.get("gpt-5"),
+            Some(&vec!["text".to_string(), "image".to_string()])
+        );
     }
 
     #[test]

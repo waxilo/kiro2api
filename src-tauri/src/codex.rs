@@ -57,6 +57,7 @@
 //! 撤顶层 model，目录文件随之删除。写盘顺序保证指针永不悬空 —— 建目录先写
 //! 文件再写配置，撤目录先写配置再删文件。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -66,7 +67,7 @@ use toml_edit::{table, value, DocumentMut, Item, Table};
 use tauri::State;
 
 use crate::codex_restart::codex_app_running;
-use crate::kiro::models::ModelFamily;
+use crate::kiro::models::{default_input_modalities, ModelFamily};
 use crate::kiro::{build_access, current_api_key, KiroProxyState};
 use crate::workbuddy::origin_matches;
 
@@ -395,7 +396,12 @@ impl CatalogLimits {
 /// 字段，多写不炸。推理档位只挂 low/medium/high（默认取用户在 kiro2api 里选的
 /// 那一档，与代理侧补默认值同源）：全模型通吃，Codex 侧用户选低档时代理侧的
 /// 归一化也能接住。
-fn catalog_entry(slug: &str, priority: i32, limits: &CatalogLimits) -> Value {
+fn catalog_entry(
+    slug: &str,
+    priority: i32,
+    limits: &CatalogLimits,
+    input_modalities: &[String],
+) -> Value {
     json!({
         "slug": slug,
         "display_name": slug,
@@ -424,22 +430,57 @@ fn catalog_entry(slug: &str, priority: i32, limits: &CatalogLimits) -> Value {
         "context_window": limits.context_window,
         "max_context_window": limits.context_window,
         "effective_context_window_percent": 95,
+        // 「原始细节模式」是 detail 参数的一种，Kiro 只接收图片字节、没有 detail，
+        // 所以不声明。它不决定「能不能发图」，别和 input_modalities 混为一谈；
+        // 声明 true 只会让 Codex 不降采样地发原图，更容易撞上代理的请求体上限。
         "supports_image_detail_original": false,
         "supports_search_tool": false,
-        "input_modalities": ["text"],
+        // 上游 supportedInputTypes 的镜像。这是 Codex 侧「允不允许贴图」的唯一开关：
+        // 写死 ["text"] 时，哪怕上游模型能看图，客户端也会把图片拦在使用之前。
+        "input_modalities": input_modalities,
         "additional_speed_tiers": [],
         "service_tiers": [],
     })
 }
 
+/// Codex 的 `input_modalities` 是封闭枚举（text / image / audio）：未知值会让整份
+/// 目录 JSON 反序列化失败，Codex 启动直接报错。上游 `supportedInputTypes` 是会长大的
+/// 字段（将来可能多出 video / file），所以这里必须过滤，不能原样透传。
+fn codex_modalities(types: &[String], slug: &str) -> Vec<String> {
+    let mut out: Vec<String> = types
+        .iter()
+        .filter(|kind| matches!(kind.as_str(), "text" | "image"))
+        .cloned()
+        .collect();
+    if out.is_empty() {
+        return default_input_modalities(slug);
+    }
+    // 目录里任何模型都必须接受文本输入，上游漏写时补在前头
+    if !out.iter().any(|kind| kind == "text") {
+        out.insert(0, "text".to_string());
+    }
+    out
+}
+
 /// 目录文件内容：Codex 只认 `{ "models": [...] }`。priority 随位置递增，
 /// 让选择器按勾选顺序排。
-fn catalog_document(models: &[String], limits: &CatalogLimits) -> Value {
+fn catalog_document(
+    models: &[String],
+    limits: &CatalogLimits,
+    input_types: &HashMap<String, Vec<String>>,
+) -> Value {
     json!({
         "models": models
             .iter()
             .enumerate()
-            .map(|(i, slug)| catalog_entry(slug, 1000 + i as i32, limits))
+            .map(|(i, slug)| {
+                // 没同步过（首次接入 / 离线）时按家族兜底，不把能看图的模型写成纯文本
+                let modalities = match input_types.get(slug) {
+                    Some(types) => codex_modalities(types, slug),
+                    None => default_input_modalities(slug),
+                };
+                catalog_entry(slug, 1000 + i as i32, limits, &modalities)
+            })
             .collect::<Vec<_>>(),
     })
 }
@@ -476,8 +517,12 @@ pub(crate) fn refresh_catalog_if_ours() -> Result<bool, String> {
     if models.is_empty() {
         return Ok(false);
     }
-    let desired = serde_json::to_string_pretty(&catalog_document(&models, &CatalogLimits::current()))
-        .map_err(|e| format!("序列化模型目录失败: {e}"))?;
+    let desired = serde_json::to_string_pretty(&catalog_document(
+        &models,
+        &CatalogLimits::current(),
+        &crate::prefs::cached_model_input_types(),
+    ))
+    .map_err(|e| format!("序列化模型目录失败: {e}"))?;
     if text == desired {
         return Ok(false);
     }
@@ -886,8 +931,12 @@ fn import_to_dir(
     let catalog_written = if catalog_managed && !models.is_empty() {
         // 先写目录文件再写配置：指针落地时文件必已就位，中断也只会多出一个
         // 没被引用的文件，不会让 Codex 拿到悬空指针
-        let desired = serde_json::to_string_pretty(&catalog_document(models, &CatalogLimits::current()))
-            .map_err(|e| format!("序列化模型目录失败: {e}"))?;
+        let desired = serde_json::to_string_pretty(&catalog_document(
+            models,
+            &CatalogLimits::current(),
+            &crate::prefs::cached_model_input_types(),
+        ))
+        .map_err(|e| format!("序列化模型目录失败: {e}"))?;
         let differs =
             fs::read_to_string(&catalog_file).ok().as_deref() != Some(desired.as_str());
         if differs {
@@ -1267,7 +1316,7 @@ model = "their-pick"
             context_window: 500_000,
             default_effort: "low".to_string(),
         };
-        let entry = catalog_entry("m1", 1000, &limits);
+        let entry = catalog_entry("m1", 1000, &limits, &["text".to_string()]);
         assert_eq!(entry["slug"], "m1");
         assert_eq!(entry["display_name"], "m1");
         assert_eq!(entry["visibility"], "list");
@@ -1400,6 +1449,7 @@ model = "their-pick"
         let text = serde_json::to_string(&catalog_document(
             &["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
             &CatalogLimits::current(),
+            &HashMap::new(),
         ))
         .unwrap();
         let current = schema_mirror::parse::<schema_mirror::Current>(&text).unwrap();
@@ -1408,11 +1458,73 @@ model = "their-pick"
         assert_eq!(legacy, 2);
     }
 
+    /// 输入模态必须来自上游 `supportedInputTypes`（缓存表），不能写死纯文本：
+    /// Codex 侧「能不能贴图」只看这一个键，写死 ["text"] 会在客户端就挡掉图片。
+    #[test]
+    fn catalog_entry_mirrors_upstream_input_modalities() {
+        let limits = CatalogLimits::current();
+        let mut types: HashMap<String, Vec<String>> = HashMap::new();
+        types.insert(
+            "gpt-5.6-terra".to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        types.insert("deepseek-3.2".to_string(), vec!["text".to_string()]);
+        let doc = catalog_document(
+            &["gpt-5.6-terra".to_string(), "deepseek-3.2".to_string()],
+            &limits,
+            &types,
+        );
+        assert_eq!(doc["models"][0]["input_modalities"], json!(["text", "image"]));
+        assert_eq!(doc["models"][1]["input_modalities"], json!(["text"]));
+    }
+
+    /// 没同步过（首次接入 / 离线）时按模型家族兜底：gpt / claude / grok 保留图片能力，
+    /// 其余保持纯文本 —— 兜底不等于一律 ["text"]。
+    #[test]
+    fn catalog_falls_back_to_family_modalities_without_cache() {
+        let doc = catalog_document(
+            &[
+                "gpt-5.6-luna".to_string(),
+                "claude-sonnet-4.6".to_string(),
+                "glm-5".to_string(),
+            ],
+            &CatalogLimits::current(),
+            &HashMap::new(),
+        );
+        assert_eq!(doc["models"][0]["input_modalities"], json!(["text", "image"]));
+        assert_eq!(doc["models"][1]["input_modalities"], json!(["text", "image"]));
+        assert_eq!(doc["models"][2]["input_modalities"], json!(["text"]));
+    }
+
+    /// 上游新增模态（video / file）不能原样进目录：Codex 的枚举是封闭的，
+    /// 一个未知值就会让整份目录反序列化失败。
+    #[test]
+    fn codex_modalities_filters_unknown_values() {
+        assert_eq!(
+            codex_modalities(
+                &["text".to_string(), "video".to_string()],
+                "gpt-5.6-terra"
+            ),
+            vec!["text".to_string()]
+        );
+        // 上游只给 image 时补上 text：任何模型都必须接受文本输入
+        assert_eq!(
+            codex_modalities(&["image".to_string()], "gpt-5.6-terra"),
+            vec!["text".to_string(), "image".to_string()]
+        );
+        // 全是不认识的值 → 按家族兜底，而不是把模型写成空数组
+        assert_eq!(
+            codex_modalities(&["file".to_string()], "deepseek-3.2"),
+            vec!["text".to_string()]
+        );
+    }
+
     #[test]
     fn parse_catalog_text_reads_slugs_and_rejects_junk() {
         let text = serde_json::to_string(&catalog_document(
             &["m1".to_string(), "m2".to_string()],
             &CatalogLimits::current(),
+            &HashMap::new(),
         ))
         .unwrap();
         assert_eq!(parse_catalog_text(&text).unwrap(), vec!["m1", "m2"]);

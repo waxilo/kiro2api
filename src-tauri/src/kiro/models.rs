@@ -30,8 +30,7 @@ pub fn is_known_kiro_model(model: &str) -> bool {
 }
 
 /// Claude 各代的 effort 枚举（上游 schema 拿不到时的回退值）。
-const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-/// 4.6 两代没有 xhigh 这一档。
+const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];/// 4.6 两代没有 xhigh 这一档。
 const CLAUDE_46_EFFORT: &[&str] = &["low", "medium", "high", "max"];
 /// GPT 系列多一个 none。
 const GPT_EFFORT: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
@@ -53,6 +52,22 @@ pub const DEFAULT_EFFORT: &str = "high";
 /// 更糟的是**任何原样合入的 effort 都失去了校验依据**，脏值会直接打到上游报
 /// `does not have a value in the enumeration [...]`。带日期后缀的公共 ID 有 6~8 位
 /// 版本号，被 [`looks_like_kiro_claude_model`] 挡掉，仍回退为空集。
+/// 上游 `supportedInputTypes` 缺失时（离线、旧缓存、未知型号）的输入模态兜底。
+///
+/// 按模型家族判而不是逐个型号：Claude 与 GPT 全系原生支持图片输入，Grok 当前也是
+/// text+image；其余（deepseek / glm / minimax / qwen）上游声明为纯文本。
+/// 上游给过真实值时一律以真实值为准，这里只服务于离线生成模型目录。
+pub fn default_input_modalities(model: &str) -> Vec<String> {
+    let supports_image = model.starts_with("claude-")
+        || model.starts_with("gpt-")
+        || model.starts_with("grok-");
+    if supports_image {
+        vec!["text".to_string(), "image".to_string()]
+    } else {
+        vec!["text".to_string()]
+    }
+}
+
 pub fn effort_levels_for_model(kiro_model: &str) -> &'static [&'static str] {
     if matches!(kiro_model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") {
         return GPT_EFFORT;
@@ -548,6 +563,19 @@ pub fn resolve_model_profile(kiro_model: &str, schema: Option<&Value>) -> ModelP
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 离线兜底：家族决定是否声明图片输入，未知型号保守按纯文本。
+    #[test]
+    fn default_input_modalities_follows_model_family() {
+        let with_image = vec!["text".to_string(), "image".to_string()];
+        let text_only = vec!["text".to_string()];
+        for slug in ["gpt-5.6-terra", "gpt-5.6-luna", "claude-opus-4.8", "grok-4.7"] {
+            assert_eq!(default_input_modalities(slug), with_image, "{slug}");
+        }
+        for slug in ["deepseek-3.2", "glm-5", "minimax-m2.5", "qwen3-coder-next", "unknown"] {
+            assert_eq!(default_input_modalities(slug), text_only, "{slug}");
+        }
+    }
 
     #[test]
     fn defaults_preserve_legacy_family_behavior() {

@@ -40,6 +40,14 @@ pub(crate) struct AppConfig {
     /// 与 `models` 同一次同步落盘（见 `store_models`），保证两份数据出自同一时刻；
     /// 空表 = 上游没给过或还没同步过，界面不显示倍率。
     pub(crate) model_rates: HashMap<String, f64>,
+    /// 上一次同步到的模型输入模态（公共模型 id → 上游 `supportedInputTypes` 的小写值，
+    /// 例如 `["text","image"]`）。
+    ///
+    /// 与 `models` / `model_rates` 同一次同步落盘。为什么要存：Codex 模型目录里的
+    /// `input_modalities` 决定客户端允不允许发图，而那份目录是离线生成的 —— 没有这份
+    /// 缓存就只能写死 `["text"]`，用户在 Codex 里贴图会被直接判定为「模型不支持」。
+    /// 空表 = 还没同步过，调用方按模型名家族兜底（见 `models::default_input_modalities`）。
+    pub(crate) model_input_types: HashMap<String, Vec<String>>,
     /// 曾经在清单里、这次同步却不在的模型（公共 id）。
     ///
     /// 上游把某个模型从账户清单里撤掉时，直接把它从 `models` 删掉会让界面凭空少一排，
@@ -126,6 +134,7 @@ impl Default for AppConfig {
             proxy_api_key: None,
             models: Vec::new(),
             model_rates: HashMap::new(),
+            model_input_types: HashMap::new(),
             unavailable_models: Vec::new(),
             usage_cache: None,
             update_source: None,
@@ -258,17 +267,32 @@ fn stale_models(previous: &[String], hidden: &[String], current: &[String]) -> V
     out
 }
 
-/// 写入模型缓存：清单与倍率同一次落盘，保证两份数据出自同一次同步。
+/// 读取缓存的模型输入模态（纯本地读取，不发网络请求）。
+pub(crate) fn cached_model_input_types() -> HashMap<String, Vec<String>> {
+    load_config().model_input_types
+}
+
+/// 写入模型缓存：清单、倍率与输入模态同一次落盘，保证三份数据出自同一次同步。
 ///
 /// 顺带维护 [`AppConfig::unavailable_models`]，并把这份名单返回给调用方
 /// （要一起推给界面，见 `ModelsState::unavailable`）。
-pub(crate) fn store_models(models: &[String], rates: &HashMap<String, f64>) -> Result<Vec<String>, String> {
+pub(crate) fn store_models(
+    models: &[String],
+    rates: &HashMap<String, f64>,
+    input_types: &HashMap<String, Vec<String>>,
+) -> Result<Vec<String>, String> {
     let mut unavailable: Vec<String> = Vec::new();
     update_config(|config| {
         let stale = stale_models(&config.models, &config.unavailable_models, models);
         unavailable = stale.clone();
         config.models = models.to_vec();
         config.model_rates = rates.clone();
+        // 只留当前清单里还有的模型：上游撤掉的模型不该继续占着模态表
+        config.model_input_types = input_types
+            .iter()
+            .filter(|(id, _)| models.contains(id))
+            .map(|(id, types)| (id.clone(), types.clone()))
+            .collect();
         config.unavailable_models = stale;
         Ok(())
     })?;

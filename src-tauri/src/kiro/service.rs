@@ -585,7 +585,15 @@ pub(crate) fn sync_models_from_upstream() -> Result<ModelsState, String> {
         }
     }
     rates.retain(|public, _| models.contains(public));
-    let unavailable = store_models(&models, &rates)?;
+    // 输入模态同样换成公共 id：Codex 模型目录按 slug 查这份表，拿不到就按家族兜底
+    let mut input_types: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, types) in auth.model_input_types() {
+        input_types
+            .entry(kiro_model_to_public_model_id(&id))
+            .or_insert(types);
+    }
+    input_types.retain(|public, _| models.contains(public));
+    let unavailable = store_models(&models, &rates, &input_types)?;
     if !unavailable.is_empty() {
         eprintln!(
             "[proxy] 上游不再提供 {} 个模型：{}",
@@ -601,6 +609,11 @@ pub(crate) fn refresh_models_and_notify() {
     match sync_models_from_upstream() {
         Ok(state) => {
             eprintln!("[proxy] 模型列表已同步: {} 个", state.models.len());
+            // 目录里的 input_modalities 跟着上游模态走：不同步重写的话，老用户升级后
+            // 目录仍是旧的 ["text"]，在 Codex 里贴图依旧被拦（改设置的路径才会重写）。
+            if let Err(error) = crate::codex::refresh_catalog_if_ours() {
+                eprintln!("[codex] 模型目录刷新失败: {error}");
+            }
             notify("proxy://models-updated", state);
         }
         Err(error) => eprintln!("[proxy] 同步模型列表失败: {error}"),
