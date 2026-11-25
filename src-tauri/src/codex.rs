@@ -67,7 +67,9 @@ use toml_edit::{table, value, DocumentMut, Item, Table};
 use tauri::State;
 
 use crate::codex_restart::codex_app_running;
-use crate::kiro::models::{default_input_modalities, ModelFamily};
+use crate::kiro::models::{
+    default_input_modalities, effort_levels_for_model, highest_effort, public_model_id_to_kiro_model,
+};
 use crate::kiro::{build_access, current_api_key, KiroProxyState};
 use crate::workbuddy::origin_matches;
 
@@ -391,17 +393,65 @@ impl CatalogLimits {
     }
 }
 
+/// Codex 的 `supported_reasoning_levels` 只列它在界面上能标出来的三档。
+/// 上游枚举里的 none / xhigh / max 对 Codex 不构成可选项 —— 声明了它也不会发，
+/// 反而会让目录与代理侧的口径看起来不一致。
+const CODEX_EFFORT_TIERS: &[&str] = &["low", "medium", "high"];
+
+/// 档位在 Codex 选择器里的说明（沿用原来的三句）。
+fn effort_description(effort: &str) -> &'static str {
+    match effort {
+        "low" => "更快",
+        "medium" => "均衡",
+        _ => "更深入",
+    }
+}
+
+/// 一个模型在 Codex 目录里的推理档位：(可选项, 默认档)。
+///
+/// slug 是 Kiro 的**公开 ID**（`claude-sonnet-4-5`），而档位表按 Kiro 私有形态
+/// （`claude-sonnet-4.5`）编排 —— 不先归一化就查会得到空集，Claude 白白丢掉档位。
+///
+/// 默认档必须落在可选项里：用户在 kiro2api 里选的档位若不在该模型的交集内，
+/// 退到它能给的最高档；完全不收 effort 的模型（deepseek / glm / qwen）返回空集 +
+/// None —— Codex 端不显示档位，代理侧也会把整块 effort 省略（见
+/// `transform::resolve_effort`）。
+fn catalog_reasoning(slug: &str, default_effort: &str) -> (Vec<String>, Option<String>) {
+    let kiro_model = public_model_id_to_kiro_model(slug);
+    let levels: Vec<String> = effort_levels_for_model(&kiro_model)
+        .iter()
+        .filter(|level| CODEX_EFFORT_TIERS.contains(level))
+        .map(|level| (*level).to_string())
+        .collect();
+    if levels.is_empty() {
+        return (levels, None);
+    }
+    let default = if levels.iter().any(|level| level == default_effort) {
+        default_effort.to_string()
+    } else {
+        highest_effort(&levels).unwrap_or_else(|| levels[0].clone())
+    };
+    (levels, Some(default))
+}
+
 /// 一条目录条目。字段是 openai/codex 新旧两个 schema 世代的超集：两个世代
 /// 各自必需的键都写上，新世代必需的 Option 槽位显式给 null —— serde 不拒未知
-/// 字段，多写不炸。推理档位只挂 low/medium/high（默认取用户在 kiro2api 里选的
-/// 那一档，与代理侧补默认值同源）：全模型通吃，Codex 侧用户选低档时代理侧的
-/// 归一化也能接住。
+/// 字段，多写不炸。
+///
+/// 推理档位按**模型自己的能力**生成（[`catalog_reasoning`]），不再假定每个模型
+/// 都吃 low/medium/high：Claude 各代有档位，DeepSeek / GLM / Qwen 没有（空数组 +
+/// null 默认档），Codex 端就不会给用户一个必然被丢弃的选项。
 fn catalog_entry(
     slug: &str,
     priority: i32,
     limits: &CatalogLimits,
     input_modalities: &[String],
 ) -> Value {
+    let (levels, default_level) = catalog_reasoning(slug, &limits.default_effort);
+    let reasoning_levels: Vec<Value> = levels
+        .iter()
+        .map(|effort| json!({ "effort": effort, "description": effort_description(effort) }))
+        .collect();
     json!({
         "slug": slug,
         "display_name": slug,
@@ -414,12 +464,8 @@ fn catalog_entry(
         "supports_reasoning_summaries": true,
         "supports_parallel_tool_calls": false,
         // 两个世代都必需的键
-        "supported_reasoning_levels": [
-            { "effort": "low", "description": "更快" },
-            { "effort": "medium", "description": "均衡" },
-            { "effort": "high", "description": "更深入" }
-        ],
-        "default_reasoning_level": &limits.default_effort,
+        "supported_reasoning_levels": reasoning_levels,
+        "default_reasoning_level": default_level,
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
@@ -856,19 +902,20 @@ fn remove_from_parts(
     (config_changed, auth_changed, catalog_removed)
 }
 
-/// 前端来的模型清单：去首尾空白、丢空项、去重（保序），只留 GPT 系 ——
-/// Codex 桌面端只认 gpt- 开头的模型，目录里混进 claude/deepseek 会让用户在
-/// /model 里选到后请求失败。旧目录里的非 GPT 条目借「应用」自然清出。
+/// 前端来的模型清单：去首尾空白、丢空项、去重（保序），并排除 `auto`。
+///
+/// **不限模型家族**：Codex 的 /model 只认目录里的 slug，不要求 `gpt-` 前缀 ——
+/// 目录条目自带能力声明（推理档位、输入模态），Claude / DeepSeek / GLM 一样能被
+/// Codex 选中并正常发请求（workbuddy2api 的目录里就有一条 `hy4flash-free`）。
+///
+/// 排除 `auto` 的理由不是家族，而是它没有确定的能力：那是 Kiro 的「自选模型」
+/// 占位，档位与模态都无从声明，写进目录只会让 Codex 端多出一个语义含混的选项。
 fn clean_models(models: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     models
         .into_iter()
         .map(|m| m.trim().to_string())
-        .filter(|m| {
-            !m.is_empty()
-                && ModelFamily::classify(m) == ModelFamily::Gpt
-                && seen.insert(m.clone())
-        })
+        .filter(|m| !m.is_empty() && m != "auto" && seen.insert(m.clone()))
         .collect()
 }
 
@@ -1320,9 +1367,9 @@ model = "their-pick"
             context_window: 500_000,
             default_effort: "low".to_string(),
         };
-        let entry = catalog_entry("m1", 1000, &limits, &["text".to_string()]);
-        assert_eq!(entry["slug"], "m1");
-        assert_eq!(entry["display_name"], "m1");
+        let entry = catalog_entry("gpt-5.6-luna", 1000, &limits, &["text".to_string()]);
+        assert_eq!(entry["slug"], "gpt-5.6-luna");
+        assert_eq!(entry["display_name"], "gpt-5.6-luna");
         assert_eq!(entry["visibility"], "list");
         assert_eq!(entry["shell_type"], "shell_command");
         assert_eq!(entry["supported_in_api"], true);
@@ -1345,6 +1392,42 @@ model = "their-pick"
         assert!(entry.get("availability_nux").is_some());
         assert!(entry.get("upgrade").is_some());
         assert!(entry.get("experimental_supported_tools").is_some());
+    }
+
+    /// 档位按**模型自己的能力**生成：Claude 有档位，不收 effort 的模型是空数组 +
+    /// null 默认档。写死 low/medium/high 会给 DeepSeek 一个必然被代理丢弃的选项。
+    #[test]
+    fn catalog_reasoning_follows_model_family() {
+        let gpt = catalog_reasoning("gpt-5.6-luna", "high");
+        assert_eq!(gpt.0, vec!["low", "medium", "high"]);
+        assert_eq!(gpt.1.as_deref(), Some("high"));
+
+        // 清单里是公共 ID（claude-sonnet-4-5）：必须先折成 Kiro 形态才查得到档位
+        let claude = catalog_reasoning("claude-sonnet-4-5", "medium");
+        assert_eq!(claude.0, vec!["low", "medium", "high"]);
+        assert_eq!(claude.1.as_deref(), Some("medium"));
+
+        // 4.6 两代的枚举少 xhigh，但 Codex 认的三档都在
+        let claude46 = catalog_reasoning("claude-opus-4-6", "high");
+        assert_eq!(claude46.0, vec!["low", "medium", "high"]);
+
+        for slug in ["deepseek-3.2", "glm-5", "qwen3-coder-next", "minimax-m2.5"] {
+            let (levels, default) = catalog_reasoning(slug, "high");
+            assert!(levels.is_empty(), "{slug} 不该声明档位");
+            assert!(default.is_none(), "{slug} 不该有默认档");
+        }
+    }
+
+    /// 用户设置的默认档不在模型枚举里时退到它能给的最高档，而不是写一个上游不收的值。
+    #[test]
+    fn catalog_default_falls_back_to_highest_supported() {
+        // max / none 都不在 Codex 的三档里 → 落到 high
+        assert_eq!(catalog_reasoning("gpt-5.6-luna", "max").1.as_deref(), Some("high"));
+        assert_eq!(catalog_reasoning("claude-sonnet-4-5", "none").1.as_deref(), Some("high"));
+        // 合法档位原样保留
+        assert_eq!(catalog_reasoning("claude-sonnet-4-5", "low").1.as_deref(), Some("low"));
+        // 不收 effort 的模型没有「可退的档」
+        assert!(catalog_reasoning("deepseek-3.2", "high").1.is_none());
     }
 
     /// Codex `ModelInfo` 的「必需键」镜像：只抄对应世代里没有 serde default 的
@@ -1450,16 +1533,28 @@ model = "their-pick"
 
     #[test]
     fn catalog_document_parses_as_both_codex_generations() {
+        // 混合家族：Claude 有档位、DeepSeek 是空档位 + null 默认档 —— 这个形状
+        // 必须能被 Codex 两个世代的 schema 同时接受，否则它启动就报错
         let text = serde_json::to_string(&catalog_document(
-            &["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
+            &[
+                "gpt-5.2".to_string(),
+                "gpt-5.2-codex".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "deepseek-3.2".to_string(),
+            ],
             &CatalogLimits::current(),
             &HashMap::new(),
         ))
         .unwrap();
         let current = schema_mirror::parse::<schema_mirror::Current>(&text).unwrap();
-        assert_eq!(current, 2);
+        assert_eq!(current, 4);
         let legacy = schema_mirror::parse::<schema_mirror::Legacy>(&text).unwrap();
-        assert_eq!(legacy, 2);
+        assert_eq!(legacy, 4);
+        // 不收 effort 的条目：空数组 + null，Codex 端不显示档位
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["models"][3]["supported_reasoning_levels"], json!([]));
+        assert!(parsed["models"][3]["default_reasoning_level"].is_null());
+        assert_eq!(parsed["models"][2]["default_reasoning_level"], "high");
     }
 
     /// 输入模态必须来自上游 `supportedInputTypes`（缓存表），不能写死纯文本：
@@ -1538,18 +1633,26 @@ model = "their-pick"
         assert!(parse_catalog_text("not json").is_err());
     }
 
+    /// 家族不再是筛子：Codex 认目录里的任意 slug；只有 `auto`（Kiro 的自选占位，
+    /// 能力无从声明）该被挡在目录外。
     #[test]
-    fn clean_models_trims_dedups_and_keeps_gpt_only() {
+    fn clean_models_keeps_every_family_but_drops_auto() {
         assert_eq!(
             clean_models(vec![
                 " gpt-5.2 ".to_string(),
                 String::new(),
                 "gpt-5.2".to_string(),
-                "claude-sonnet-5".to_string(),
-                "deepseek-v3".to_string(),
-                "gpt-5.6-terra".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "deepseek-3.2".to_string(),
+                "glm-5".to_string(),
+                "auto".to_string(),
             ]),
-            vec!["gpt-5.2".to_string(), "gpt-5.6-terra".to_string()]
+            vec![
+                "gpt-5.2".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "deepseek-3.2".to_string(),
+                "glm-5".to_string(),
+            ]
         );
     }
 

@@ -28,8 +28,14 @@ const TABS: TabSpec[] = [
   { id: 'codex', label: 'Codex' },
 ];
 
-/** Codex 桌面端只认 GPT 系模型，网格与目录都只留 gpt- 开头的（与 Rust 侧 ModelFamily::classify 同一规则）。 */
-const isGptModel = (id: string) => id.trim().startsWith('gpt-');
+/**
+ * 可接入 Codex 的模型：除 `auto` 外都行。
+ *
+ * 家族不是筛子 —— Codex 的 /model 只认目录里的 slug，目录条目自带能力声明，
+ * Claude / DeepSeek / GLM 一样能被选中并正常发请求。`auto` 是 Kiro 的「自选模型」
+ * 占位，能力无从声明，与 Rust 侧 `clean_models` 同一规则。
+ */
+const isSelectableModel = (id: string) => id.trim() !== 'auto';
 
 export const thirdpartyView: ViewSpec = {
   id: 'thirdparty',
@@ -126,9 +132,9 @@ function codexCard(state: AppState): string {
   const catalogSet = new Set(catalogIds);
   const rates = state.models?.rates ?? {};
 
-  // GPT 系之外不上网格（Codex 桌面端只认 gpt- 开头的模型）；目录里已有的
-  // 非 GPT 条目仍占一张卡（标「Codex 不支持」）—— 看得见才删得掉
-  const available = (state.models?.models ?? []).filter(isGptModel);
+  // 任意家族的模型都能进目录（档位按模型自己的能力声明）；目录里已有的条目
+  // 就算已从模型清单移除也仍占一张卡 —— 看得见才删得掉
+  const available = (state.models?.models ?? []).filter(isSelectableModel);
   const availableSet = new Set(available);
   const universe = [...new Set([...available, ...catalogIds])];
   const raw = state.codexFilter;
@@ -142,15 +148,17 @@ function codexCard(state: AppState): string {
   const current = scan.catalogState === 'ours' ? scan.activeModel : null;
 
   // 还没有模型清单：与 WorkBuddy 同款 —— 只有标题的卡头 + 引导去同步；
-  // 清单里有模型但全是非 GPT 系时，说明是过滤后为空而不是没同步过
+  // 清单里有模型但全被筛掉（只剩 auto）时，说明是过滤后为空而不是没同步过
   if (!universe.length) {
     const hasModels = (state.models?.models ?? []).length > 0;
     return `
       <div class="card">
         <div class="card-head"><span class="card-title">Codex 模型</span></div>
         ${emptyState(
-          hasModels ? '清单里没有 GPT 系模型' : '还没有可用模型清单',
-          hasModels ? 'Codex 桌面端只支持 gpt- 开头的模型' : '先到概览页「可用模型」弹窗同步',
+          hasModels ? '清单里没有可接入的模型' : '还没有可用模型清单',
+          hasModels
+            ? 'auto 是 Kiro 的自选模型占位，没有确定能力，不能写进 Codex 目录'
+            : '先到概览页「可用模型」弹窗同步',
         )}
       </div>`;
   }
@@ -192,25 +200,18 @@ function codexCard(state: AppState): string {
       <div class="model-card-list">
         ${shown.length
           ? shown.map((model) =>
-              codexModelCard(
-                model,
-                checked.has(model),
-                availableSet.has(model),
-                isGptModel(model),
-                rates[model],
-              ),
+              codexModelCard(model, checked.has(model), availableSet.has(model), rates[model]),
             ).join('')
           : `<div class="model-card-empty">没有匹配「${esc(query)}」的模型，换个关键词试试</div>`}
       </div>`}
-      <div class="wb-hint">勾选写入 Codex 的模型目录（kiro2api-model-catalog.json），点「应用」一次生效；「取消接入」把 config.toml 还原成接管前的样子并移除指向本应用的条目；「恢复」放弃未应用的改动。Codex 只在启动时读一次配置，应用之后要重启才认得新目录</div>
+      <div class="wb-hint">勾选写入 Codex 的模型目录（kiro2api-model-catalog.json），点「应用」一次生效；任意家族的模型都能接入（gpt / claude / deepseek…），推理档位按模型自己的能力声明，不收 effort 的模型不显示档位；「取消接入」把 config.toml 还原成接管前的样子并移除指向本应用的条目；「恢复」放弃未应用的改动。Codex 只在启动时读一次配置，应用之后要重启才认得新目录</div>
     </div>`;
-}
+  }
 
 /** 一张模型卡：整卡一颗按钮，选中就是整卡的主色描边 + 底色（与 WorkBuddy 同款）。
- *  非 GPT 的目录残留单独说明 —— 不是清单里没有，而是 Codex 不支持。 */
-function codexModelCard(model: string, checked: boolean, known: boolean, gpt: boolean, rate: number | undefined): string {
-  // 目录里有、网格可选清单里没有：多半是模型从清单移除后的残留，看得见才删得掉
-  const pill = checked && !known ? tonePill('off', gpt ? '不在模型列表' : 'Codex 不支持') : '';
+ *  目录里有、可选清单里没有的条目单独说明 —— 多半是模型从清单移除后的残留。 */
+function codexModelCard(model: string, checked: boolean, known: boolean, rate: number | undefined): string {
+  const pill = checked && !known ? tonePill('off', '不在模型列表') : '';
   return (
     `<button class="model-card${checked ? ' is-checked' : ''}" type="button"` +
     ` data-action="codex-toggle" data-model="${esc(model)}"` +
